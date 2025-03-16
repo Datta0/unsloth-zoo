@@ -551,8 +551,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16)
     kwargs = dict()
     if quantization_config != {}:
         # Get quantization_config flags
-        compute_dtype = _get_dtype(quantization_config["bnb_4bit_compute_dtype"])
-        compute_dtype = dtype # Do not use config file's dtype!
         kwargs["compress_statistics"] = quantization_config["bnb_4bit_use_double_quant"]
         kwargs["quant_type"] = quantization_config["bnb_4bit_quant_type"]
         kwargs["quant_storage"] = _get_dtype(quantization_config["bnb_4bit_quant_storage"])
@@ -602,7 +600,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16)
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
                 n_layers = config.num_hidden_layers
-                layer = Linear4bit(0, 0, device = "cuda:0", bias = has_bias, compute_dtype = compute_dtype, **kwargs)
+                layer = Linear4bit(0, 0, device = "cuda:0", bias = has_bias, compute_dtype = dtype, **kwargs)
                 layer.in_features  = quant_state.shape[1]
                 layer.out_features = quant_state.shape[0]
                 layer.weight = Params4bit(data = weight, requires_grad = False, **kwargs)
