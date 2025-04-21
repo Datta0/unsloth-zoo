@@ -211,14 +211,21 @@ def grpo_accumulated_loss(
 
     completion_input_ids = input_ids[:, -logits_to_keep:]
     lm_head = trainer.model.get_output_embeddings().weight
+    completion_length = completion_mask.shape[1]
 
     with torch.amp.autocast(device_type = "cuda", dtype = mixed_dtype):
         with torch.inference_mode(), trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False).disable_adapter():
-            old_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
+            # old_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
+            old_hidden_states = trainer.model.model.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).last_hidden_state
         pass
 
-        new_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
+        # new_hidden_states = trainer.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).logits
+        new_hidden_states = trainer.model.model.model(input_ids = input_ids, logits_to_keep = logits_to_keep + 1).last_hidden_state
         
+        old_hidden_states = old_hidden_states[:, -completion_length:, :]
+        new_hidden_states = new_hidden_states[:, -completion_length:, :]
+        #breakpoint()
+    
         loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
             new_hidden_states, old_hidden_states, lm_head,
             completion_input_ids, completion_mask, advantages, trainer.beta,
