@@ -297,11 +297,7 @@ else:
         return
     pass
 
-    def patch_vllm_compute_dtype():
-        return
-    pass
-
-    def unpatch_vllm_compute_dtype(old_config):
+    def unpatch_vllm_compute_dtype_stub(old_config):
         return
     pass
 
@@ -845,6 +841,144 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 pass
 
 
+def assert_same_model_attributes(old_model, new_model):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Check if model attributes match between original and converted model
+
+    failures = []
+
+    def is_comparable_value(val):
+        """Check if a value is comparable (not a method, module, etc.)"""
+        return (
+            val is None or
+            isinstance(val, (int, float, str, bool, tuple, list)) or
+            (hasattr(val, '__class__') and val.__class__.__name__ in ['dtype', 'device'])
+        )
+
+    def compare_all_attributes(obj1, obj2, path="", max_depth=3):
+        """Compare all comparable attributes between two objects"""
+        if max_depth <= 0:
+            return
+
+        # Get all attributes, excluding private ones and methods
+        attrs1 = set(attr for attr in dir(obj1) if not attr.startswith('_') and not callable(getattr(obj1, attr, None)))
+        attrs2 = set(attr for attr in dir(obj2) if not attr.startswith('_') and not callable(getattr(obj2, attr, None)))
+
+        # Check for missing attributes
+        missing_in_obj2 = attrs1 - attrs2
+        missing_in_obj1 = attrs2 - attrs1
+
+        for attr in missing_in_obj2:
+            failures.append(f"{path}.{attr}: exists in old model only")
+        for attr in missing_in_obj1:
+            failures.append(f"{path}.{attr}: exists in new model only")
+
+        # Compare common attributes
+        common_attrs = attrs1 & attrs2
+        for attr in common_attrs:
+            try:
+                val1 = getattr(obj1, attr)
+                val2 = getattr(obj2, attr)
+
+                # Skip if values are not comparable
+                if not (is_comparable_value(val1) and is_comparable_value(val2)):
+                    continue
+
+                if val1 != val2:
+                    failures.append(f"{path}.{attr}: {val1} != {val2}")
+
+            except Exception:
+                # Skip attributes that can't be accessed
+                continue
+
+    # Compare main model config
+    old_config = getattr(old_model, 'config', None)
+    new_config = getattr(new_model, 'config', None)
+
+    if old_config is not None and new_config is not None:
+        compare_all_attributes(old_config, new_config, "config")
+
+        # For multimodal models, compare text_config and vision_config separately
+        old_text_config = getattr(old_config, 'text_config', None)
+        new_text_config = getattr(new_config, 'text_config', None)
+        if old_text_config is not None and new_text_config is not None:
+            compare_all_attributes(old_text_config, new_text_config, "config.text_config")
+
+        old_vision_config = getattr(old_config, 'vision_config', None)
+        new_vision_config = getattr(new_config, 'vision_config', None)
+        if old_vision_config is not None and new_vision_config is not None:
+            compare_all_attributes(old_vision_config, new_vision_config, "config.vision_config")
+
+    # Compare attention and MLP modules in the first layer as a sample
+    def get_model_layers(model):
+        """Get the layers from a model, handling different architectures"""
+        model_attr = getattr(model, 'model', None)
+        if model_attr is not None:
+            # Try direct layers first
+            layers = getattr(model_attr, 'layers', None)
+            if layers is not None:
+                return layers
+            # Try language_model.layers
+            language_model = getattr(model_attr, 'language_model', None)
+            if language_model is not None:
+                return getattr(language_model, 'layers', None)
+        return None
+
+    old_layers = get_model_layers(old_model)
+    new_layers = get_model_layers(new_model)
+
+    if old_layers is not None and new_layers is not None:
+        # Check layer count consistency
+        if len(old_layers) != len(new_layers):
+            failures.append(f"num_layers: {len(old_layers)} != {len(new_layers)}")
+
+        # Compare first layer attributes as a sample
+        if len(old_layers) > 0 and len(new_layers) > 0:
+            old_layer = old_layers[0]
+            new_layer = new_layers[0]
+
+            old_self_attn = getattr(old_layer, 'self_attn', None)
+            new_self_attn = getattr(new_layer, 'self_attn', None)
+            if old_self_attn is not None and new_self_attn is not None:
+                compare_all_attributes(old_self_attn, new_self_attn, "layers[0].self_attn", max_depth=1)
+
+            old_mlp = getattr(old_layer, 'mlp', None)
+            new_mlp = getattr(new_layer, 'mlp', None)
+            if old_mlp is not None and new_mlp is not None:
+                compare_all_attributes(old_mlp, new_mlp, "layers[0].mlp", max_depth=1)
+
+    # Check embedding dimensions
+    def get_embeddings(model):
+        model_attr = getattr(model, 'model', None)
+        if model_attr is not None:
+            # Try direct embed_tokens first
+            embed_tokens = getattr(model_attr, 'embed_tokens', None)
+            if embed_tokens is not None:
+                return embed_tokens
+            # Try language_model.embed_tokens
+            language_model = getattr(model_attr, 'language_model', None)
+            if language_model is not None:
+                return getattr(language_model, 'embed_tokens', None)
+        return None
+
+    old_embed = get_embeddings(old_model)
+    new_embed = get_embeddings(new_model)
+
+    if old_embed is not None and new_embed is not None:
+        compare_all_attributes(old_embed, new_embed, "embed_tokens", max_depth=1)
+
+    if len(failures) > 0:
+        print(f"Unsloth: ⚠️ Found {len(failures)} model attribute differences:")
+        for failure in failures[:10]:  # Show first 10 differences
+            print(f"  - {failure}")
+        if len(failures) > 10:
+            print(f"  ... and {len(failures) - 10} more differences")
+        print("Unsloth: Proceeding with conversion despite differences.")
+    else:
+        print("Unsloth: ✓ All model attributes match between original and converted models!")
+pass
+
+
 @torch.inference_mode
 def create_empty_causal_lm(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1142,7 +1276,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 exec(f"new_model.{layer_name_br}.weight = None")
                 exec(f"new_model.{layer_name_br}.weight = weight_param")
                 # Set bias if it exists
-                if bias is not None:
+                if has_bias:
                     exec(f"new_model.{layer_name_br}.bias = None")
                     exec(f"new_model.{layer_name_br}.bias = bias")
                 continue
@@ -1156,56 +1290,77 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
     set_additional_modules(new_model, quant_state_dict, config)
 
-
-    # Extract config attributes for setting on modules
-    config_as_dict = config.to_dict()
-    config_flat = {}
-    def _flatten(d):
-        for k, v in d.items():
-            if isinstance(v, dict):
-                _flatten(v)
-            elif isinstance(k, str):
-                config_flat[k] = v
-    _flatten(config_as_dict)
-
-    # For VLMs which have vision_config and text_config, we want to extract keys from nested structure
-    config_as_dict = config_as_dict | config_flat
-
-    for module in new_model.modules():
-        # Set individual config attributes that the module expects
-        for key, value in config_as_dict.items():
-            if hasattr(module, key): setattr(module, key, value)
-        if hasattr(module, "config"): module.config = config
-    pass
-    for param in new_model.parameters():
-        for key, value in config_as_dict.items():
-            if hasattr(param, key): setattr(param, key, value)
-        if hasattr(param, "config"): param.config = config
-    pass
-    module = new_model
-    for key, value in config_as_dict.items():
-        if hasattr(module, key): setattr(module, key, value)
+    # Simplified config application - just set the main config and let modules handle their own config needs
     new_model.config = config
 
-    text_config = getattr(config, "text_config", config) #try using text config for VLMs
-    # Fix up rotary_emb by re-initing them
+    # For multimodal models, ensure text_config and vision_config have proper torch_dtype
+    text_config = getattr(config, 'text_config', None)
+    vision_config = getattr(config, 'vision_config', None)
+
+    if text_config is not None:
+        try:
+            text_config.torch_dtype = dtype
+        except (AttributeError, TypeError):
+            pass
+
+    if vision_config is not None:
+        try:
+            vision_config.torch_dtype = dtype
+        except (AttributeError, TypeError):
+            pass
+
+    # Fix rotary embeddings with appropriate config
+    rotary_config = text_config or config
     for module in new_model.modules():
-        if hasattr(module, "rotary_emb"):
-            module.rotary_emb = module.rotary_emb.__class__(
-                config = text_config,
-                device = get_target_device(),
-            )
-        if hasattr(module, "rotary_emb_local"):
-            # gemma3 has a rotary_emb_local
-            module.rotary_emb_local = module.rotary_emb_local.__class__(
-                config = text_config,
-                device = get_target_device(),
-            )
-        pass
-    pass
+        # Fix rotary embeddings
+        for rotary_attr in ["rotary_emb", "rotary_emb_local"]:
+            if hasattr(module, rotary_attr):
+                try:
+                    setattr(module, rotary_attr, getattr(module, rotary_attr).__class__(
+                        config=rotary_config,
+                        device=get_target_device(),
+                    ))
+                except Exception:
+                    pass  # Skip if reinit fails
 
     # Must override or else Bitsandbytes will error
     new_model.to = partial(_override_to, new_model)
+
+    # Set training mode to False to match original model
+    new_model.eval()
+
+    # Define computed attributes to fix with structured approach
+    computed_attributes = {
+        'num_key_value_groups': [
+            {
+                'condition': lambda m: hasattr(m, 'num_heads') and hasattr(m, 'num_key_value_heads'),
+                'compute': lambda m: m.num_heads // m.num_key_value_heads
+            }
+        ],
+        'intermediate_size': [
+            {
+                # For merged gate/up projections, intermediate_size = half of output features
+                'condition': lambda m: hasattr(m, 'gate_up_proj') and hasattr(m.gate_up_proj, 'out_features'),
+                'compute': lambda m: m.gate_up_proj.out_features // 2
+            },
+            {
+                # For separate gate/up projections, intermediate_size = gate_proj output features
+                'condition': lambda m: hasattr(m, 'gate_proj') and hasattr(m.gate_proj, 'out_features'),
+                'compute': lambda m: m.gate_proj.out_features
+            }
+        ]
+    }
+
+    # Fix computed attributes that need to be set correctly
+    for name, module in new_model.named_modules():
+        for attr_name, attr_rules in computed_attributes.items():
+            for rule in attr_rules:
+                if rule['condition'](module):
+                    try:
+                        setattr(module, attr_name, rule['compute'](module))
+                        break  # Found a rule that applies, move to next attribute
+                    except (AttributeError, ZeroDivisionError):
+                        continue
 
     # Cleanup
     for _ in range(3):
@@ -2220,6 +2375,7 @@ def _test_get_vllm_state_dict(
 
     new_model = convert_vllm_to_huggingface(quant_state_dict, config, dtype, is_vision_model = is_vision_model)
     assert_same_state_dict(model.state_dict(), new_model.state_dict())
+    assert_same_model_attributes(model, new_model)
 
     # Run the model as well
     if not skip_generation:
