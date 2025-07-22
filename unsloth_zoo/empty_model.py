@@ -4,6 +4,7 @@ __all__ = [
     "extract_mllama_vision_layers",
     "extract_qwen2_5_vl_vision_layers",
     "extract_gemma3_vision_layers",
+    "extract_mistral3_vision_layers",
     "get_model_layer_config",
     "compare_attributes",
     "copy_attributes",
@@ -247,6 +248,9 @@ def create_empty_vision_model(config, dtype = torch.float16):
     elif model_type == "gemma3":
         from transformers import Gemma3ForConditionalGeneration
         model_cls = Gemma3ForConditionalGeneration
+    elif model_type == "mistral3":
+        from transformers import Mistral3ForConditionalGeneration
+        model_cls = Mistral3ForConditionalGeneration
     else:
         raise ValueError(f"Unsloth: Unsupported vision model type: {model_type}")
 
@@ -346,11 +350,14 @@ def set_additional_modules(new_model, quant_state_dict, config):
     norm = torch.nn.Parameter(norm, requires_grad = False)
     language_model.norm.weight = norm
 
-    # LM Head
-    if getattr(config, "tie_word_embeddings", False):
-        lmhead_key = f"{language_model_prefix}.embed_tokens.weight"
+
+    if "lm_head" in quant_state_dict:
+        lmhead_key = "lm_head"
     else:
-        lmhead_key = "lm_head.weight"
+        if getattr(config, "tie_word_embeddings", False):
+            lmhead_key = f"{language_model_prefix}.embed_tokens.weight"
+        else:
+            raise ValueError(f"Unsloth: tie_word_embeddings is False but lm_head is not found in quant_state_dict")
 
     # Check if lm_head exists in the state dict
     if lmhead_key in quant_state_dict:
@@ -503,6 +510,30 @@ def get_model_layer_config(model_type, config=None):
             "model.vision_tower.vision_model.encoder.layers.{kk}.layer_norm2",
         ])
 
+    elif model_type == "mistral3":
+        base_config = get_base_config("model.language_model")
+        # Vision transformer layers
+        base_config['vision_layers'].extend([
+            "model.vision_tower.transformer.layers.{kk}.attention.q_proj",
+            "model.vision_tower.transformer.layers.{kk}.attention.k_proj",
+            "model.vision_tower.transformer.layers.{kk}.attention.v_proj",
+            "model.vision_tower.transformer.layers.{kk}.attention.o_proj",
+            "model.vision_tower.transformer.layers.{kk}.feed_forward.gate_proj",
+            "model.vision_tower.transformer.layers.{kk}.feed_forward.up_proj",
+            "model.vision_tower.transformer.layers.{kk}.feed_forward.down_proj",
+            "model.vision_tower.transformer.layers.{kk}.attention_norm",
+            "model.vision_tower.transformer.layers.{kk}.ffn_norm",
+        ])
+        # Additional layers including multi-modal projector
+        base_config['additional_layers'].extend([
+            "model.vision_tower.patch_conv",
+            "model.vision_tower.ln_pre",
+            "model.multi_modal_projector.norm",
+            "model.multi_modal_projector.patch_merger.merging_layer",
+            "model.multi_modal_projector.linear_1",
+            "model.multi_modal_projector.linear_2",
+        ])
+
     # Add some common additional norms for causal LM models
     else:
         # Add potential additional norms that some models might have
@@ -543,6 +574,11 @@ def get_model_layer_counts(config):
         return {
             "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
             "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+        }
+    elif model_type == "mistral3":
+        return {
+            "text_layers": getattr(config.text_config, "num_hidden_layers", 40),
+            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 24),
         }
     else:
         # Standard causal LM
@@ -693,3 +729,60 @@ def extract_gemma3_vision_layers(vllm_internals, state_dict, quant_state_dict, g
 
     except Exception as e:
         print(f"Unsloth: Could not extract vision layers for gemma3: {e}")
+
+def extract_mistral3_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict):
+    """Extract vision layers for mistral3 models."""
+    try:
+        # Vision transformer layers
+        vision_tower = vllm_internals.vision_tower
+
+        # Extract patch conv and ln_pre
+        get_state_dict("model.vision_tower.patch_conv", 0, state_dict, vision_tower.patch_conv, slice_weights=False)
+        get_state_dict("model.vision_tower.ln_pre", 0, state_dict, vision_tower.ln_pre, slice_weights=False)
+
+        # Extract transformer layers
+        for kk in range(len(vision_tower.transformer.layers)):
+            layer = vision_tower.transformer.layers[kk]
+            prefix = f"model.vision_tower.transformer.layers.{kk}"
+
+            # Vision attention layers
+            attention = layer.attention
+            # Check if vLLM uses unified QKV
+            if hasattr(attention, "qkv_proj"):
+                get_state_dict(f"{prefix}.attention.q_proj", 0, state_dict, attention.qkv_proj)
+                get_state_dict(f"{prefix}.attention.k_proj", 1, state_dict, attention.qkv_proj)
+                get_state_dict(f"{prefix}.attention.v_proj", 2, state_dict, attention.qkv_proj)
+            else:
+                # Separate projections
+                get_state_dict(f"{prefix}.attention.q_proj", 0, state_dict, attention.q_proj)
+                get_state_dict(f"{prefix}.attention.k_proj", 0, state_dict, attention.k_proj)
+                get_state_dict(f"{prefix}.attention.v_proj", 0, state_dict, attention.v_proj)
+
+            get_state_dict(f"{prefix}.attention.o_proj", 0, state_dict, attention.o_proj)
+
+            # Vision MLP layers
+            mlp = layer.feed_forward
+            get_state_dict(f"{prefix}.feed_forward.gate_proj", 0, state_dict, mlp.gate_up_proj)
+            get_state_dict(f"{prefix}.feed_forward.up_proj", 1, state_dict, mlp.gate_up_proj)
+            get_state_dict(f"{prefix}.feed_forward.down_proj", 0, state_dict, mlp.down_proj)
+
+            # Vision layernorms
+            get_state_dict(f"{prefix}.attention_norm", 0, state_dict, layer.attention_norm, slice_weights=False)
+            get_state_dict(f"{prefix}.ffn_norm", 0, state_dict, layer.ffn_norm, slice_weights=False)
+
+        # Extract multi-modal projector
+        projector = vllm_internals.multi_modal_projector
+
+        # Extract norm
+        get_state_dict("model.multi_modal_projector.norm", 0, state_dict, projector.norm, slice_weights=False)
+
+        # Extract patch merger
+        get_state_dict("model.multi_modal_projector.patch_merger.merging_layer", 0, state_dict,
+                      projector.patch_merger.merging_layer, slice_weights=False)
+
+        # Extract linear layers
+        get_state_dict("model.multi_modal_projector.linear_1", 0, state_dict, projector.linear_1, slice_weights=False)
+        get_state_dict("model.multi_modal_projector.linear_2", 0, state_dict, projector.linear_2, slice_weights=False)
+
+    except Exception as e:
+        print(f"Unsloth: Could not extract vision layers for mistral3: {e}")

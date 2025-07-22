@@ -917,6 +917,8 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             extract_qwen2_5_vl_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
         elif model_type == "gemma3":
             extract_gemma3_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
+        elif model_type == "mistral3":
+            extract_mistral3_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
 
     # Norm
     # For Gemma3 and similar multimodal models, norm should be under model.norm
@@ -2123,6 +2125,9 @@ def _test_get_vllm_state_dict(
         elif model_type == "mllama":
             from transformers import MllamaForConditionalGeneration
             model_class = MllamaForConditionalGeneration
+        elif model_type == "mistral3":
+            from transformers import Mistral3ForConditionalGeneration
+            model_class = Mistral3ForConditionalGeneration
         else:
             raise ValueError(f"Unsloth: Model type {model_type} not supported for vision models")
 
