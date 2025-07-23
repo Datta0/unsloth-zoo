@@ -363,8 +363,8 @@ def set_additional_modules(new_model, quant_state_dict, config):
     language_model.norm.weight = norm
 
 
-    if "lm_head" in quant_state_dict:
-        lmhead_key = "lm_head"
+    if "lm_head.weight" in quant_state_dict:
+        lmhead_key = "lm_head.weight"
     else:
         if getattr(config, "tie_word_embeddings", False):
             lmhead_key = f"{language_model_prefix}.embed_tokens.weight"

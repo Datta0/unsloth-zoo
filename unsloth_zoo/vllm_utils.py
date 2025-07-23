@@ -1524,7 +1524,6 @@ def load_vllm(
         # New vLLM versions need to pass this in!
         # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
         enable_sleep_mode      = unsloth_vllm_standby,
-        limit_mm_per_prompt    = {"image": 1, "video": 0},
     )
     if is_vision_model:
         # To reduce memory usage, we limit the number of images/videos per prompt
