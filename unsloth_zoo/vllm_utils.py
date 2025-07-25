@@ -1526,7 +1526,7 @@ def load_vllm(
     if is_vision_model:
         # To reduce memory usage, we limit the number of images/videos per prompt
         # TODO: Make it configurable by user
-        engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
+        engine_args["limit_mm_per_prompt"] = {"image": 0, "video": 0}
 
     if unsloth_vllm_standby and "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
         del os.environ['PYTORCH_CUDA_ALLOC_CONF'] # Disable expandable segments cuz https://github.com/pytorch/pytorch/issues/147851
