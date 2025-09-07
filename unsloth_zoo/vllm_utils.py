@@ -892,7 +892,10 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     else:
         raise RuntimeError(f'Unsloth: Cannot find vllm_internal_model!')
 
-    embed_tokens = vllm_text_model.embed_tokens
+    # GPT OSS has embedding as the attribute name instead of embed_tokens
+    # https://github.com/vllm-project/vllm/blob/0661cb9df390a47dda0a5c201cf712dd2d943666/vllm/model_executor/models/gpt_oss.py#L226
+    embed_tokens = getattr(vllm_text_model, "embed_tokens", None) or getattr(vllm_text_model, "embedding", None)
+    assert embed_tokens is not None, "Unsloth: Cannot find embed_tokens or embedding in vLLM model!"
     # Use get_state_dict for consistent extraction and automatic truncation
     get_state_dict(f"{vllm_text_model_prefix}.embed_tokens", 0, state_dict, embed_tokens, slice_weights=False)
 
@@ -903,10 +906,15 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
     skipped_layernorms = []
     for kk in range(len(vllm_text_model.layers)):
         layer = vllm_text_model.layers[kk]
-        if hasattr(layer, "self_attn"):
-            prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
-            qkv_proj = layer.self_attn.qkv_proj
-            o_proj = layer.self_attn.o_proj
+        if hasattr(layer, "self_attn") or hasattr(layer, "attn"):
+            if hasattr(layer, "self_attn"):
+                prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
+                qkv_proj = layer.self_attn.qkv_proj
+                o_proj = layer.self_attn.o_proj
+            else:
+                prefix = f"{vllm_text_model_prefix}.layers.{kk}.attn"
+                qkv_proj = layer.attn.qkv
+                o_proj = layer.attn.o_proj
 
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
@@ -922,15 +930,35 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
             get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
+        else:
+            raise ValueError(f"Unsloth: Cannot find self_attn or cross_attn in layer {kk}!")
 
         get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
-        proj = layer.mlp.gate_up_proj
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+        mlp = layer.mlp
+        if hasattr(mlp, "experts"):
+            router = mlp.router
+            experts = mlp.experts
+            breakpoint()
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.router.linear", 0, state_dict, router)
+            num_experts = len(experts)
+            for ee in range(num_experts):
+                proj = experts[ee].gate_up_proj
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.experts.{ee}.gate_up_projs", 0, state_dict, proj, slice_weights=False)
 
-        proj = layer.mlp.down_proj
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
+                proj = experts[ee].down_proj
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.experts.{ee}.down_projs", 0, state_dict, proj)
+
+        elif hasattr(mlp, "gate_up_proj"):
+            proj = mlp.gate_up_proj
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+
+            proj = mlp.down_proj
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
+        else:
+            raise ValueError(f"Unsloth: Cannot find experts or gate_up_proj in mlp of layer {kk}!")
+
 
         # Use layernorms from the layer configuration
         layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
