@@ -654,7 +654,11 @@ def patch_vllm_enable_sleep_mode():
     vllm.LLM.generate = get_patched_generate(vllm.LLM.generate)
     vllm.AsyncLLMEngine.generate = get_patched_generate(vllm.AsyncLLMEngine.generate)
 
-    CuMemAllocator.__init__ = __init__
+    try:
+        CuMemAllocator.__init__ = __init__
+    except Exception as e:
+        print(f'Failed to patch standby expandable segments error messsge with error = {str(e)}. Continuing...')
+    pass
     CuMemAllocator.sleep = sleep
     CuMemAllocator.wake_up = wake_up
     CuMemAllocator.print_memory_summary = print_memory_summary
