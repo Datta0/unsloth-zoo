@@ -880,9 +880,11 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     # for qwen 3 for eg, 4096 query and 1024 each for k and v. Weight block size say is [128, 128]
                     # so the shape of qkv is [6144, 4096] and scale.T is [48, 32]. Now 48 should be split into [0, 32, 40, 48]
                     # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
+                    # Note: vLLM 0.10.2 and vllm 0.11 seem to treat this differently (one has weight_scale transposed) so to handle both lets check shapes
                     scale_suffix = '.weight_scale_inv'
+                    a, b = weight_scale.shape
                     block_size = proj.weight_block_size[0]
-                    weight_scale = weight_scale.T
+                    weight_scale = weight_scale.T if a < b else weight_scale # So that slicing happens on 0 dim which is higher always.
                 else:
                     # This is dynamic quantization (aka per row or per column). The scale is of shape [n,1]
                     # The weight here is of shape [4096, 6144]. We need to transpose and then slice
