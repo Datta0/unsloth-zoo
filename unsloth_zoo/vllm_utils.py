@@ -882,9 +882,11 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     # Also notice that vLLM stores scale in [32,48] which is transpose of what HF expects.
                     # Note: vLLM 0.10.2 and vllm 0.11 seem to treat this differently (one has weight_scale transposed) so to handle both lets check shapes
                     scale_suffix = '.weight_scale_inv'
-                    a, b = weight_scale.shape
                     block_size = proj.weight_block_size[0]
-                    weight_scale = weight_scale.T if a < b else weight_scale # So that slicing happens on 0 dim which is higher always.
+                    a, b = weight_scale.shape
+                    m, n = weight.shape
+                    if b>a and m>n: # if the weight scale needs transpose, do it to make it shaped well for transformers
+                        weight_scale = weight_scale.T
                 else:
                     # This is dynamic quantization (aka per row or per column). The scale is of shape [n,1]
                     # The weight here is of shape [4096, 6144]. We need to transpose and then slice
