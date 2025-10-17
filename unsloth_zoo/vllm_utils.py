@@ -884,8 +884,8 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
                     scale_suffix = '.weight_scale_inv'
                     block_size = proj.weight_block_size[0]
                     a, b = weight_scale.shape
-                    m, n = weight.shape
-                    if b>a and m>n: # if the weight scale needs transpose, do it to make it shaped well for transformers
+                    m, n = qweight.shape
+                    if (b > a and m > n) or (a > b and n > m) : # if the weight scale needs transpose, do it to make it shaped well for transformers
                         weight_scale = weight_scale.T
                 else:
                     # This is dynamic quantization (aka per row or per column). The scale is of shape [n,1]
