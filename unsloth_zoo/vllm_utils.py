@@ -547,9 +547,9 @@ def patch_vllm_enable_sleep_mode():
 
         assert isinstance(offload_tags, tuple)
 
-        logger.debug(f'Sleeping allocator with tags: {offload_tags}')
+        logger.info(f'Sleeping allocator with tags: {offload_tags}')
         set_of_tags = set([data.tag for _, data in self.pointer_to_data.items()])
-        logger.debug(f'Set of tags {set_of_tags} and len of data {len(self.pointer_to_data.items())}')
+        logger.info(f'Set of tags {set_of_tags} and len of data {len(self.pointer_to_data.items())}')
 
         self.print_memory_summary()
         cpu_offloads = 0
@@ -635,8 +635,8 @@ def patch_vllm_enable_sleep_mode():
             elif data.tag == "kv_cache":
                 kv_cache_total += size
                 kv_cache_count += 1
-        logger.debug(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
-        logger.debug(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
+        logger.info(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
+        logger.info(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
         # print(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
         # print(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
     pass
@@ -1463,9 +1463,9 @@ def load_vllm(
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
-    if unsloth_vllm_standby and gpu_memory_utilization < 0.8:
+    if unsloth_vllm_standby and gpu_memory_utilization < 0.9:
         ## [TODO] Used to allow 0.9, but now 0.8 works only
-        gpu_memory_utilization = 0.8
+        gpu_memory_utilization = 0.9
         logger.info("Unsloth: Standby mode is enabled. Increasing `gpu_memory_utilization` to 0.8.")
 
     if DEVICE_TYPE == "cuda":
