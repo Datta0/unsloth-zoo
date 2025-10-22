@@ -502,7 +502,7 @@ def patch_vllm_enable_sleep_mode():
     from vllm.utils import is_pin_memory_available
     from typing import Optional, Union, Tuple, Any
 
-    logger.info(f"Unsloth: Enabling vLLM standby mode")
+    print(f"Unsloth: Enabling vLLM standby mode")
 
     def __init__(self):
         # This is a replica of the original CuMemAllocator.__init__()
@@ -547,9 +547,9 @@ def patch_vllm_enable_sleep_mode():
 
         assert isinstance(offload_tags, tuple)
 
-        logger.info(f'Sleeping allocator with tags: {offload_tags}')
+        print(f'Sleeping allocator with tags: {offload_tags}')
         set_of_tags = set([data.tag for _, data in self.pointer_to_data.items()])
-        logger.info(f'Set of tags {set_of_tags} and len of data {len(self.pointer_to_data.items())}')
+        print(f'Set of tags {set_of_tags} and len of data {len(self.pointer_to_data.items())}')
 
         self.print_memory_summary()
         cpu_offloads = 0
@@ -635,8 +635,8 @@ def patch_vllm_enable_sleep_mode():
             elif data.tag == "kv_cache":
                 kv_cache_total += size
                 kv_cache_count += 1
-        logger.info(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
-        logger.info(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
+        print(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
+        logger.debug(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
         # print(f"Total weights memory: {weights_total / 1e9:.2f} GB for {weights_count} items")
         # print(f"Total KVCache memory: {kv_cache_total / 1e9:.2f} GB for {kv_cache_count} items")
     pass
@@ -691,19 +691,19 @@ def patch_vllm_graph_capture():
     # Patch vLLM v1
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
-        logger.info('Unsloth: Patching vLLM v1 graph capture')
+        print('Unsloth: Patching vLLM v1 graph capture')
         original_capture_model_v1 = GPUModelRunner.capture_model
 
         @wraps(original_capture_model_v1)
         def capture_model_wrapper_v1(self, *args, **kwargs):
-            logger.info("Unsloth: Running patched vLLM v1 `capture_model`.")
+            print("Unsloth: Running patched vLLM v1 `capture_model`.")
             start_time = time.perf_counter()
 
             with suppress_gc_collect():
                 result = original_capture_model_v1(self, *args, **kwargs)
 
             end_time = time.perf_counter()
-            logger.info(
+            print(
                 "Unsloth: Patched vLLM v1 graph capture finished in %.0f secs.",
                 end_time - start_time
             )
@@ -719,19 +719,19 @@ def patch_vllm_graph_capture():
     # Also patch vLLM v0
     try:
         from vllm.worker.model_runner import GPUModelRunnerBase, logger
-        logger.info('Unsloth: Patching vLLM v0 graph capture')
+        print('Unsloth: Patching vLLM v0 graph capture')
         original_capture_model_v0 = GPUModelRunnerBase.capture_model
 
         @wraps(original_capture_model_v0)
         def capture_model_wrapper_v0(self, *args, **kwargs):
-            logger.info("Unsloth: Running patched vLLM v0 `capture_model`.")
+            print("Unsloth: Running patched vLLM v0 `capture_model`.")
             start_time = time.perf_counter()
 
             with suppress_gc_collect():
                 result = original_capture_model_v0(self, *args, **kwargs)
 
             end_time = time.perf_counter()
-            logger.info(
+            print(
                 "Unsloth: Patched vLLM v0 graph capture finished in %.0f secs.",
                 end_time - start_time
             )
@@ -749,7 +749,7 @@ pass
 def patch_vllm(debug = True):
     # Temporary patch to disable multiprocessing for vLLM
     # Allows accessing model_executor
-    logger.info(f'Unsloth: Patching vLLM')
+    print(f'Unsloth: Patching vLLM')
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     if debug or os.getenv("UNSLOTH_ENABLE_LOGGING", "0") == "1":
         os.environ["VLLM_LOGGING_LEVEL"] = "INFO"
@@ -760,7 +760,7 @@ def patch_vllm(debug = True):
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
     if os.getenv("UNSLOTH_VLLM_STANDBY", "0") == "1":
-        logger.info(f'Unsloth: Patching vLLM to enable standby.')
+        print(f'Unsloth: Patching vLLM to enable standby.')
         patch_vllm_enable_sleep_mode()
     patch_vllm_graph_capture()
     # GuidedDecodingParmas is renamed to StructuredOutputsParams in vLLM
@@ -1466,7 +1466,7 @@ def load_vllm(
     if unsloth_vllm_standby and gpu_memory_utilization < 0.9:
         ## [TODO] Used to allow 0.9, but now 0.8 works only
         gpu_memory_utilization = 0.9
-        logger.info("Unsloth: Standby mode is enabled. Increasing `gpu_memory_utilization` to 0.8.")
+        print("Unsloth: Standby mode is enabled. Increasing `gpu_memory_utilization` to 0.8.")
 
     if DEVICE_TYPE == "cuda":
         major_version, minor_version = torch.cuda.get_device_capability()
