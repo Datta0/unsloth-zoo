@@ -270,7 +270,7 @@ def old_init(
     lora_config: LoRAConfig,
     device: torch.device,
     embedding_modules: Dict[str, str],
-    embedding_padding_modules: List[str],
+    embedding_padding_modules: Optional[List[str]] = [],
     lora_model_cls: Type[LoRAModel] = LoRAModel,
     max_position_embeddings: Optional[int] = None,
 ):
@@ -293,7 +293,7 @@ def new_init(
     vllm_config: VllmConfig,
     device: torch.device,
     embedding_modules: dict[str, str],
-    embedding_padding_modules: list[str],
+    embedding_padding_modules: Optional[List[str]] = [],
     lora_model_cls: type[LoRAModel] = LoRAModel,
 ):
 
