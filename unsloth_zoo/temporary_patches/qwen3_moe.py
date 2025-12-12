@@ -156,14 +156,25 @@ def patch_qwen3_moe():
             final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             return final_hidden_states.to(hidden_states.dtype), router_logits
     else:
-        # Sparse implementation for new transformers (Qwen3MoeExperts)
-        # Uses capture_dynamic_output_shape_ops to enable torch.compile with dynamic shapes
-        # Only computes selected experts per token - exploits MoE sparsity
+        # =================================================================
+        # Optimized Sparse MoE for new transformers (Qwen3MoeExperts)
+        # =================================================================
+        # Feature detection for version-aware optimizations
         import torch._dynamo
+        from packaging import version as pkg_version
+
+        TORCH_VERSION = pkg_version.parse(torch.__version__.split('+')[0])
+        HAS_TORCH_2_4 = TORCH_VERSION >= pkg_version.parse("2.4.0")
+        HAS_TORCH_2_5 = TORCH_VERSION >= pkg_version.parse("2.5.0")
+        HAS_GROUPED_MM = hasattr(torch, '_grouped_mm')
+        HAS_SCALED_MM = hasattr(torch, '_scaled_grouped_mm')
+
+        # Enable dynamic shape capture for torch.compile
         torch._dynamo.config.capture_dynamic_output_shape_ops = True
         torch._dynamo.config.capture_scalar_outputs = True
 
-        @torch_compile(dynamic = True)
+        # Simple sparse implementation with inline expert computation
+        # torch.compile on separate expert function caused numerical issues
         def forward(
             self,
             hidden_states: torch.Tensor,
@@ -187,10 +198,9 @@ def patch_qwen3_moe():
                 # Only process tokens assigned to this expert (sparse!)
                 current_state = hidden_states[token_idx]
 
-                # Forward through this expert
+                # Forward through this expert (inlined for correctness)
                 gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
-                intermediate_size = gate_up.shape[-1] // 2
-                gate, up = gate_up.split(intermediate_size, dim=-1)
+                gate, up = gate_up.chunk(2, dim=-1)
                 intermediate = self.act_fn(gate) * up
                 current_hidden_states = F.linear(intermediate, self.down_proj[expert_idx])
 
