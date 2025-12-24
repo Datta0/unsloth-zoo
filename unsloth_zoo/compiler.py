@@ -1283,13 +1283,14 @@ def apply_fused_lm_head(forward, module = None):
             )
 
         # Fix Idefics and Idefics3
-        forward = forward.replace(
-            "loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))",
+        forward = regex.sub(
+            r"([\s\n]{1,})loss = loss_fct\(shift_logits\.view\(\-1, shift_logits\.size\(\-1\)\), shift_labels\.view\(\-1\)\)",
 
-            "shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)\n"\
-            "shift_labels = shift_labels.view(-1)\n"\
-            "shift_labels = shift_labels.to(shift_logits.device)\n"\
-            "loss = loss_fct(shift_logits, shift_labels)"
+            r"\1shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)\n"\
+            r"\1shift_labels = shift_labels.view(-1)\n"\
+            r"\1shift_labels = shift_labels.to(shift_logits.device)\n"\
+            r"\1loss = loss_fct(shift_logits, shift_labels)",
+            forward,
         )
 
         # Find matches
