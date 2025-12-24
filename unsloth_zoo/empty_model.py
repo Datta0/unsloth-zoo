@@ -403,6 +403,10 @@ def set_additional_modules(new_model, quant_state_dict, config):
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
         language_model_prefix = "model.language_model"
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model"):
+        # Gemma 3 has nested structure: model.model.language_model.embed_tokens
+        language_model = new_model.model.language_model
+        language_model_prefix = "model.language_model"
     else:
         language_model_prefix = "model"
         language_model = new_model.model

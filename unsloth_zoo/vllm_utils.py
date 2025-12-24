@@ -1565,6 +1565,33 @@ def vllm_supports_flashinfer(config) -> bool:
 
     For eg Qwen3-VL does not work with flashinfer.
     """
+    # Multimodal prefix LM models use bidirectional attention for mm positions
+    # which FlashInfer doesn't support (use_mm_prefix feature).
+    # Try to dynamically extract MM_PREFIX_LM_MODELS from vLLM's ModelConfig.
+    model_type = getattr(config, "model_type", None)
+    if model_type is not None:
+        try:
+            from vllm.config import ModelConfig
+            import inspect
+            source = inspect.getsource(ModelConfig)
+            # Extract MM_PREFIX_LM_MODELS tuple from source
+            match = re.search(r'MM_PREFIX_LM_MODELS\s*=\s*\(([^)]+)\)', source)
+            if match:
+                content = match.group(1)
+                # Parse model names, ignoring comments
+                mm_prefix_lm_models = tuple(
+                    m.strip().strip('"').strip("'")
+                    for m in content.split(',')
+                    if m.strip() and not m.strip().startswith('#')
+                )
+                if model_type in mm_prefix_lm_models:
+                    return False
+        except Exception:
+            # Fallback to known models if extraction fails
+            MM_PREFIX_LM_MODELS = ("gemma3",)
+            if model_type in MM_PREFIX_LM_MODELS:
+                return False
+
     try:
         from vllm.model_executor.models.registry import ModelRegistry
     except Exception as e:
