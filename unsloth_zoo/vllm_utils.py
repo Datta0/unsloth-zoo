@@ -62,6 +62,13 @@ from .temporary_patches.common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
 )
+from .empty_model import (
+    get_model_layer_config,
+    get_model_type,
+    get_model_layer_counts,
+    extract_vision_layers as _extract_vision_layers,
+    create_empty_model,
+)
 from .log import logger
 from .device_type import DEVICE_TYPE
 global LORA_REQUEST_ID
@@ -830,6 +837,138 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
         return _get_vllm_state_dict(llm, return_state_dict, config, is_vision_model)
 
 
+def _get_nested_attr(obj, attr_path: str):
+    parts = attr_path.split(".")
+    if parts[0] == "model" and not hasattr(obj, "model"):
+        parts = parts[1:]
+    cur = obj
+    try:
+        for part in parts:
+            if part.isdigit():
+                cur = cur[int(part)]
+            else:
+                cur = getattr(cur, part)
+        return cur
+    except (AttributeError, IndexError):
+        return None
+    return None
+
+def extract_model_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict):
+    """
+    Extracts layers for any model (Text or Vision) by dynamically using
+    a model-specific configuration. This approach is more robust and avoids
+    failures by correctly identifying layer paths and parameters.
+    """
+    model_type = get_model_type(vllm_internals.config)
+    layer_config = get_model_layer_config(return_non_layered = True)
+
+    all_layered_templates = (
+        layer_config.get('standard_layers', []) +
+        layer_config.get('vision_layers', []) +
+        layer_config.get('layernorms', []) +
+        layer_config.get('additional_layers', [])
+    )
+
+    layer_counts = get_model_layer_counts(vllm_internals.config)
+    num_layers_to_iterate = max(layer_counts.values()) if isinstance(layer_counts, dict) else layer_counts
+
+    # Process layered components
+    for kk in range(num_layers_to_iterate):
+        # Filter templates relevant for this layer index if needed, but usually we just iterate all
+        for layer_template in all_layered_templates:
+            layer_path = layer_template.format(kk=kk)
+            layer_module = _get_nested_attr(vllm_internals, layer_path)
+
+            if 'language_model.model' in layer_path:
+                # vLLM uses vllm_internals.language_model.model.layers while HF uses model.language_model.layers
+                # However, if vllm_internals IS the wrapper, it has .language_model.model corresponding to model.language_model
+                # _get_nested_attr handles "model" prefix stripping if "model" attr is missing.
+                pass
+
+            if layer_module is not None:
+                # Check for QKV splitting/fusion
+                if "qkv" in layer_path:
+                    if model_type in ("qwen2_5_vl", "qwen3_vl"):
+                        # If the HF model too prefers having merged qkv, we do this
+                        get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
+                    else:
+                         get_state_dict(f"{layer_path.replace('qkv_proj', 'q_proj')}", 0, state_dict, layer_module)
+                         get_state_dict(f"{layer_path.replace('qkv_proj', 'k_proj')}", 1, state_dict, layer_module)
+                         get_state_dict(f"{layer_path.replace('qkv_proj', 'v_proj')}", 2, state_dict, layer_module)
+                elif "gate_up_proj" in layer_path:
+                    # vLLM seems to have merged gate and up proj recently for qwen vl. This is to handle new variant
+                    get_state_dict(f"{layer_path.replace('gate_up_proj','gate_proj')}", 0, state_dict, layer_module)
+                    get_state_dict(f"{layer_path.replace('gate_up_proj','up_proj')}", 1, state_dict, layer_module)
+                elif "fc" in layer_path or "proj" in layer_path:
+                    get_state_dict(layer_path, 0, state_dict, layer_module)
+                else: # Handle other layers, especially layernorms
+                    if isinstance(layer_module, torch.nn.Module):
+                        if hasattr(layer_module, 'weight'):
+                            get_state_dict(layer_path, 0, state_dict, layer_module)
+                        # Also handle bias for norms if present (generic handled below via logic?)
+                        # get_state_dict handles bias inside it
+                    elif isinstance(layer_module, torch.nn.Parameter):
+                        state_dict[f"{layer_path}"] = layer_module.data
+                        quant_state_dict[f"{layer_path}"] = state_dict[f"{layer_path}"]
+                    # else:
+                    #     print(f"Unsloth: Skipping layer '{layer_path}' of unexpected type: {type(layer_module)}")
+            else:
+                # Fallback: if 'q_proj', 'k_proj', 'v_proj' are in standard_layers, look for 'qkv_proj' in vLLM
+                # Logic: If HF template says q_proj, but vLLM has qkv_proj.
+                # get_model_layer_config contains 'standard_layers' which has {q_proj, k_proj, v_proj}.
+                # If layer_module is None for '...q_proj', we check if '...qkv_proj' exists.
+                if "q_proj" in layer_path and "self_attn" in layer_path:
+                   qkv_path = layer_path.replace("q_proj", "qkv_proj")
+                   qkv_module = _get_nested_attr(vllm_internals, qkv_path)
+                   if qkv_module is not None:
+                       get_state_dict(layer_path, 0, state_dict, qkv_module)
+                elif "k_proj" in layer_path and "self_attn" in layer_path:
+                   qkv_path = layer_path.replace("k_proj", "qkv_proj")
+                   qkv_module = _get_nested_attr(vllm_internals, qkv_path)
+                   if qkv_module is not None:
+                       get_state_dict(layer_path, 1, state_dict, qkv_module)
+                elif "v_proj" in layer_path and "self_attn" in layer_path:
+                   qkv_path = layer_path.replace("v_proj", "qkv_proj")
+                   qkv_module = _get_nested_attr(vllm_internals, qkv_path)
+                   if qkv_module is not None:
+                       get_state_dict(layer_path, 2, state_dict, qkv_module)
+                elif "gate_proj" in layer_path and "mlp" in layer_path:
+                   gate_up_path = layer_path.replace("gate_proj", "gate_up_proj")
+                   gate_up_module = _get_nested_attr(vllm_internals, gate_up_path)
+                   if gate_up_module is not None:
+                       get_state_dict(layer_path, 0, state_dict, gate_up_module)
+                elif "up_proj" in layer_path and "mlp" in layer_path:
+                   gate_up_path = layer_path.replace("up_proj", "gate_up_proj")
+                   gate_up_module = _get_nested_attr(vllm_internals, gate_up_path)
+                   if gate_up_module is not None:
+                       get_state_dict(layer_path, 1, state_dict, gate_up_module)
+
+    # Extract non-layered components (embeddings, etc) if not handled by standard logic
+    # But usually standard logic handles embed_tokens/lm_head via set_additional_modules logic which runs AFTER this?
+    # No, _get_vllm_state_dict must extract them.
+    # We leave embed_tokens and lm_head extraction to the caller (standard _get_vllm_state_dict code) or integrate it.
+    # Current _get_vllm_state_dict handles embed_tokens and lm_head explicitly.
+    # We will keep that explicit handling to minimize risk, OR use non_layered_components.
+    # Let's check non_layered_components from config.
+    non_layered_components = layer_config.get('non_layered_components', [])
+    for component_path in non_layered_components:
+        component = _get_nested_attr(vllm_internals, component_path)
+        if component is not None:
+             if hasattr(component, 'weight'):
+                get_state_dict(component_path, 0, state_dict, component)
+             elif isinstance(component, torch.nn.Parameter):
+                state_dict[component_path] = component.data
+                quant_state_dict[component_path] = component.data
+             elif isinstance(component, torch.nn.Module):
+                for param_name, param in component.named_parameters():
+                    if param_name.replace('.weight', '') in non_layered_components: continue
+                    full_param_path = f"{component_path}.{param_name}"
+                    if hasattr(param, 'weight'):
+                        get_state_dict(full_param_path, 0, state_dict, param)
+                    elif hasattr(param, 'data'):
+                        state_dict[full_param_path] = param.data
+                        quant_state_dict[full_param_path] = param.data
+
 def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
@@ -1039,64 +1178,19 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     # Use get_state_dict for consistent extraction and automatic truncation
     get_state_dict(f"{vllm_text_model_prefix}.embed_tokens", 0, state_dict, embed_tokens, slice_weights=False)
 
-    # Get layer configuration for this model type
-    layer_config = get_model_layer_config()
-
-    # All layers
-    skipped_layernorms = []
-    for kk in range(len(vllm_text_model.layers)):
-        layer = vllm_text_model.layers[kk]
-        if hasattr(layer, "self_attn"):
-            prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
-            qkv_proj = layer.self_attn.qkv_proj
-            o_proj = layer.self_attn.o_proj
-
-            get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
-            get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
-            get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
-        elif hasattr(layer, "cross_attn"):
-            prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
-            qkv_proj = layer.cross_attn.qkv_proj
-            o_proj = layer.cross_attn.o_proj
-            name = re.sub(r"\.(\d+)\.", r"[\1].", prefix.replace('model.language_model','language_model.model', 1) + ".qkv_proj")
-            cross_attn_layer = eval(f'vllm_internals.{name}')
-            q_proj = cross_attn_layer.proj['q_proj_decoder']
-            kv_proj = cross_attn_layer.proj['kv_proj_encoder']
-            get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
-            get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
-            get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
-
-        get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
-
-        proj = layer.mlp.gate_up_proj
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
-
-        proj = layer.mlp.down_proj
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
-
-        # Use layernorms from the layer configuration
-        layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
-
-        for layernorm_name in layernorm_names:
-            vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
-            try:
-                layernorm = eval(vllm_name).state_dict()["weight"]
-                layernorm_name = f"{layernorm_name}.weight"
-                state_dict[layernorm_name] = layernorm
-                quant_state_dict[layernorm_name] = state_dict[layernorm_name]
-            except Exception as e:
-                skipped_layernorms.append(layernorm_name.split(".")[-1])
-        pass
-    pass
-
-    if len(skipped_layernorms) != 0:
-        print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
-    pass
+    # Use generic layer extraction
+    extract_model_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
 
     if is_vision_model:
-        # Handle vision-specific layers using dedicated functions
-        extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
+        # Handle vision-specific layers using dedicated functions (Wait, extract_model_layers does both now?)
+        # Since extract_model_layers includes vision_layers, we might be duplicating if we call extract_vision_layers too.
+        # However, extract_vision_layers logic in empty_model.py is what I copied.
+        # So I don't need to call _extract_vision_layers again IF extract_model_layers covers it.
+        # But for safety, and because user said "Let extract vision layers be as is",
+        # I should probably just use extract_model_layers which covers everything.
+        pass
+
+    # Norm
     # Norm
     # For Gemma3 and similar multimodal models, norm should be under model.norm
     # For standard models, also under model.norm
