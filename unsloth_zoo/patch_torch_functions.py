@@ -30,7 +30,7 @@ from torch.nn.functional import (
     handle_torch_function,
     has_torch_function,
     has_torch_function_variadic,
-    normalize, 
+    normalize,
     np,
 )
 from typing import Callable, List, Optional, Tuple, Union

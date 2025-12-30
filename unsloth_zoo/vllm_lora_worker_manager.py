@@ -69,7 +69,10 @@ class WorkerLoRAManager(AbstractWorkerManager):
     def create_lora_manager(
         self,
         model: torch.nn.Module,
+        *args,
+        **kwargs,
     ) -> Any:
+        vllm_config = args[0] if len(args) > 0 else kwargs.get("vllm_config", None)
         lora_manager = create_lora_manager(
             model,
             max_num_seqs=self.max_num_seqs,
@@ -78,6 +81,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
             lora_config=self.lora_config,
             device=self.device,
             lora_manager_cls=self._manager_cls,
+            vllm_config=vllm_config,
         )
         self._adapter_manager = lora_manager
         return lora_manager.model
@@ -339,11 +343,10 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
     def create_lora_manager(
         self,
         model: torch.nn.Module,
-        *args, **kwargs,
+        *args,
+        **kwargs,
     ) -> Any:
-        vllm_config = kwargs.get("vllm_config", None)
-        if len(args) > 0: vllm_config = args[0]
-
+        vllm_config = args[0] if len(args) > 0 else kwargs.get("vllm_config", None)
         lora_manager = create_lora_manager(
             model,
             lora_manager_cls=self._manager_cls,
@@ -353,7 +356,6 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
             device=self.device,
             max_num_batched_tokens=self.max_num_batched_tokens,
             vllm_config=vllm_config,
-            **kwargs,
         )
         self._adapter_manager = lora_manager
         return lora_manager.model

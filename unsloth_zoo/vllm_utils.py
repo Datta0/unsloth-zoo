@@ -91,7 +91,16 @@ def get_mem_info():
 pass
 
 if importlib.util.find_spec("vllm") is not None:
-    from vllm import __version__ as vllm_version
+    import vllm
+    try:
+        from vllm import __version__ as vllm_version
+    except ImportError:
+        try:
+            from vllm.version import __version__ as vllm_version
+        except ImportError:
+            vllm_version = "0.0.0"
+    if not hasattr(vllm, "__version__"):
+        vllm.__version__ = vllm_version
 
     # Patch excessive warning messages
     if not UNSLOTH_ENABLE_LOGGING:
@@ -1309,7 +1318,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.quant_method = "fbgemm_fp8"
                 elif fp8_weight_scale.ndim == 2:
                     # This denotes that the model if FP8 dynamic quantized.
-                    layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], activation_scheme = kwargs['activation_scheme']).to(get_target_device())
+                    layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
                     layer.weight = torch.nn.Parameter(weight, requires_grad = False)
@@ -1441,7 +1450,12 @@ def approximate_vllm_memory_usage(
     vocab_size = config.vocab_size
     hd = config.hidden_size
     context_length = config.max_position_embeddings
-    mlp_size = config.intermediate_size
+    if hasattr(config, "intermediate_size"):
+        mlp_size = config.intermediate_size
+    elif hasattr(config, "ffn_dim"):
+        mlp_size = config.ffn_dim
+    else:
+        mlp_size = config.hidden_size * 4
     n_layers = config.num_hidden_layers
     n_kv_heads = getattr(config, "num_key_value_heads", 1)
     n_heads    = getattr(config, "num_attention_heads", 1)
@@ -1973,7 +1987,7 @@ def load_vllm(
                 inductor_compile_config = get_torch_compile_options(
                     epilogue_fusion = True,
                     max_autotune = False, # Too slow
-                    shape_padding = False,
+                    shape_padding = True,
                     debug = False,
                     cudagraphs = cudagraphs,
                     coordinate_descent_tuning = False, # Too slow
@@ -2111,6 +2125,15 @@ def load_vllm(
                     f"Unsloth: Retrying vLLM to process {approx_max_num_seqs} sequences and {max_num_batched_tokens} tokens in tandem.\n"\
                     f"Error:\n{error}"
                 )
+            elif "FLASHINFER" in error:
+                print(
+                    f"Unsloth: Retrying vLLM without FLASHINFER.\n"\
+                    f"Error:\n{error}"
+                )
+                if "VLLM_ATTENTION_BACKEND" in os.environ:
+                    del os.environ["VLLM_ATTENTION_BACKEND"]
+                if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ:
+                    del os.environ["VLLM_USE_FLASHINFER_SAMPLER"]
             else:
                 raise RuntimeError(error)
         pass
