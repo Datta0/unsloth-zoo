@@ -2237,16 +2237,23 @@ pass
 
 
 def prepare_vllm_lora_loading(model):
-    # All Unsloth Zoo code licensed under LGPLv3
-    # Get all vLLM LoRAs - supports both dense and MoE models
+    """
+    Maps training model LoRA weights to vLLM's internal LoRA buffers.
+    Supports both dense and MoE models automatically.
+
+    Weight format differences:
+    - HuggingFace (training): Separate q/k/v/o_proj, separate gate/up/down_proj for MLP
+    - vLLM (inference): Fused qkv_proj, fused gate_up_proj for dense MLP
+    - MoE: HF uses experts.gate_up_proj/down_proj, vLLM uses w13/w2_lora_stacked
+
+    After calling this, use load_lora_directly() to copy weights via .copy_()
+    """
     assert(hasattr(model, "vllm_engine"))
 
-    # Must split into 2 lists since B is scaled in vLLM
     model_loras_A, model_loras_B = [], []
     vllm_loras_A,  vllm_loras_B  = [], []
     vllm_model = model.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
 
-    # Go through all layers!
     for v_layer, m_layer in zip(vllm_model.model.layers, model.model.model.layers):
         # ===== Attention (same for dense and MoE) =====
         model_loras_A.append(m_layer.self_attn.q_proj.lora_A.default.weight)
@@ -2362,8 +2369,10 @@ pass
 
 
 def load_lora_directly(model):
-    # All Unsloth Zoo code licensed under LGPLv3
-    # Load LoRAs directly from model into vLLM internal LoRAs
+    """
+    Copy LoRA weights from training model to vLLM's buffers.
+    Call this after training updates to sync weights. Scales LoRA B as vLLM expects.
+    """
     model_loras_A = model.model_loras_A
     model_loras_B = model.model_loras_B
     vllm_loras_A  = model. vllm_loras_A
@@ -2383,252 +2392,8 @@ def load_lora_directly(model):
 pass
 
 
-def is_moe_model(model):
-    """Check if the model contains MoE (Mixture of Experts) layers."""
-    # All Unsloth Zoo code licensed under LGPLv3
-    vllm_model = model.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
-    # Check if model has MoE layers by looking for FusedMoEWithLoRA wrappers
-    for name, module in vllm_model.named_modules():
-        if 'FusedMoE' in module.__class__.__name__:
-            return True
-    return False
-pass
-
-
-def prepare_vllm_moe_lora_weight_sharing(model, lora_idx=0):
-    """
-    Set up true weight sharing for MoE LoRA between training model and vLLM.
-
-    Like convert_vllm_to_huggingface, this directly assigns training model's LoRA
-    tensors to vLLM's buffers, so both share the same memory. No copy needed!
-
-    Args:
-        model: The Unsloth model with both training model and vllm_engine
-        lora_idx: The LoRA adapter index in vLLM's stacked buffers (default 0)
-
-    For MoE models, the training model stores:
-    - gate_up_proj.lora_A/B: Combined gate and up projection LoRAs
-    - down_proj.lora_A/B: Down projection LoRAs
-
-    vLLM FusedMoEWithLoRA expects:
-    - w13_lora_a_stacked: [max_loras, num_experts, rank, hidden_size]
-    - w13_lora_b_stacked: [max_loras, num_experts, intermediate_size, rank]
-    - w2_lora_a_stacked: [max_loras, num_experts, rank, intermediate_size]
-    - w2_lora_b_stacked: [max_loras, num_experts, hidden_size, rank]
-    """
-    # All Unsloth Zoo code licensed under LGPLv3
-    assert hasattr(model, "vllm_engine"), "Model must have vllm_engine attribute"
-
-    vllm_model = model.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
-    training_model = model.model.model  # Access the training model's base
-
-    # Track replacements for verification
-    shared_count = 0
-
-    # Also set up dense model LoRA sharing for attention layers
-    model_loras_A, model_loras_B = [], []
-    vllm_loras_A, vllm_loras_B = [], []
-
-    for v_layer, m_layer in zip(vllm_model.model.layers, training_model.layers):
-        # ===== Handle Attention LoRAs (same as dense models) =====
-        if hasattr(m_layer.self_attn, 'q_proj') and hasattr(m_layer.self_attn.q_proj, 'lora_A'):
-            model_loras_A.append(m_layer.self_attn.q_proj.lora_A.default.weight)
-            model_loras_A.append(m_layer.self_attn.k_proj.lora_A.default.weight)
-            model_loras_A.append(m_layer.self_attn.v_proj.lora_A.default.weight)
-            vllm_loras_A.append(v_layer.self_attn.qkv_proj.lora_a_stacked[0])
-            vllm_loras_A.append(v_layer.self_attn.qkv_proj.lora_a_stacked[1])
-            vllm_loras_A.append(v_layer.self_attn.qkv_proj.lora_a_stacked[2])
-
-            sq = m_layer.self_attn.q_proj.scaling.get("default", 1.0)
-            sk = m_layer.self_attn.k_proj.scaling.get("default", 1.0)
-            sv = m_layer.self_attn.v_proj.scaling.get("default", 1.0)
-            sq = None if sq == 1.0 else sq
-            sk = None if sk == 1.0 else sk
-            sv = None if sv == 1.0 else sv
-            model_loras_B.append(m_layer.self_attn.q_proj.lora_B.default.weight)
-            model_loras_B.append(m_layer.self_attn.k_proj.lora_B.default.weight)
-            model_loras_B.append(m_layer.self_attn.v_proj.lora_B.default.weight)
-            vllm_loras_B.append((v_layer.self_attn.qkv_proj.lora_b_stacked[0], sq))
-            vllm_loras_B.append((v_layer.self_attn.qkv_proj.lora_b_stacked[1], sk))
-            vllm_loras_B.append((v_layer.self_attn.qkv_proj.lora_b_stacked[2], sv))
-
-            so = m_layer.self_attn.o_proj.scaling.get("default", 1.0)
-            so = None if so == 1.0 else so
-            model_loras_A.append(m_layer.self_attn.o_proj.lora_A.default.weight)
-            vllm_loras_A.append(v_layer.self_attn.o_proj.lora_a_stacked[0])
-            model_loras_B.append(m_layer.self_attn.o_proj.lora_B.default.weight)
-            vllm_loras_B.append((v_layer.self_attn.o_proj.lora_b_stacked[0], so))
-
-        # ===== Handle MLP (MoE) =====
-        m_mlp = m_layer.mlp
-        v_mlp = v_layer.mlp
-
-        # Check if this is a MoE layer
-        if hasattr(m_mlp, 'experts') and 'SparseMoe' in m_mlp.__class__.__name__:
-            m_experts = m_mlp.experts
-
-            # Find vLLM's FusedMoEWithLoRA
-            v_moe = None
-            if hasattr(v_mlp, 'experts'):
-                v_moe = v_mlp.experts
-
-            if v_moe is None or 'FusedMoE' not in v_moe.__class__.__name__:
-                for name, child in v_mlp.named_modules():
-                    if 'FusedMoEWithLoRA' in child.__class__.__name__:
-                        v_moe = child
-                        break
-
-            if v_moe is None:
-                continue
-
-            # ===== TRUE WEIGHT SHARING for MoE gate_up_proj (w13) =====
-            if hasattr(m_experts, 'gate_up_proj') and hasattr(m_experts.gate_up_proj, 'lora_A'):
-                # Get training model's LoRA weights
-                # Training: lora_A = [rank, hidden_size] (shared for all experts via grouped matmul)
-                # Training: lora_B = [2*intermediate*num_experts, rank] or similar
-                gate_up_lora_A = m_experts.gate_up_proj.lora_A.default.weight
-                gate_up_lora_B = m_experts.gate_up_proj.lora_B.default.weight
-                scaling = m_experts.gate_up_proj.scaling.get("default", 1.0)
-                num_experts = m_experts.num_experts
-
-                # vLLM expects: w13_lora_a_stacked[lora_idx] = [num_experts, rank, hidden_size]
-                # For LoRA A, the weight is shared across experts (same LoRA applied to all)
-                # Reshape: [rank, hidden_size] -> [1, rank, hidden_size] -> broadcast to [num_experts, rank, hidden_size]
-                rank = gate_up_lora_A.shape[0]
-                hidden_size = gate_up_lora_A.shape[1]
-
-                # Create expanded view that shares memory via expand (no copy!)
-                lora_a_expanded = gate_up_lora_A.unsqueeze(0).expand(num_experts, -1, -1)
-
-                # Directly assign to vLLM's buffers - replaces the tensor at this index
-                # Both gate and up use the same LoRA A (they're computed together)
-                v_moe.w13_lora_a_stacked[0][lora_idx] = lora_a_expanded
-                v_moe.w13_lora_a_stacked[1][lora_idx] = lora_a_expanded
-
-                # For LoRA B: [2*intermediate*num_experts, rank] -> [num_experts, 2*intermediate, rank]
-                # Then split into gate and up
-                total_out = gate_up_lora_B.shape[0]
-                per_expert = total_out // num_experts
-                intermediate = per_expert // 2
-
-                # Reshape and split
-                lora_b_reshaped = gate_up_lora_B.view(num_experts, per_expert, rank)
-                gate_lora_b = lora_b_reshaped[:, :intermediate, :].contiguous()  # [num_experts, intermediate, rank]
-                up_lora_b = lora_b_reshaped[:, intermediate:, :].contiguous()    # [num_experts, intermediate, rank]
-
-                # Apply scaling to B (vLLM expects pre-scaled)
-                if scaling != 1.0:
-                    gate_lora_b = gate_lora_b * scaling
-                    up_lora_b = up_lora_b * scaling
-
-                v_moe.w13_lora_b_stacked[0][lora_idx] = gate_lora_b
-                v_moe.w13_lora_b_stacked[1][lora_idx] = up_lora_b
-
-                # Enable this adapter
-                v_moe.adapter_enabled[lora_idx] = 1
-                shared_count += 1
-
-            # ===== TRUE WEIGHT SHARING for MoE down_proj (w2) =====
-            if hasattr(m_experts, 'down_proj') and hasattr(m_experts.down_proj, 'lora_A'):
-                down_lora_A = m_experts.down_proj.lora_A.default.weight
-                down_lora_B = m_experts.down_proj.lora_B.default.weight
-                scaling = m_experts.down_proj.scaling.get("default", 1.0)
-                num_experts = m_experts.num_experts
-
-                # down_proj LoRA A: [rank, intermediate_size]
-                # vLLM expects: [num_experts, rank, intermediate_size]
-                rank = down_lora_A.shape[0]
-                lora_a_expanded = down_lora_A.unsqueeze(0).expand(num_experts, -1, -1)
-                v_moe.w2_lora_a_stacked[0][lora_idx] = lora_a_expanded
-
-                # down_proj LoRA B: [hidden_size*num_experts, rank] -> [num_experts, hidden_size, rank]
-                hidden_size = down_lora_B.shape[0] // num_experts
-                lora_b_reshaped = down_lora_B.view(num_experts, hidden_size, rank)
-
-                if scaling != 1.0:
-                    lora_b_reshaped = lora_b_reshaped * scaling
-
-                v_moe.w2_lora_b_stacked[0][lora_idx] = lora_b_reshaped
-                shared_count += 1
-        else:
-            # Dense MLP - similar to standard dense LoRA sharing
-            if hasattr(m_mlp, 'gate_proj') and hasattr(m_mlp.gate_proj, 'lora_A'):
-                model_loras_A.append(m_mlp.gate_proj.lora_A.default.weight)
-                model_loras_A.append(m_mlp.up_proj.lora_A.default.weight)
-                vllm_loras_A.append(v_layer.mlp.gate_up_proj.lora_a_stacked[0])
-                vllm_loras_A.append(v_layer.mlp.gate_up_proj.lora_a_stacked[1])
-
-                sg = m_mlp.gate_proj.scaling.get("default", 1.0)
-                su = m_mlp.up_proj.scaling.get("default", 1.0)
-                sg = None if sg == 1.0 else sg
-                su = None if su == 1.0 else su
-                model_loras_B.append(m_mlp.gate_proj.lora_B.default.weight)
-                model_loras_B.append(m_mlp.up_proj.lora_B.default.weight)
-                vllm_loras_B.append((v_layer.mlp.gate_up_proj.lora_b_stacked[0], sg))
-                vllm_loras_B.append((v_layer.mlp.gate_up_proj.lora_b_stacked[1], su))
-
-            if hasattr(m_mlp, 'down_proj') and hasattr(m_mlp.down_proj, 'lora_A'):
-                sd = m_mlp.down_proj.scaling.get("default", 1.0)
-                sd = None if sd == 1.0 else sd
-                model_loras_A.append(m_mlp.down_proj.lora_A.default.weight)
-                vllm_loras_A.append(v_layer.mlp.down_proj.lora_a_stacked[0])
-                model_loras_B.append(m_mlp.down_proj.lora_B.default.weight)
-                vllm_loras_B.append((v_layer.mlp.down_proj.lora_b_stacked[0], sd))
-    pass
-
-    # Store dense LoRA mappings for load_lora_directly compatibility
-    model.model_loras_A = model_loras_A
-    model.model_loras_B = model_loras_B
-    model.vllm_loras_A = vllm_loras_A
-    model.vllm_loras_B = vllm_loras_B
-    model.is_moe_weight_sharing = True
-    model.moe_shared_count = shared_count
-
-    logger.info(f"Set up MoE weight sharing: {shared_count} MoE layers, {len(model_loras_A)} dense LoRAs")
-    return
-pass
-
-
-def sync_moe_lora_weights(model):
-    """
-    Sync LoRA weights from training model to vLLM after training updates.
-
-    For MoE layers with true weight sharing, this is a NO-OP since they share memory!
-    For dense attention layers, this copies weights like load_lora_directly.
-    """
-    # All Unsloth Zoo code licensed under LGPLv3
-    if not hasattr(model, 'is_moe_weight_sharing') or not model.is_moe_weight_sharing:
-        raise RuntimeError("Must call prepare_vllm_moe_lora_weight_sharing first")
-
-    # Dense attention LoRAs still need to be copied (they're not MoE-stacked)
-    model_loras_A = model.model_loras_A
-    model_loras_B = model.model_loras_B
-    vllm_loras_A = model.vllm_loras_A
-    vllm_loras_B = model.vllm_loras_B
-
-    for model_lora_A, vllm_lora_A in zip(model_loras_A, vllm_loras_A):
-        vllm_lora_A.copy_(model_lora_A, non_blocking=True)
-
-    for model_lora_B, (vllm_lora_B, s) in zip(model_loras_B, vllm_loras_B):
-        vllm_lora_B.copy_(model_lora_B, non_blocking=True)
-        if s is not None:
-            vllm_lora_B *= s
-
-    torch.cuda.synchronize()
-
-    # MoE layers are already shared - no sync needed!
-    logger.info(f"Synced dense LoRAs. MoE weights are shared (no copy needed).")
-pass
-
-
-# Keep old names as aliases for backwards compatibility
-prepare_vllm_moe_lora_loading = prepare_vllm_moe_lora_weight_sharing
-load_moe_lora_directly = sync_moe_lora_weights
-
-
-
-
 from peft import PeftType
+
 
 
 @torch.inference_mode
