@@ -2238,7 +2238,7 @@ pass
 
 def prepare_vllm_lora_loading(model):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Get all vLLM LoRAs
+    # Get all vLLM LoRAs - supports both dense and MoE models
     assert(hasattr(model, "vllm_engine"))
 
     # Must split into 2 lists since B is scaled in vLLM
@@ -2247,7 +2247,8 @@ def prepare_vllm_lora_loading(model):
     vllm_model = model.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
 
     # Go through all layers!
-    for v_layer, m_layer in zip(vllm_model .model.layers, model.model.model.layers):
+    for v_layer, m_layer in zip(vllm_model.model.layers, model.model.model.layers):
+        # ===== Attention (same for dense and MoE) =====
         model_loras_A.append(m_layer.self_attn.q_proj.lora_A.default.weight)
         model_loras_A.append(m_layer.self_attn.k_proj.lora_A.default.weight)
         model_loras_A.append(m_layer.self_attn.v_proj.lora_A.default.weight)
@@ -2275,26 +2276,72 @@ def prepare_vllm_lora_loading(model):
         model_loras_B.append( m_layer.self_attn.o_proj.lora_B.default.weight)
         vllm_loras_B .append((v_layer.self_attn.o_proj.lora_b_stacked[0], so,))
 
-        model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
-        model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
-        vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[0])
-        vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[1])
+        # ===== MLP - auto-detect MoE vs dense =====
+        m_mlp = m_layer.mlp
+        v_mlp = v_layer.mlp
+        mlp_class_name = m_mlp.__class__.__name__
 
-        sg = m_layer.mlp.gate_proj.scaling["default"]
-        su = m_layer.mlp.  up_proj.scaling["default"]
-        sg = None if sg == 1.0 else sg
-        su = None if su == 1.0 else su
-        model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
-        model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
-        vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[0], sg,))
-        vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[1], su,))
+        if 'SparseMoe' in mlp_class_name or 'MoE' in mlp_class_name:
+            # MoE layer - experts have gate_up_proj and down_proj with LoRA
+            m_experts = m_mlp.experts
 
-        sd = m_layer.mlp.down_proj.scaling["default"]
-        sd = None if sd == 1.0 else sd
-        model_loras_A.append(m_layer.mlp.down_proj.lora_A.default.weight)
-        vllm_loras_A .append(v_layer.mlp.down_proj.lora_a_stacked[0])
-        model_loras_B.append( m_layer.mlp.down_proj.lora_B.default.weight)
-        vllm_loras_B .append((v_layer.mlp.down_proj.lora_b_stacked[0], sd,))
+            # Find vLLM's FusedMoEWithLoRA
+            v_moe = None
+            if hasattr(v_mlp, 'experts'):
+                v_moe = v_mlp.experts
+            else:
+                for name, child in v_mlp.named_modules():
+                    if 'FusedMoE' in child.__class__.__name__:
+                        v_moe = child
+                        break
+
+            if v_moe is None:
+                raise RuntimeError(f"Could not find FusedMoE layer in vLLM MoE block")
+
+            # MoE gate_up_proj LoRA (if exists)
+            if hasattr(m_experts, 'gate_up_proj') and hasattr(m_experts.gate_up_proj, 'lora_A'):
+                model_loras_A.append(m_experts.gate_up_proj.lora_A.default.weight)
+                model_loras_A.append(m_experts.gate_up_proj.lora_A.default.weight)  # Same A for gate and up
+                vllm_loras_A.append(v_moe.w13_lora_a_stacked[0][0])  # gate
+                vllm_loras_A.append(v_moe.w13_lora_a_stacked[1][0])  # up
+
+                sg = m_experts.gate_up_proj.scaling.get("default", 1.0)
+                sg = None if sg == 1.0 else sg
+                model_loras_B.append(m_experts.gate_up_proj.lora_B.default.weight)
+                model_loras_B.append(m_experts.gate_up_proj.lora_B.default.weight)
+                vllm_loras_B.append((v_moe.w13_lora_b_stacked[0][0], sg,))
+                vllm_loras_B.append((v_moe.w13_lora_b_stacked[1][0], sg,))
+
+            # MoE down_proj LoRA (if exists)
+            if hasattr(m_experts, 'down_proj') and hasattr(m_experts.down_proj, 'lora_A'):
+                sd = m_experts.down_proj.scaling.get("default", 1.0)
+                sd = None if sd == 1.0 else sd
+                model_loras_A.append(m_experts.down_proj.lora_A.default.weight)
+                vllm_loras_A.append(v_moe.w2_lora_a_stacked[0][0])
+                model_loras_B.append(m_experts.down_proj.lora_B.default.weight)
+                vllm_loras_B.append((v_moe.w2_lora_b_stacked[0][0], sd,))
+        else:
+            # Dense MLP - original logic
+            model_loras_A.append(m_layer.mlp.gate_proj.lora_A.default.weight)
+            model_loras_A.append(m_layer.mlp.up_proj.lora_A.default.weight)
+            vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[0])
+            vllm_loras_A .append(v_layer.mlp.gate_up_proj.lora_a_stacked[1])
+
+            sg = m_layer.mlp.gate_proj.scaling["default"]
+            su = m_layer.mlp.up_proj.scaling["default"]
+            sg = None if sg == 1.0 else sg
+            su = None if su == 1.0 else su
+            model_loras_B.append( m_layer.mlp.gate_proj.lora_B.default.weight)
+            model_loras_B.append( m_layer.mlp.up_proj.lora_B.default.weight)
+            vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[0], sg,))
+            vllm_loras_B .append((v_layer.mlp.gate_up_proj.lora_b_stacked[1], su,))
+
+            sd = m_layer.mlp.down_proj.scaling["default"]
+            sd = None if sd == 1.0 else sd
+            model_loras_A.append(m_layer.mlp.down_proj.lora_A.default.weight)
+            vllm_loras_A .append(v_layer.mlp.down_proj.lora_a_stacked[0])
+            model_loras_B.append( m_layer.mlp.down_proj.lora_B.default.weight)
+            vllm_loras_B .append((v_layer.mlp.down_proj.lora_b_stacked[0], sd,))
     pass
 
     # Check all shapes
@@ -2311,6 +2358,7 @@ def prepare_vllm_lora_loading(model):
     model. vllm_loras_B = vllm_loras_B
     return
 pass
+
 
 
 def load_lora_directly(model):
