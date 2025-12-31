@@ -1309,7 +1309,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.quant_method = "fbgemm_fp8"
                 elif fp8_weight_scale.ndim == 2:
                     # This denotes that the model if FP8 dynamic quantized.
-                    layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], activation_scheme = kwargs['activation_scheme']).to(get_target_device())
+                    layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
                     layer.weight = torch.nn.Parameter(weight, requires_grad = False)
@@ -1441,7 +1441,12 @@ def approximate_vllm_memory_usage(
     vocab_size = config.vocab_size
     hd = config.hidden_size
     context_length = config.max_position_embeddings
-    mlp_size = config.intermediate_size
+    # Handle different config attribute names for intermediate size
+    # Falcon uses hidden_dim or ff_factor, other models might use different names
+    mlp_size = getattr(config, "intermediate_size", None) or \
+               getattr(config, "hidden_dim", None) or \
+               getattr(config, "ffn_hidden_size", None) or \
+               int(hd * getattr(config, "ff_factor", 4))  # Default to 4x hidden_size
     n_layers = config.num_hidden_layers
     n_kv_heads = getattr(config, "num_key_value_heads", 1)
     n_heads    = getattr(config, "num_attention_heads", 1)
@@ -1973,7 +1978,7 @@ def load_vllm(
                 inductor_compile_config = get_torch_compile_options(
                     epilogue_fusion = True,
                     max_autotune = False, # Too slow
-                    shape_padding = False,
+                    shape_padding = True,
                     debug = False,
                     cudagraphs = cudagraphs,
                     coordinate_descent_tuning = False, # Too slow

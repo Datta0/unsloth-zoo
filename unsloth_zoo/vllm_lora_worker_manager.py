@@ -46,6 +46,13 @@ def dummy_lora_has_scaling_factor(create_dummy_lora):
     return "scaling_factor" in keys
 pass
 
+@functools.lru_cache(1)
+def create_lora_manager_needs_vllm_config():
+    """Check if create_lora_manager requires the vllm_config parameter (newer vLLM versions)"""
+    keys = inspect.signature(create_lora_manager).parameters.keys()
+    return "vllm_config" in keys
+pass
+
 class WorkerLoRAManager(AbstractWorkerManager):
     """WorkerLoRAManager that manages LoRA models on the worker side.
 
@@ -69,9 +76,10 @@ class WorkerLoRAManager(AbstractWorkerManager):
     def create_lora_manager(
         self,
         model: torch.nn.Module,
+        vllm_config: Optional[Any] = None,  # For compatibility with newer vLLM
     ) -> Any:
-        lora_manager = create_lora_manager(
-            model,
+        kwargs = dict(
+            model=model,
             max_num_seqs=self.max_num_seqs,
             max_num_batched_tokens=self.max_num_batched_tokens,
             vocab_size=self.vocab_size,
@@ -79,6 +87,10 @@ class WorkerLoRAManager(AbstractWorkerManager):
             device=self.device,
             lora_manager_cls=self._manager_cls,
         )
+        # Newer vLLM versions require vllm_config parameter
+        if create_lora_manager_needs_vllm_config() and vllm_config is not None:
+            kwargs['vllm_config'] = vllm_config
+        lora_manager = create_lora_manager(**kwargs)
         self._adapter_manager = lora_manager
         return lora_manager.model
 
@@ -339,24 +351,24 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
     def create_lora_manager(
         self,
         model: torch.nn.Module,
-        *args, **kwargs,
+        vllm_config: Optional[Any] = None,  # For compatibility with newer vLLM
     ) -> Any:
-        vllm_config = kwargs.get("vllm_config", None)
-        if len(args) > 0: vllm_config = args[0]
-
-        lora_manager = create_lora_manager(
-            model,
+        kwargs = dict(
+            model=model,
             lora_manager_cls=self._manager_cls,
             max_num_seqs=self.max_num_seqs,
             vocab_size=self.vocab_size,
             lora_config=self.lora_config,
             device=self.device,
             max_num_batched_tokens=self.max_num_batched_tokens,
-            vllm_config=vllm_config,
-            **kwargs,
         )
+        # Newer vLLM versions require vllm_config parameter
+        if create_lora_manager_needs_vllm_config() and vllm_config is not None:
+            kwargs['vllm_config'] = vllm_config
+        lora_manager = create_lora_manager(**kwargs)
         self._adapter_manager = lora_manager
         return lora_manager.model
+
 
     def _apply_adapters(self, lora_requests: Set[LoRARequest]) -> None:
         loras_map = {
