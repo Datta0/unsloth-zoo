@@ -265,6 +265,14 @@ if importlib.util.find_spec("vllm") is not None:
         vllm.model_executor.layers.quantization.bitsandbytes.is_layer_skipped_bnb = is_layer_skipped_bnb
         vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesLinearMethod._apply_4bit_weight = _apply_4bit_weight
 
+        # Patch BitsAndBytesMoEMethod if it exists
+        if hasattr(vllm.model_executor.layers.quantization.bitsandbytes, "BitsAndBytesMoEMethod"):
+             def select_gemm_impl(self, *args, **kwargs):
+                 return
+
+             vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesMoEMethod.select_gemm_impl = select_gemm_impl
+             vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesMoEMethod._apply_4bit_weight = _apply_4bit_weight
+
         # Disable all not supported messages
         try:
             from vllm.config import logger as vllm_config_logger
