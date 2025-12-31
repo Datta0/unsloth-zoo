@@ -1412,60 +1412,43 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     pass
 
                 if is_module_list:
+                    # HuggingFace standard MoE implementation (older versions)
+                    # Uses nn.ModuleList for experts
                     for expert_idx in range(num_experts):
                         expert_weight = weight[expert_idx]
+                        expert = experts_module[expert_idx]
 
                         if "gate_up_proj" in layer_name:
                             target_attr = "gate_up_proj"
-                            code = f"""
-expert = new_model.{base_name_br}.experts[{expert_idx}]
-# If gate_proj and up_proj exist, remove them
-if hasattr(expert, 'gate_proj'): del expert.gate_proj
-if hasattr(expert, 'up_proj'):   del expert.up_proj
-
-layer = torch.nn.Linear(0, 0, device=weight.device, bias=False)
-layer.in_features = {expert_weight.shape[1]}
-layer.out_features = {expert_weight.shape[0]}
-layer.weight = torch.nn.Parameter(expert_weight, requires_grad=False)
-expert.{target_attr} = layer
-"""
-                            exec(code)
-
+                            # If gate_proj and up_proj exist, remove them
+                            if hasattr(expert, 'gate_proj'): del expert.gate_proj
+                            if hasattr(expert, 'up_proj'):   del expert.up_proj
                         elif "down_proj" in layer_name:
-                            target_attr = "down_proj"
-                            code = f"""
-expert = new_model.{base_name_br}.experts[{expert_idx}]
-layer = torch.nn.Linear(0, 0, device=weight.device, bias=False)
-layer.in_features = {expert_weight.shape[1]}
-layer.out_features = {expert_weight.shape[0]}
-layer.weight = torch.nn.Parameter(expert_weight, requires_grad=False)
-expert.{target_attr} = layer
-"""
-                            exec(code)
+                             target_attr = "down_proj"
+
+                        layer = torch.nn.Linear(0, 0, bias=False, device=weight.device)
+                        layer.in_features = expert_weight.shape[1]
+                        layer.out_features = expert_weight.shape[0]
+                        layer.weight = torch.nn.Parameter(expert_weight, requires_grad=False)
+                        setattr(expert, target_attr, layer)
+
                 else:
                     # Fused MoE (Qwen3MoeExperts etc) - single module with fused weights
-                    # Assign full 3D weight directly
+                    # This path handles new transformers (5.0+) or vLLM native FusedMoE modules
+                    # Assign full 3D weight directly without splitting per expert
                     target_attr = "gate_up_proj" if "gate_up_proj" in layer_name else "down_proj"
 
-                    code = f"""
-experts_module = new_model.{base_name_br}.experts
-if hasattr(experts_module, '{target_attr}'):
-    # Assign weight directly
-    # Can be a Parameter or just an attribute depending on implementation
-    # We overwrite it with a Parameter to be safe
-    # If the attribute is a Linear layer, we might need to replace it or set .weight
-    # But Qwen3MoeExperts usually has these as Parameters/tensors if fused
-    current_val = getattr(experts_module, '{target_attr}')
-    if isinstance(current_val, torch.nn.Linear):
-         current_val.weight = torch.nn.Parameter(weight, requires_grad=False)
-    else:
-         setattr(experts_module, '{target_attr}', torch.nn.Parameter(weight, requires_grad=False))
-elif hasattr(experts_module, 'register_parameter'):
-     experts_module.register_parameter('{target_attr}', torch.nn.Parameter(weight, requires_grad=False))
-else:
-     setattr(experts_module, '{target_attr}', torch.nn.Parameter(weight, requires_grad=False))
-"""
-                    exec(code)
+                    # We can simply getattr / setattr
+                    if hasattr(experts_module, target_attr):
+                        current_val = getattr(experts_module, target_attr)
+                        if isinstance(current_val, torch.nn.Linear):
+                             current_val.weight = torch.nn.Parameter(weight, requires_grad=False)
+                        else:
+                             setattr(experts_module, target_attr, torch.nn.Parameter(weight, requires_grad=False))
+                    elif hasattr(experts_module, 'register_parameter'):
+                        experts_module.register_parameter(target_attr, torch.nn.Parameter(weight, requires_grad=False))
+                    else:
+                        setattr(experts_module, target_attr, torch.nn.Parameter(weight, requires_grad=False))
                 continue
 
             if fp8_weight_scale is not None: assert fp8_weight_scale.ndim in [1,2], f"we only support row quantized (ndim=1) and block quantized(ndim=2) fp8 but found {fp8_weight_scale.ndim}"
