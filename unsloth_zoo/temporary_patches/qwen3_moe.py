@@ -128,6 +128,7 @@ def patch_qwen3_moe():
             # one hot encode the selected experts to create an expert mask
             # this will be used to easily index which expert is going to be sollicitated
             # Loop over all available experts in the model and perform the computation on each expert
+            expert_idx = torch.arange(self.num_experts, device=hidden_states.device)
             for expert_idx in range(self.num_experts):
                 expert_layer = self.experts[expert_idx]
                 token_idx, _ = torch.where(selected_experts == expert_idx)
@@ -244,9 +245,37 @@ def patch_qwen3_moe():
         def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             batch_size, sequence_length, hidden_dim = hidden_states.shape
             hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-            _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+            # _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+            gate_output = self.gate(hidden_states_reshaped)
+            router_logits = None
+            if isinstance(gate_output, tuple):
+                if len(gate_output) == 3:
+                     router_logits, routing_weights, selected_experts = gate_output
+                elif len(gate_output) == 2:
+                     routing_weights, selected_experts = gate_output
+                else:
+                     print(f"Unsloth: gate_output len {len(gate_output)}")
+                     routing_weights, selected_experts = gate_output[1], gate_output[2]
+                     if hasattr(gate_output[0], "shape"): router_logits = gate_output[0]
+            else:
+                 # It is just logits (Tensor). We need to compute routing manually.
+                 # Matches standard Qwen2MoE logic.
+                 router_logits = gate_output
+                 routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+
+                 # Fast inference path might lose these attributes
+                 top_k = getattr(self, "top_k", getattr(self, "num_experts_per_tok", 8))
+                 norm_topk_prob = getattr(self, "norm_topk_prob", True)
+
+                 routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+                 if norm_topk_prob:
+                     routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+
+                 routing_weights = routing_weights.to(hidden_states.dtype)
+
             final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
-            return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            return final_hidden_states
 
     # For old transformers, patch Qwen3MoeSparseMoeBlock
     # For new transformers, patch Qwen3MoeExperts (which has the expert loop)

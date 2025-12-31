@@ -280,6 +280,11 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     new_config.vocab_size = 1
     new_config.pad_token_id = 0
 
+    if hasattr(new_config, "moe_intermediate_size"):
+        new_config.moe_intermediate_size = 1
+    if hasattr(new_config, "shared_expert_intermediate_size"):
+        new_config.shared_expert_intermediate_size = 1
+
     # Set attention module head_dim
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})

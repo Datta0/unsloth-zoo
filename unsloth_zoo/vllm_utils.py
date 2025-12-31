@@ -47,7 +47,10 @@ from torch import __version__ as torch_version
 import json
 import psutil
 import functools
+import functools
 import contextlib
+import logging
+logger = logging.getLogger(__name__)
 import inspect
 from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
@@ -1096,6 +1099,12 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             if fused_moe is None:
                 raise RuntimeError(f"Could not find FusedMoE layer in MoE block at layer {kk}")
 
+            # Unwrap generic LoRA wrapper or VLLM's specific PyTorch LoRA wrapper
+            if hasattr(fused_moe, "base_layer"):
+                fused_moe = fused_moe.base_layer
+
+            # Get expert weights - these are stored as w13_weight and w2_weight
+
             # Get expert weights - these are stored as w13_weight and w2_weight
             # No need to use get_state_dict since these are already the full tensors
             mlp_prefix = f"{vllm_text_model_prefix}.layers.{kk}.mlp"
@@ -1230,6 +1239,23 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # Unmerges vLLM modules to create HF compatible model
     set_dtype_in_config(config, dtype)
     new_model, original_meta_model, layer_count, layer_names = create_empty_model(config, dtype, is_vision_model)
+
+    # Ensure MoE experts are in layer_names if present in state_dict
+    # This fixes issues where empty_model.py might miss expert layers
+    if layer_count > 0:
+        # Robustly find any expert keys in quant_state_dict
+        expert_keys = [k for k in quant_state_dict.keys() if "experts.gate_up_proj" in k or "experts.down_proj" in k]
+        if len(expert_keys) > 0:
+            # Check if they are already in layer_names (using set for speed if large, but list is fine for <1000 items)
+            existing_layers = set(layer_names)
+            keys_to_add = [k for k in expert_keys if k not in existing_layers]
+
+            if len(keys_to_add) > 0:
+                logger.warning(f"Unsloth: Manually adding {len(keys_to_add)} MoE expert layers to layer_names for processing.")
+                layer_names.extend(keys_to_add)
+                # Sort to ensure deterministic order (though processing order mostly doesn't matter for these)
+                layer_names.sort()
+
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
     quantization_config = getattr(config, "quantization_config", {})
     quant_method = get_quant_type(config)
@@ -1340,6 +1366,99 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             elif f"{layer_name}.weight_scale_inv" in quant_state_dict:
                 fp8_weight_scale = quant_state_dict[f"{layer_name}.weight_scale_inv"]
             pass
+
+            if "experts" in layer_name:
+                pass
+            else:
+                pass
+                if f"{layer_name}" in quant_state_dict:
+                    pass
+                elif f"{layer_name}.weight" in quant_state_dict:
+                    pass
+                else:
+                    pass
+
+            # Handle MoE experts specially
+            if "experts.gate_up_proj" in layer_name or "experts.down_proj" in layer_name:
+                logger.warning(f"Entering MoE special handling for {layer_name}")
+                weight = quant_state_dict[f"{layer_name}"] # Fused weight [E, ...]
+                num_experts = weight.shape[0]
+
+                # Get the base path to "experts" e.g. model.layers[0].mlp.experts
+                # layer_name is "model.layers.0.mlp.experts.gate_up_proj"
+                base_name = layer_name.rsplit(".", 2)[0] # model.layers.0.mlp
+                # Fix: Do NOT remove 'model.' because new_model is the wrapper (Qwen3MoeForCausalLM) which has .model attribute
+                base_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", base_name)
+
+                # Access the "experts" ModuleList from new_model
+                # We use eval/exec carefully
+
+                # Check if experts is a ModuleList or a single fused generic module
+                # Qwen2.5/Qwen3 VL uses a single Qwen3MoeExperts module instead of a ModuleList
+                is_module_list = False
+                try:
+                    experts_module = eval(f"new_model.{base_name_br}.experts")
+                    if isinstance(experts_module, torch.nn.ModuleList):
+                        is_module_list = True
+                except:
+                    pass
+
+                if is_module_list:
+                    for expert_idx in range(num_experts):
+                        expert_weight = weight[expert_idx]
+
+                        if "gate_up_proj" in layer_name:
+                            target_attr = "gate_up_proj"
+                            code = f"""
+expert = new_model.{base_name_br}.experts[{expert_idx}]
+# If gate_proj and up_proj exist, remove them
+if hasattr(expert, 'gate_proj'): del expert.gate_proj
+if hasattr(expert, 'up_proj'):   del expert.up_proj
+
+layer = torch.nn.Linear(0, 0, device=weight.device, bias=False)
+layer.in_features = {expert_weight.shape[1]}
+layer.out_features = {expert_weight.shape[0]}
+layer.weight = torch.nn.Parameter(expert_weight, requires_grad=False)
+expert.{target_attr} = layer
+"""
+                            exec(code)
+
+                        elif "down_proj" in layer_name:
+                            target_attr = "down_proj"
+                            code = f"""
+expert = new_model.{base_name_br}.experts[{expert_idx}]
+layer = torch.nn.Linear(0, 0, device=weight.device, bias=False)
+layer.in_features = {expert_weight.shape[1]}
+layer.out_features = {expert_weight.shape[0]}
+layer.weight = torch.nn.Parameter(expert_weight, requires_grad=False)
+expert.{target_attr} = layer
+"""
+                            exec(code)
+                else:
+                    # Fused MoE (Qwen3MoeExperts etc) - single module with fused weights
+                    # Assign full 3D weight directly
+                    target_attr = "gate_up_proj" if "gate_up_proj" in layer_name else "down_proj"
+
+                    code = f"""
+experts_module = new_model.{base_name_br}.experts
+if hasattr(experts_module, '{target_attr}'):
+    # Assign weight directly
+    # Can be a Parameter or just an attribute depending on implementation
+    # We overwrite it with a Parameter to be safe
+    # If the attribute is a Linear layer, we might need to replace it or set .weight
+    # But Qwen3MoeExperts usually has these as Parameters/tensors if fused
+    current_val = getattr(experts_module, '{target_attr}')
+    if isinstance(current_val, torch.nn.Linear):
+         current_val.weight = torch.nn.Parameter(weight, requires_grad=False)
+    else:
+         setattr(experts_module, '{target_attr}', torch.nn.Parameter(weight, requires_grad=False))
+elif hasattr(experts_module, 'register_parameter'):
+     experts_module.register_parameter('{target_attr}', torch.nn.Parameter(weight, requires_grad=False))
+else:
+     setattr(experts_module, '{target_attr}', torch.nn.Parameter(weight, requires_grad=False))
+"""
+                    exec(code)
+                continue
 
             if fp8_weight_scale is not None: assert fp8_weight_scale.ndim in [1,2], f"we only support row quantized (ndim=1) and block quantized(ndim=2) fp8 but found {fp8_weight_scale.ndim}"
 
@@ -2317,8 +2436,14 @@ def prepare_vllm_lora_loading(model):
 
                 sg = m_experts.gate_up_proj.scaling.get("default", 1.0)
                 sg = None if sg == 1.0 else sg
-                model_loras_B.append(m_experts.gate_up_proj.lora_B.default.weight)
-                model_loras_B.append(m_experts.gate_up_proj.lora_B.default.weight)
+                # model_loras_B.append(m_experts.gate_up_proj.lora_B.default.weight)
+                # model_loras_B.append(m_experts.gate_up_proj.lora_B.default.weight)
+                # We must slice the B matrix into 2 parts
+                # The shape is [2*intermediate_size, rank]
+                lora_B = m_experts.gate_up_proj.lora_B.default.weight
+                intermediate_weight_size = lora_B.shape[0] // 2
+                model_loras_B.append(lora_B[:intermediate_weight_size])
+                model_loras_B.append(lora_B[intermediate_weight_size:])
                 vllm_loras_B.append((v_moe.w13_lora_b_stacked[0][0], sg,))
                 vllm_loras_B.append((v_moe.w13_lora_b_stacked[1][0], sg,))
 
