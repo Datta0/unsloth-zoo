@@ -530,6 +530,15 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.gate_proj",
             "model.layers.{kk}.mlp.up_proj",
             "model.layers.{kk}.mlp.down_proj",
+
+            # MoE expert layers (Qwen3MoE, etc.)
+            # These are nn.Parameter, not Linear layers, so no .weight suffix
+            "model.layers.{kk}.mlp.experts.gate_up_proj",
+            "model.layers.{kk}.mlp.experts.down_proj",
+            "model.layers.{kk}.mlp.gate",  # Router gate
+            "model.language_model.layers.{kk}.mlp.experts.gate_up_proj",
+            "model.language_model.layers.{kk}.mlp.experts.down_proj",
+            "model.language_model.layers.{kk}.mlp.gate",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
