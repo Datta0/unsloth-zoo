@@ -267,82 +267,11 @@ if importlib.util.find_spec("vllm") is not None:
 
         # Patch BitsAndBytesMoEMethod if it exists
         if hasattr(vllm.model_executor.layers.quantization.bitsandbytes, "BitsAndBytesMoEMethod"):
-            from vllm.model_executor.layers.fused_moe.fused_moe import TritonExperts
-            from vllm.model_executor.layers.fused_moe import fused_experts
+             def select_gemm_impl(self, *args, **kwargs):
+                 return
 
-            class UnslothBitsAndBytesTritonExperts(TritonExperts):
-                def apply(
-                    self,
-                    output,
-                    hidden_states,
-                    w1,
-                    w2,
-                    topk_weights,
-                    topk_ids,
-                    activation,
-                    global_num_experts,
-                    expert_map,
-                    a1q_scale,
-                    a2_scale,
-                    workspace13,
-                    workspace2,
-                    expert_tokens_meta,
-                    apply_router_weight_on_input,
-                ):
-                    from bitsandbytes.functional import dequantize_4bit
-                    # w1 and w2 are the quantized weights (Parameters with bnb state)
-                    w1_d = dequantize_4bit(w1.reshape(-1, 1), w1.bnb_quant_state).reshape(w1.experts_shape)
-                    w2_d = dequantize_4bit(w2.reshape(-1, 1), w2.bnb_quant_state).reshape(w2.experts_shape)
-
-                    # Call standard fused_experts (outplace but uses inplace arg if supported)
-                    return fused_experts(
-                       hidden_states=hidden_states,
-                       w1=w1_d,
-                       w2=w2_d,
-                       topk_weights=topk_weights,
-                       topk_ids=topk_ids,
-                       inplace=True,
-                       activation=activation,
-                       apply_router_weight_on_input=apply_router_weight_on_input,
-                       global_num_experts=global_num_experts,
-                       expert_map=expert_map
-                    )
-
-            class DummyQuantConfig:
-                def __getattr__(self, name): return None
-
-            def select_gemm_impl(self, *args, **kwargs):
-                # Return our custom experts implementation satisfying LoRA checks
-                return UnslothBitsAndBytesTritonExperts(DummyQuantConfig())
-
-            def get_fused_moe_quant_config(self, layer):
-                return DummyQuantConfig()
-
-            # Patch maybe_make_prepare_finalize to return None to prevent FusedMoEModularMethod wrapper
-            # This is critical because:
-            # 1. BitsAndBytesMoEMethod.apply() directly dequantizes and calls fused_experts
-            # 2. FusedMoEModularMethod uses TritonExperts.workspace_shapes() which calculates
-            #    buffer sizes from packed 4-bit weight dimensions instead of dequantized dimensions
-            # 3. This causes massive OOM (e.g., 288 GiB allocation attempt)
-            def maybe_make_prepare_finalize(self, routing_tables=None):
-                logger.warning("Unsloth: maybe_make_prepare_finalize returning None for bitsandbytes MoE")
-                return None
-
-            vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesMoEMethod.select_gemm_impl = select_gemm_impl
-            vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesMoEMethod.get_fused_moe_quant_config = get_fused_moe_quant_config
-            vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesMoEMethod.maybe_make_prepare_finalize = maybe_make_prepare_finalize
-            vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesMoEMethod._apply_4bit_weight = _apply_4bit_weight
-
-            # Also patch the base class to catch all MoE methods
-            from vllm.model_executor.layers.fused_moe.fused_moe_method_base import FusedMoEMethodBase
-            original_maybe_make = FusedMoEMethodBase.maybe_make_prepare_finalize
-            def patched_maybe_make_prepare_finalize(self, routing_tables=None):
-                # Only return None for BitsAndBytesMoEMethod
-                if isinstance(self, vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesMoEMethod):
-                    logger.warning("Unsloth: FusedMoEMethodBase.maybe_make_prepare_finalize returning None for bitsandbytes MoE")
-                    return None
-                return original_maybe_make(self, routing_tables=routing_tables)
-            FusedMoEMethodBase.maybe_make_prepare_finalize = patched_maybe_make_prepare_finalize
+             vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesMoEMethod.select_gemm_impl = select_gemm_impl
+             vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesMoEMethod._apply_4bit_weight = _apply_4bit_weight
 
         # Disable all not supported messages
         try:
@@ -356,10 +285,6 @@ if importlib.util.find_spec("vllm") is not None:
         vllm_config_logger.addFilter(HideLoggingMessage("not set"))
         del vllm_config_logger
     pass
-
-    # Call patch_vllm_bitsandbytes at import time to ensure patches are applied
-    # BEFORE any vLLM models are created (critical for 4-bit MoE OOM fix)
-    patch_vllm_bitsandbytes()
 
     class BitsAndBytesConfig(
         vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
