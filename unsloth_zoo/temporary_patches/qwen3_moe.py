@@ -149,13 +149,34 @@ def _create_experts_forward(backend):
 # ============================================================================
 
 @torch.compiler.disable
-def _sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+def _sparse_moe_block_forward_v5(self, hidden_states: torch.Tensor) -> torch.Tensor:
     """
-    SparseMoeBlock forward that handles both gate output formats.
+    SparseMoeBlock forward for transformers v5+.
 
-    Handles:
+    Returns only the hidden states tensor. Router logits are captured
+    via the OutputRecorder mechanism in v5.
+    """
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+
+    # TopKRouter returns (router_logits, routing_weights, selected_experts)
+    _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+
+    # Use optimized grouped GEMM
+    final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+    return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+
+@torch.compiler.disable
+def _sparse_moe_block_forward_v4(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """
+    SparseMoeBlock forward for transformers v4.x with compatibility layer.
+
+    Handles both:
     - TopKRouter: returns (router_logits, routing_weights, selected_experts)
     - nn.Linear: returns just logits, routing computed manually
+
+    Returns (hidden_states, router_logits) tuple for v4 compatibility.
     """
     if getattr(self, '_unsloth_needs_conversion', False):
         self._convert_to_stacked_experts()
@@ -360,11 +381,11 @@ def patch_qwen3_moe():
         # Patch expert forward
         Qwen3MoeExperts.forward = experts_forward
 
-        # Patch SparseMoeBlock forward
+        # Patch SparseMoeBlock forward (v4 returns tuple with router_logits)
         patch_function(
             qwen3_module.Qwen3MoeSparseMoeBlock,
             "forward",
-            _sparse_moe_block_forward
+            _sparse_moe_block_forward_v4
         )
     else:
         # ================================================================
@@ -375,10 +396,11 @@ def patch_qwen3_moe():
             "forward",
             experts_forward
         )
+        # Patch SparseMoeBlock forward (v5 returns tensor only)
         patch_function(
             qwen3_module.Qwen3MoeSparseMoeBlock,
             "forward",
-            _sparse_moe_block_forward
+            _sparse_moe_block_forward_v5
         )
 
     # ================================================================
