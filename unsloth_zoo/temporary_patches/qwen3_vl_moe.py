@@ -16,9 +16,108 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+from .moe_utils import *
+from .transformers_v4_compat import apply_v4_compatibility_patches, UnslothMoeExperts, UnslothMoeTopKRouter
 import os
 import torch
 import torch.nn as nn
+from typing import Optional, Tuple, Union, List
+
+# Check mapping!
+# Qwen3VLMoeModel               <-- Qwen3MoeModel
+# Qwen3VLMoeForCausalLM         <-- Qwen3MoeForCausalLM
+# Qwen3VLMoeSparseMoeBlock      <-- Qwen3MoeSparseMoeBlock
+# Qwen3VLMoeTextSparseMoeBlock  (This one is actual MoE block for text)
+# Qwen3VLMoeTextExperts         <-- Qwen3MoeExperts (v5)
+
+
+def _create_causal_lm_forward():
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+
+    def forward_causal_lm(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Any] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ):
+        output_hidden_states = kwargs.get("output_hidden_states", None)
+        return_dict = kwargs.get("return_dict", None)
+
+        if os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1":
+            output_hidden_states = True
+            kwargs["output_hidden_states"] = True
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = outputs[0]
+
+        if os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1":
+            # Handle logits_to_keep: slice hidden states to return only the last N+1 positions
+            if logits_to_keep > 0:
+                hidden_states = hidden_states[:, -logits_to_keep:, :]
+            return CausalLMOutputWithPast(
+                loss=None,
+                logits=hidden_states,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+
+        loss = None
+        logits = hidden_states
+        if self.config.tie_word_embeddings:
+            logits = F.linear(logits, self.model.embed_tokens.weight)
+        else:
+            logits = self.lm_head(logits)
+
+        logits = logits.float()
+
+        if labels is not None:
+             # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = nn.CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+    return forward_causal_lm
+
 import torch.nn.functional as F
 import inspect
 from .common import (
@@ -47,11 +146,27 @@ from .moe_utils import (
 )
 
 def patch_qwen3_vl_moe():
+    from transformers.models.qwen2_vl import modeling_qwen2_vl
     try:
-        import transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe
-        transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextSparseMoeBlock
-    except Exception as e:
-        return raise_error("transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextSparseMoeBlock", e)
+        from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
+    except ImportError:
+        try:
+            from transformers.models.qwen2_vl_moe import modeling_qwen2_vl_moe as modeling_qwen3_vl_moe
+        except ImportError:
+            return
+
+    # Check for v4 compatibility
+    UnslothMoeExperts, UnslothMoeTopKRouter = apply_v4_compatibility_patches(
+         modeling_qwen3_vl_moe,
+         target_class_name="Qwen3VLMoeTextSparseMoeBlock",
+         experts_class_name="Qwen3VLMoeTextExperts"
+    )
+
+    Qwen3VLMoeTextExperts = modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts
+    Qwen3VLMoeTextSparseMoeBlock = modeling_qwen3_vl_moe.Qwen3VLMoeTextSparseMoeBlock
+    Qwen3VLMoeForConditionalGeneration = modeling_qwen3_vl_moe.Qwen3VLMoeForConditionalGeneration
+
+    patch_function(Qwen3VLMoeForConditionalGeneration, "forward", _create_causal_lm_forward(), force=True)
 
     old_transformers = True
     try:
@@ -197,10 +312,13 @@ def patch_qwen3_vl_moe():
 
                     current_state = hidden_states[token_idx]
 
-                    # Assuming gate_up_proj and down_proj exist as stacked weights in Experts class
-                    gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                    # Weights are now [H, 2*I] and [I, H] (HF format)
+                    # Use matmul directly: [tokens, H] @ [H, 2*I] = [tokens, 2*I]
+                    gate_up = current_state @ self.gate_up_proj[expert_idx]
+                    gate, up = gate_up.chunk(2, dim=-1)
                     current_hidden_states = self.act_fn(gate) * up
-                    current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+                    # [tokens, I] @ [I, H] = [tokens, H]
+                    current_hidden_states = current_hidden_states @ self.down_proj[expert_idx]
 
                     current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
                     final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))

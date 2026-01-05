@@ -331,7 +331,8 @@ def forward_triton_grouped_gemm(
 
     # Cache model dimensions and kernel configs on first call
     if self._unsloth_moe_configs is None:
-        intermediate_dim = self.gate_up_proj.shape[1] // 2
+        # With HF format: gate_up_proj is [E, H, 2*I], so intermediate_dim = shape[2] // 2
+        intermediate_dim = self.gate_up_proj.shape[2] // 2
 
         # Autotune first GEMM
         gemm1_configs = get_or_autotune_moe_kernels(

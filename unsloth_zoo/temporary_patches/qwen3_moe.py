@@ -370,14 +370,15 @@ def patch_qwen3_moe():
         # Transformers v4.x: Apply compatibility layer
         # ================================================================
         from .transformers_v4_compat import (
-            Qwen3MoeExperts,
-            Qwen3MoeTopKRouter,
-            apply_v4_compatibility_patches,
+            apply_v4_compatibility_patches, UnslothMoeExperts, UnslothMoeTopKRouter,
         )
 
         # Apply v4 compatibility patches (init, state dict loading, etc.)
-        apply_v4_compatibility_patches(qwen3_module)
-
+        UnslothMoeExperts, UnslothMoeTopKRouter = apply_v4_compatibility_patches(
+            transformers.models.qwen3_moe.modeling_qwen3_moe,
+            target_class_name="Qwen3MoeSparseMoeBlock",
+            experts_class_name="Qwen3MoeExperts"
+        )
         # Patch expert forward
         Qwen3MoeExperts.forward = experts_forward
 

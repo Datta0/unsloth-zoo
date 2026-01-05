@@ -47,16 +47,15 @@ import torch.nn.functional as F
 from .utils import logger
 
 
-class Qwen3MoeExperts(nn.Module):
+class UnslothMoeExperts(nn.Module):
     """
-    v5-compatible Experts class for use with v4 transformers.
+    v5-compatible Experts class for used with v4 transformers.
 
     Stores expert weights as stacked 3D tensors for efficient grouped GEMM:
-    - gate_up_proj: [num_experts, 2 * intermediate_dim, hidden_dim]
-    - down_proj: [num_experts, hidden_dim, intermediate_dim]
+    - gate_up_proj: [num_experts, hidden_dim, 2 * intermediate_dim]
+    - down_proj: [num_experts, intermediate_dim, hidden_dim]
 
-    This format enables batch matrix multiplication across all experts
-    instead of looping through individual expert modules.
+    This format matches HF transformers v5's Qwen3VLMoeTextExperts/Qwen3MoeExperts.
     """
 
     def __init__(self, config):
@@ -64,13 +63,14 @@ class Qwen3MoeExperts(nn.Module):
         self.num_experts = config.num_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.moe_intermediate_size
+        self.hidden_size = config.hidden_size  # Alias for compatibility
 
-        # Stacked weights: [E, 2*I, H] and [E, H, I]
+        # Stacked weights: [E, H, 2*I] and [E, I, H] - matches HF format
         self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
+            torch.empty(self.num_experts, self.hidden_dim, 2 * self.intermediate_dim)
         )
         self.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
+            torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim)
         )
 
         # Get activation function from config
@@ -80,17 +80,17 @@ class Qwen3MoeExperts(nn.Module):
     @classmethod
     def from_modulelist(cls, experts_list, config, dtype=None):
         """
-        Convert nn.ModuleList[Qwen3MoeMLP] to stacked format.
+        Convert nn.ModuleList[MoeMLP] to stacked format.
 
         Memory-efficient: stacks directly without intermediate copies.
 
         Args:
-            experts_list: nn.ModuleList of Qwen3MoeMLP modules
+            experts_list: nn.ModuleList of MoeMLP modules
             config: Model config with num_experts, hidden_size, moe_intermediate_size
             dtype: Optional dtype override (defaults to first expert's dtype)
 
         Returns:
-            Qwen3MoeExperts instance with stacked weights
+            UnslothMoeExperts instance with stacked weights
         """
         instance = cls.__new__(cls)
         nn.Module.__init__(instance)
@@ -108,17 +108,18 @@ class Qwen3MoeExperts(nn.Module):
         device = experts_list[0].gate_proj.weight.device
 
         # Stack weights efficiently
-        # gate_up_proj: [E, 2*I, H] - concat gate and up per expert, then stack
-        # down_proj: [E, H, I]
+        # gate_up_proj: [E, H, 2*I] - concat gate and up per expert (transposed), then stack
+        # down_proj: [E, I, H]
         gate_up_list = []
         down_list = []
 
         for expert in experts_list:
             # gate_proj.weight: [I, H], up_proj.weight: [I, H]
-            gate_up = torch.cat([expert.gate_proj.weight.data, expert.up_proj.weight.data], dim=0)
+            # Concat along dim=0 gives [2*I, H], then transpose to [H, 2*I]
+            gate_up = torch.cat([expert.gate_proj.weight.data, expert.up_proj.weight.data], dim=0).t()
             gate_up_list.append(gate_up)
-            # down_proj.weight: [H, I]
-            down_list.append(expert.down_proj.weight.data)
+            # down_proj.weight: [H, I] -> transpose to [I, H]
+            down_list.append(expert.down_proj.weight.data.t())
 
         instance.gate_up_proj = nn.Parameter(torch.stack(gate_up_list, dim=0))
         instance.down_proj = nn.Parameter(torch.stack(down_list, dim=0))
@@ -130,7 +131,7 @@ class Qwen3MoeExperts(nn.Module):
         return instance
 
 
-class Qwen3MoeTopKRouter(nn.Module):
+class UnslothMoeTopKRouter(nn.Module):
     """
     v5-compatible TopK Router for use with v4 transformers.
 
@@ -158,7 +159,7 @@ class Qwen3MoeTopKRouter(nn.Module):
             config: Model config with num_experts_per_tok, num_experts, etc.
 
         Returns:
-            Qwen3MoeTopKRouter instance
+            UnslothMoeTopKRouter instance
         """
         instance = cls.__new__(cls)
         nn.Module.__init__(instance)
@@ -186,6 +187,8 @@ class Qwen3MoeTopKRouter(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = F.linear(hidden_states, self.weight)
         router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+
+        # Handle different top_k vs num_experts logic if needed, but standard topk works
         router_top_value, router_indices = torch.topk(router_probs, self.top_k, dim=-1)
 
         if self.norm_topk_prob:
@@ -195,7 +198,7 @@ class Qwen3MoeTopKRouter(nn.Module):
         return router_logits, router_top_value, router_indices
 
 
-def _create_lazy_convert_hook(Qwen3MoeExperts, Qwen3MoeTopKRouter, logger):
+def _create_lazy_convert_hook(UnslothMoeExperts, UnslothMoeTopKRouter, logger):
     """
     Create a pre-forward hook that converts nn.ModuleList to stacked format on first forward.
 
@@ -221,13 +224,13 @@ def _create_lazy_convert_hook(Qwen3MoeExperts, Qwen3MoeTopKRouter, logger):
 
         # Convert experts
         old_experts = module.experts
-        module.experts = Qwen3MoeExperts.from_modulelist(old_experts, config)
+        module.experts = UnslothMoeExperts.from_modulelist(old_experts, config)
         del old_experts
 
         # Convert gate to TopKRouter
         if hasattr(module, 'gate') and isinstance(module.gate, nn.Linear):
             old_gate = module.gate
-            module.gate = Qwen3MoeTopKRouter.from_linear(old_gate, config)
+            module.gate = UnslothMoeTopKRouter.from_linear(old_gate, config)
             del old_gate
 
         module._unsloth_needs_conversion = False
@@ -263,9 +266,9 @@ def _create_new_init(original_init):
     return _new_sparse_moe_init
 
 
-def _create_convert_method(Qwen3MoeExperts, Qwen3MoeTopKRouter):
+def _create_convert_method(UnslothMoeExperts, UnslothMoeTopKRouter):
     """
-    Create a method to convert nn.ModuleList to stacked Qwen3MoeExperts.
+    Create a method to convert nn.ModuleList to stacked UnslothMoeExperts.
 
     Should be called once after model.load_state_dict() or from_pretrained().
     """
@@ -281,13 +284,13 @@ def _create_convert_method(Qwen3MoeExperts, Qwen3MoeTopKRouter):
 
         # Convert experts
         old_experts = self.experts
-        self.experts = Qwen3MoeExperts.from_modulelist(old_experts, config)
+        self.experts = UnslothMoeExperts.from_modulelist(old_experts, config)
         del old_experts
 
         # Convert gate to TopKRouter
         if hasattr(self, 'gate') and isinstance(self.gate, nn.Linear):
             old_gate = self.gate
-            self.gate = Qwen3MoeTopKRouter.from_linear(old_gate, config)
+            self.gate = UnslothMoeTopKRouter.from_linear(old_gate, config)
             del old_gate
 
         self._unsloth_needs_conversion = False
@@ -300,7 +303,7 @@ def _create_convert_method(Qwen3MoeExperts, Qwen3MoeTopKRouter):
     return _convert_to_stacked_experts
 
 
-def _create_load_state_dict_hook(Qwen3MoeExperts, Qwen3MoeTopKRouter, original_load_state_dict):
+def _create_load_state_dict_hook(UnslothMoeExperts, UnslothMoeTopKRouter, original_load_state_dict):
     """
     Create a custom _load_from_state_dict that handles v4 checkpoint format.
 
@@ -345,10 +348,10 @@ def _create_load_state_dict_hook(Qwen3MoeExperts, Qwen3MoeTopKRouter, original_l
                 gate_up_list.clear()
                 down_list.clear()
 
-            # Now we need to replace self.experts with Qwen3MoeExperts BEFORE loading
+            # Now we need to replace self.experts with UnslothMoeExperts BEFORE loading
             if isinstance(self.experts, nn.ModuleList):
                 old_experts = self.experts
-                self.experts = Qwen3MoeExperts(config)
+                self.experts = UnslothMoeExperts(config)
                 # Move to same device/dtype if possible
                 if hasattr(old_experts[0].gate_proj, 'weight') and old_experts[0].gate_proj.weight is not None:
                     device = old_experts[0].gate_proj.weight.device
@@ -359,7 +362,7 @@ def _create_load_state_dict_hook(Qwen3MoeExperts, Qwen3MoeTopKRouter, original_l
             # Convert gate
             if isinstance(self.gate, nn.Linear):
                 old_gate = self.gate
-                self.gate = Qwen3MoeTopKRouter(config)
+                self.gate = UnslothMoeTopKRouter(config)
                 if old_gate.weight is not None:
                     self.gate.to(device=old_gate.weight.device, dtype=old_gate.weight.dtype)
                 del old_gate
@@ -374,22 +377,24 @@ def _create_load_state_dict_hook(Qwen3MoeExperts, Qwen3MoeTopKRouter, original_l
     return _load_from_state_dict_v4_compat
 
 
-def apply_v4_compatibility_patches(transformers_module):
+def apply_v4_compatibility_patches(transformers_module, target_class_name="Qwen3MoeSparseMoeBlock", experts_class_name="Qwen3MoeExperts"):
     """
     Apply v4 compatibility patches to the transformers Qwen3 MoE module.
 
-    This function patches Qwen3MoeSparseMoeBlock to:
+    This function patches SparseMoeBlock to:
     1. Store config during __init__ for later conversion
     2. Convert v4 checkpoint format during state dict loading
-    3. Register Qwen3MoeExperts and Qwen3MoeTopKRouter classes
+    3. Register UnslothMoeExperts and UnslothMoeTopKRouter classes
 
     Args:
-        transformers_module: The transformers.models.qwen3_moe.modeling_qwen3_moe module
+        transformers_module: The module containing the target class (e.g. transformers.models.qwen3_moe.modeling_qwen3_moe)
+        target_class_name: Name of the SparseMoeBlock class to patch (default: "Qwen3MoeSparseMoeBlock")
+        experts_class_name: Name to register the Experts class as (default: "Qwen3MoeExperts")
 
     Returns:
-        Tuple of (Qwen3MoeExperts, Qwen3MoeTopKRouter) classes for use in forward patches
+        Tuple of (UnslothMoeExperts, UnslothMoeTopKRouter) classes for use in forward patches
     """
-    OriginalSparseMoeBlock = transformers_module.Qwen3MoeSparseMoeBlock
+    OriginalSparseMoeBlock = getattr(transformers_module, target_class_name)
     _original_sparse_moe_init = OriginalSparseMoeBlock.__init__
 
     _original_load_from_state_dict = (
@@ -401,14 +406,16 @@ def apply_v4_compatibility_patches(transformers_module):
     # Apply patches
     OriginalSparseMoeBlock.__init__ = _create_new_init(_original_sparse_moe_init)
     OriginalSparseMoeBlock._load_from_state_dict = _create_load_state_dict_hook(
-        Qwen3MoeExperts, Qwen3MoeTopKRouter, _original_load_from_state_dict
+        UnslothMoeExperts, UnslothMoeTopKRouter, _original_load_from_state_dict
     )
     OriginalSparseMoeBlock._convert_to_stacked_experts = _create_convert_method(
-        Qwen3MoeExperts, Qwen3MoeTopKRouter
+        UnslothMoeExperts, UnslothMoeTopKRouter
     )
 
     # Register the new classes in the module for proper pickling/unpickling
-    transformers_module.Qwen3MoeExperts = Qwen3MoeExperts
-    transformers_module.Qwen3MoeTopKRouter = Qwen3MoeTopKRouter
+    setattr(transformers_module, experts_class_name, UnslothMoeExperts)
+    # We can also register the router, maybe with a generic name or specific if needed
+    # For now, let's just stick to UnslothMoeTopKRouter internal name unless needed externally
+    # transformers_module.Qwen3MoeTopKRouter = UnslothMoeTopKRouter
 
-    return Qwen3MoeExperts, Qwen3MoeTopKRouter
+    return UnslothMoeExperts, UnslothMoeTopKRouter
