@@ -51,6 +51,38 @@ import os
 _GROUPED_GEMM_AVAILABLE = None
 _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 
+# Check if GPU supports torch._grouped_mm (requires compute capability >= 9.0)
+_TORCH_GROUPED_MM_SUPPORTED = None
+
+def _check_torch_grouped_mm_supported():
+    """
+    Check if torch._grouped_mm is actually supported on the current GPU.
+    It requires CUDA compute capability >= 9.0 (H100 and newer).
+    """
+    global _TORCH_GROUPED_MM_SUPPORTED
+    if _TORCH_GROUPED_MM_SUPPORTED is not None:
+        return _TORCH_GROUPED_MM_SUPPORTED
+
+    if not _TORCH_GROUPED_MM_AVAILABLE:
+        _TORCH_GROUPED_MM_SUPPORTED = False
+        return False
+
+    if not torch.cuda.is_available():
+        _TORCH_GROUPED_MM_SUPPORTED = False
+        return False
+
+    try:
+        # Get compute capability of current device
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
+        compute_capability = major + minor / 10.0
+        # torch._grouped_mm requires compute capability >= 9.0 (H100)
+        _TORCH_GROUPED_MM_SUPPORTED = compute_capability >= 9.0
+    except Exception:
+        _TORCH_GROUPED_MM_SUPPORTED = False
+
+    return _TORCH_GROUPED_MM_SUPPORTED
+
 _TRITON_ALLOCATOR_INITIALIZED = False
 _PERSISTENT_BUFFER = None
 
@@ -93,35 +125,19 @@ def _init_triton_allocator():
 
 def _check_grouped_gemm_available():
     """Check if Unsloth grouped GEMM kernels are available."""
-    # Check if user wants to force disable Triton kernels
     if os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1":
         return False
 
     global _GROUPED_GEMM_AVAILABLE
-    if _GROUPED_GEMM_AVAILABLE is None:
-        try:
-            # The grouped_gemm module uses relative imports like `from grouped_gemm.kernels...`
-            # so we need to add its parent directory to sys.path
-            import sys
-            import unsloth
+    if _GROUPED_GEMM_AVAILABLE is not None:
+        return _GROUPED_GEMM_AVAILABLE
 
-            if hasattr(unsloth, "__file__") and unsloth.__file__ is not None:
-                unsloth_path = os.path.dirname(unsloth.__file__)
-            else:
-                 # Fallback for namespace package or editable install
-                 unsloth_path = list(unsloth.__path__)[0]
-                 if os.path.exists(os.path.join(unsloth_path, "unsloth", "kernels")):
-                     unsloth_path = os.path.join(unsloth_path, "unsloth")
-
-            moe_kernels_path = os.path.join(unsloth_path, "kernels", "moe")
-            if moe_kernels_path not in sys.path:
-                sys.path.insert(0, moe_kernels_path)
-            from grouped_gemm.interface import grouped_gemm, supports_tma
-            _GROUPED_GEMM_AVAILABLE = True
-            # Initialize persistent allocator when grouped GEMM is available
-            _init_triton_allocator()
-        except (ImportError, ModuleNotFoundError) as e:
-            _GROUPED_GEMM_AVAILABLE = False
+    try:
+        from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
+        _GROUPED_GEMM_AVAILABLE = True
+        _init_triton_allocator()
+    except (ImportError, ModuleNotFoundError):
+        _GROUPED_GEMM_AVAILABLE = False
     return _GROUPED_GEMM_AVAILABLE
 
 
@@ -134,7 +150,7 @@ def select_moe_backend():
     # Choices ordered by preference
     # (backend_name, is_available)
     choices = [
-        ("grouped_mm",     hasattr(torch, "_grouped_mm")),
+        ("grouped_mm",     _check_torch_grouped_mm_supported()),
         ("unsloth_triton", _check_grouped_gemm_available()),
         ("native_torch",   True),
     ]
@@ -163,16 +179,18 @@ def select_moe_backend():
     # 2. Automatic selection (first available in preference order)
     for name, available in choices:
         if available:
+            print(f"Unsloth: Using MoE backend '{name}'")
             return name
 
+    print("Unsloth: Using MoE backend 'native_torch' (fallback)")
     return "native_torch"
 
 
-def _get_routing_indices_optimized(selected_experts, num_experts):
+@torch.no_grad()
+def _get_routing_indices(selected_experts, num_experts):
     """
-    Optimized token→expert mapping for grouped GEMM.
+    Compute token→expert mapping for grouped GEMM.
     Uses bincount instead of histc to avoid float conversion overhead.
-    Reuses buffers when possible to reduce memory allocation pressure.
 
     Returns:
         token_counts_by_expert: (num_experts,) token counts per expert
@@ -192,19 +210,6 @@ def _get_routing_indices_optimized(selected_experts, num_experts):
     return token_counts_by_expert, gather_indices
 
 
-@torch.no_grad()
-def _get_routing_indices(selected_experts, num_experts):
-    """
-    Compute token→expert mapping for grouped GEMM.
-    Wrapper that uses optimized implementation.
-
-    Returns:
-        token_counts_by_expert: (num_experts,) token counts per expert
-        gather_indices: (total_tokens,) indices for gathering tokens in expert order
-    """
-    return _get_routing_indices_optimized(selected_experts, num_experts)
-
-
 def _silu_and_mul(x):
     """Fused SiLU activation and element-wise multiply for gate/up projections."""
     gate, up = x.chunk(2, dim=-1)
@@ -220,7 +225,16 @@ def forward_native_grouped_mm(
     """
     Native Pytorch grouped GEMM MoE forward pass.
     Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
+    Requires CUDA compute capability >= 9.0 (H100 and newer).
     """
+    # Runtime safety check - defense in depth
+    if not _check_torch_grouped_mm_supported():
+        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+        raise RuntimeError(
+            f"torch._grouped_mm requires CUDA compute capability >= 9.0 (H100), "
+            f"but current device has {major}.{minor}. "
+            f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
+        )
 
 
     if hidden_states.dim() == 2:
@@ -251,9 +265,9 @@ def forward_native_grouped_mm(
         # Handle different weight shapes (e.g. Qwen3 vs Qwen3VL)
         # If dim 1 matches hidden state dim, no transpose needed.
         if self.gate_up_proj.shape[1] == hidden_dim:
-             w1 = self.gate_up_proj
+            w1 = self.gate_up_proj
         else:
-             w1 = self.gate_up_proj.transpose(-2, -1)
+            w1 = self.gate_up_proj.transpose(-2, -1)
         mm1_out = torch._grouped_mm(permuted_input, w1, offs=offsets)
         gate, up = mm1_out.chunk(2, dim=-1)
     elif hasattr(self, "w1") and hasattr(self, "w3"):
@@ -270,9 +284,9 @@ def forward_native_grouped_mm(
     # Grouped GEMM 2
     if hasattr(self, "down_proj"):
         if self.down_proj.shape[1] == inter.shape[-1]:
-             w2 = self.down_proj
+            w2 = self.down_proj
         else:
-             w2 = self.down_proj.transpose(-2, -1)
+            w2 = self.down_proj.transpose(-2, -1)
     elif hasattr(self, "w2"):
         w2 = self.w2.transpose(-2, -1)
     else:
@@ -311,8 +325,8 @@ def forward_triton_grouped_gemm(
     """
 
 
-    # Import grouped GEMM interface (sys.path was set by _check_grouped_gemm_available)
-    from grouped_gemm.interface import grouped_gemm
+    # Import grouped GEMM interface
+    from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
     # Import autotune cache
     from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
 
@@ -323,10 +337,24 @@ def forward_triton_grouped_gemm(
     # For now, let's attach it to self if possible, or use a global usage
     # Attaching to self is cleaner: self._unsloth_moe_configs
 
+    # Create expert mask and find which experts have tokens
     if not hasattr(self, "_unsloth_moe_configs"):
         self._unsloth_moe_configs = None
 
-    num_tokens, hidden_dim = hidden_states.shape
+    # Handle 3D inputs (batch_size, seq_len, hidden_dim)
+    is_3d = hidden_states.dim() == 3
+    if is_3d:
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        num_tokens = batch_size * seq_len
+        # Also flatten top_k inputs if they are 3D
+        if top_k_index.dim() == 3:
+            top_k_index = top_k_index.view(-1, top_k_index.shape[-1])
+        if top_k_weights.dim() == 3:
+            top_k_weights = top_k_weights.view(-1, top_k_weights.shape[-1])
+    else:
+        num_tokens, hidden_dim = hidden_states.shape
+
     top_k = top_k_index.shape[1]
 
     # Cache model dimensions and kernel configs on first call
@@ -370,9 +398,9 @@ def forward_triton_grouped_gemm(
     )
 
     if self.gate_up_proj.shape[-1] == hidden_dim:
-         w1 = self.gate_up_proj
+        w1 = self.gate_up_proj
     else:
-         w1 = self.gate_up_proj.transpose(-2, -1)
+        w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
 
     # First grouped GEMM: gate_up projection
     first_gemm_output = grouped_gemm(
@@ -396,9 +424,9 @@ def forward_triton_grouped_gemm(
     # Grouped GEMM 2: down projection
 
     if self.down_proj.shape[-1] == intermediate.shape[-1]:
-         w2 = self.down_proj
+        w2 = self.down_proj
     else:
-         w2 = self.down_proj.transpose(-2, -1)
+        w2 = self.down_proj.transpose(-2, -1).contiguous()
 
     second_gemm_output = grouped_gemm(
         X=intermediate,
@@ -422,5 +450,8 @@ def forward_triton_grouped_gemm(
         * top_k_weights[..., None]
     )
     final_hidden_states = final_hidden_states.sum(dim=1)
+
+    if is_3d:
+        final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
 
     return final_hidden_states

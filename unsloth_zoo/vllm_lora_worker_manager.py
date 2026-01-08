@@ -86,6 +86,7 @@ class WorkerLoRAManager(AbstractWorkerManager):
             lora_config=self.lora_config,
             device=self.device,
             lora_manager_cls=self._manager_cls,
+            vllm_config=vllm_config,
         )
         # Newer vLLM versions require vllm_config parameter
         if create_lora_manager_needs_vllm_config() and vllm_config is not None:
@@ -361,6 +362,7 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
             lora_config=self.lora_config,
             device=self.device,
             max_num_batched_tokens=self.max_num_batched_tokens,
+            vllm_config=vllm_config,
         )
         # Newer vLLM versions require vllm_config parameter
         if create_lora_manager_needs_vllm_config() and vllm_config is not None:
