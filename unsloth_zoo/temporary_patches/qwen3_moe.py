@@ -250,7 +250,6 @@ def patch_qwen3_moe():
                 return final_hidden_states
 
         # SparseMoeBlock forward is disabled from compilation due to dynamic routing
-        # SparseMoeBlock forward is disabled from compilation due to dynamic routing
         @torch.compiler.disable
         def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             if hidden_states.dim() == 3:
@@ -262,15 +261,43 @@ def patch_qwen3_moe():
 
             hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
-            # self.gate is nn.Linear - so it returns logits!
-            router_logits = self.gate(hidden_states_reshaped)
+            # self.gate is Qwen3MoeTopKRouter which returns (router_logits, routing_weights, selected_experts)
+            gate_outputs = self.gate(hidden_states_reshaped)
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-            if self.norm_topk_prob:
-                routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-            # we cast back to the input dtype
-            routing_weights = routing_weights.to(hidden_states.dtype)
+            if isinstance(gate_outputs, tuple):
+                # Expect at least 3 values: logits, weights, indices
+                if len(gate_outputs) >= 3:
+                     routing_weights = gate_outputs[1]
+                     selected_experts = gate_outputs[2]
+                else:
+                     raise ValueError(f"Expected at least 3 return values from gate, got {len(gate_outputs)}")
+            else:
+                # Fallback: assume output is router_logits and manually compute weights/experts
+                router_logits = gate_outputs
+                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+
+                # Attempt to retrieve top_k
+                if hasattr(self.gate, "top_k"):
+                    top_k = self.gate.top_k
+                elif hasattr(self, "config") and hasattr(self.config, "num_experts_per_tok"):
+                    top_k = self.config.num_experts_per_tok
+                else:
+                     # Default to 2 if unknown (risky but better than crashing) or raise error
+                     # Qwen2/3 typically use top_k=2 or similar.
+                     # Let's try to infer or error.
+                     logger.warning_once("Unsloth: Could not determine top_k for MoE routing. Defaulting to 2.")
+                     top_k = 2
+
+                routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+                norm_topk_prob = getattr(self.gate, "norm_topk_prob", False)
+                if not norm_topk_prob and hasattr(self, "config"):
+                     norm_topk_prob = getattr(self.config, "norm_topk_prob", False)
+
+                if norm_topk_prob:
+                    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
+                routing_weights = routing_weights.to(hidden_states.dtype)
 
             final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
@@ -287,5 +314,89 @@ def patch_qwen3_moe():
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", sparse_moe_block_forward)
 
     transformers.models.qwen3_moe.modeling_qwen3_moe.__UNSLOTH_PATCHED__ = True
+
+    # ====================================================================
+    # Patch Qwen3MoeForCausalLM.forward for GRPO training
+    # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
+    # ====================================================================
+    try:
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+            Qwen3MoeForCausalLM,
+            MoeCausalLMOutputWithPast,
+        )
+
+        _original_causal_lm_forward = Qwen3MoeForCausalLM.forward
+
+        def _patched_causal_lm_forward(
+            self,
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            labels=None,
+            use_cache=None,
+            output_router_logits=None,
+            cache_position=None,
+            logits_to_keep=0,
+            **kwargs,
+        ):
+            RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
+
+            if not RETURN_HIDDEN_STATES:
+                # Normal forward pass
+                return _original_causal_lm_forward(
+                    self,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    use_cache=use_cache,
+                    output_router_logits=output_router_logits,
+                    cache_position=cache_position,
+                    logits_to_keep=logits_to_keep,
+                    **kwargs,
+                )
+
+            # RETURN_HIDDEN_STATES mode - return hidden_states instead of logits
+            output_router_logits = (
+                output_router_logits if output_router_logits is not None else self.config.output_router_logits
+            )
+
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_router_logits=output_router_logits,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs.last_hidden_state
+
+            # Apply slice_indices to hidden_states (same indexing as for logits)
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) and logits_to_keep > 0 else slice(None)
+            # Return hidden_states as "logits" for GRPO to use
+            logits = hidden_states[:, slice_indices, :]
+
+            return MoeCausalLMOutputWithPast(
+                loss=None,
+                aux_loss=None,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                router_logits=outputs.router_logits,
+            )
+
+        Qwen3MoeForCausalLM.forward = _patched_causal_lm_forward
+        logger.info("Unsloth: Patched Qwen3MoeForCausalLM.forward for GRPO hidden states.")
+    except Exception as e:
+        logger.warning(f"Unsloth: Could not patch Qwen3MoeForCausalLM.forward: {e}")
 pass
 TEMPORARY_PATCHES.append(patch_qwen3_moe)
