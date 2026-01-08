@@ -566,9 +566,9 @@ def process_vision_info(
     size_factor: int = IMAGE_FACTOR,
     return_video_kwargs: bool = False,
 ) -> Tuple[Union[List[Image.Image], None], Union[List[Union[torch.Tensor, List[Image.Image]]], None]]:
-    
+
     vision_infos = extract_vision_info(conversations)
-   
+
     ## Read images or videos
     image_inputs = []
     video_inputs = []
@@ -612,6 +612,19 @@ def get_padding_tokens_ids(tokenizer):
     padding_token_ids = torch.IntTensor(padding_token_ids)
     return padding_token_ids
 pass
+
+
+def _is_cjk(char):
+    if len(char) == 0: return False
+    code = ord(char)
+    return (
+        0x4E00 <= code <= 0x9FFF or  # CJK Unified Ideographs
+        0x3040 <= code <= 0x309F or  # Hiragana
+        0x30A0 <= code <= 0x30FF or  # Katakana
+        0xAC00 <= code <= 0xD7AF     # Hangul
+    )
+pass
+
 
 
 def _get_dtype(dtype):
@@ -792,7 +805,7 @@ class UnslothVisionDataCollator:
 
         if self.formatting_func is not None:
             examples = [self.formatting_func(example) for example in examples]
-        
+
         if "prompt" in examples[0] and "completion" in examples[0]:
             return self._collate_prompt_completion(examples)
 
@@ -926,7 +939,7 @@ class UnslothVisionDataCollator:
                 return_video_kwargs=True,
             )
             if image is None: image = []
-            if video is None: video = [] 
+            if video is None: video = []
         pass
         return image, video, video_kwarg
 
@@ -958,7 +971,7 @@ class UnslothVisionDataCollator:
         except Exception:
             imgs = []
             vids = []
-        
+
         return imgs, vids, vids_kwarg
 
     def _resize_images_inplace(self, image):
@@ -1150,6 +1163,33 @@ class UnslothVisionDataCollator:
                 # see trl/data_utils.py
                 p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
                 c_txt = pc_txt[len(p_txt):]
+
+                # Unsloth: Fixes spaces for CJK non-latin languages
+                if len(c_txt) > 0 and c_txt[0].isspace():
+                    # Check if next char is CJK
+                    if len(c_txt) > 1 and _is_cjk(c_txt[1]):
+                        # Check user intent
+                        first_content = ""
+                        if isinstance(c, str):
+                            first_content = c
+                        elif isinstance(c, list) and len(c) > 0:
+                            first_msg = c[0]
+                            if isinstance(first_msg, dict):
+                                content = first_msg.get("content", "")
+                                if isinstance(content, str):
+                                    first_content = content
+                                elif isinstance(content, list) and len(content) > 0:
+                                    if isinstance(content[0], dict) and content[0].get("type") == "text":
+                                        first_content = content[0].get("text", "")
+                        pass
+
+                        # If user did NOT put a space, we should move it to prompt
+                        if len(first_content) > 0 and not first_content[0].isspace():
+                            p_txt += c_txt[0]
+                            c_txt = c_txt[1:]
+                        pass
+                    pass
+                pass
             else:
                 c_txt = str(c)
 
