@@ -95,7 +95,7 @@ pass
 
 if importlib.util.find_spec("vllm") is not None:
     from vllm import __version__ as vllm_version
-    
+
     # Patch excessive warning messages
     if not UNSLOTH_ENABLE_LOGGING:
         # Disable all not supported messages
@@ -1841,7 +1841,7 @@ def load_vllm(
     total_gb = total_memory/1024/1024/1024
     ten_percent = total_gb * 0.1 # 1.46GB for T4
     if UNSLOTH_ENABLE_LOGGING:
-        logger.log(f"10% of your GPU VRAM = {ten_percent}")
+        logger.info(f"10% of your GPU VRAM = {ten_percent}")
     if   ten_percent >= 4.0: standby_target_gpu_util = 0.925
     elif ten_percent >= 2.5: standby_target_gpu_util = 0.9
     elif ten_percent >= 2.0: standby_target_gpu_util = 0.875
@@ -1849,14 +1849,14 @@ def load_vllm(
     elif ten_percent >= 1.0: standby_target_gpu_util = 0.8
     else: standby_target_gpu_util = 0.75
     if UNSLOTH_ENABLE_LOGGING:
-        logger.log(f"standby_target_gpu_util = {standby_target_gpu_util}")
+        logger.info(f"standby_target_gpu_util = {standby_target_gpu_util}")
     # Reduce memory usage for newer vLLM versions since it OOMs
     if Version(vllm_version) >= Version("0.11.0"):
         if UNSLOTH_ENABLE_LOGGING:
-            logger.log(f"Decreasing VRAM further since vLLM version >= 0.11.0 uses more")
+            logger.info(f"Decreasing VRAM further since vLLM version >= 0.11.0 uses more")
         standby_target_gpu_util *= 0.95
         if UNSLOTH_ENABLE_LOGGING:
-            logger.log(f"Further reduced standby_target_gpu_util = {standby_target_gpu_util}")
+            logger.info(f"Further reduced standby_target_gpu_util = {standby_target_gpu_util}")
 
     if unsloth_vllm_standby and not standby_util_override:
         if gpu_memory_utilization < standby_target_gpu_util:
@@ -2119,6 +2119,7 @@ def load_vllm(
     # Get device as well
     device = get_target_device()
 
+    if enforce_eager: compilation_config = None
     if compilation_config == 3:
         try:
             from vllm.config import CompilationConfig
