@@ -23,6 +23,7 @@ import inspect
 from .common import (
     TEMPORARY_PATCHES,
     torch_compile,
+    UNSLOTH_ENABLE_LOGGING,
 )
 from .utils import (
     patch_function,
@@ -40,8 +41,12 @@ from .moe_utils import (
     _TORCH_GROUPED_MM_AVAILABLE,
     forward_native_grouped_mm,
     forward_triton_grouped_gemm,
+    forward_native_moe_loop,
     select_moe_backend,
+    patch_param_wrapper_for_moe,
 )
+
+from . import moe_utils
 
 
 
@@ -50,6 +55,10 @@ def patch_qwen3_moe():
     # https://github.com/huggingface/transformers/blob/v4.57.3/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py#L213
     # Transformers >= 5       uses self.gate_up_proj = nn.Parameter(...)
     # whilst old transformers uses self.experts = nn.ModuleList(...)
+
+    # Patch ParamWrapper.forward for MoE separated LoRA
+    patch_param_wrapper_for_moe()
+
     try:
         import transformers.models.qwen3_moe.modeling_qwen3_moe
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock
@@ -65,6 +74,9 @@ def patch_qwen3_moe():
 
     if old_transformers:
         def old_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            forward_native_grouped_mm = moe_utils.forward_native_grouped_mm
+            forward_triton_grouped_gemm = moe_utils.forward_triton_grouped_gemm
+            forward_native_moe_loop = moe_utils.forward_native_moe_loop
             """ """
             batch_size, sequence_length, hidden_dim = hidden_states.shape
             hidden_states = hidden_states.view(-1, hidden_dim)
@@ -118,6 +130,9 @@ def patch_qwen3_moe():
             return router_scores, selected_experts, router_logits
 
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            forward_native_grouped_mm = moe_utils.forward_native_grouped_mm
+            forward_triton_grouped_gemm = moe_utils.forward_triton_grouped_gemm
+            forward_native_moe_loop = moe_utils.forward_native_moe_loop
             """ """
             is_3d = hidden_states.dim() == 3
             if is_3d:
@@ -169,6 +184,7 @@ def patch_qwen3_moe():
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
+                forward_native_grouped_mm = moe_utils.forward_native_grouped_mm
                 """
                 Native Pytorch grouped GEMM MoE forward pass.
                 Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
@@ -187,6 +203,7 @@ def patch_qwen3_moe():
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
+                forward_triton_grouped_gemm = moe_utils.forward_triton_grouped_gemm
                 """
                 Grouped GEMM MoE forward pass using Triton kernels.
 
@@ -208,50 +225,28 @@ def patch_qwen3_moe():
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
+                forward_native_moe_loop = moe_utils.forward_native_moe_loop
                 """
                 Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
                 Uses @torch.compiler.disable because the loop is data-dependent.
                 """
-
-
-                final_hidden_states = torch.zeros_like(hidden_states)
-
-                # Create expert mask and find which experts have tokens
-                with torch.no_grad():
-                    expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-                    expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
-                    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-                # Only loop over experts that actually have tokens routed to them
-                for expert_idx in expert_hit:
-                    expert_idx = expert_idx[0]
-                    if expert_idx == self.num_experts:
-                        continue
-
-                    # Find which tokens are routed to this expert
-                    top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-
-                    # Gather only the tokens for this expert
-                    current_state = hidden_states[token_idx]
-
-                    # Compute gate_up projection for this expert only
-                    gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-                    current_hidden_states = self.act_fn(gate) * up
-
-                    # Compute down projection for this expert only
-                    current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
-
-                    # Apply routing weights
-                    current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-
-                    # Scatter back to final output
-                    final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-                return final_hidden_states
+                return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
         # SparseMoeBlock forward is disabled from compilation due to dynamic routing
         @torch.compiler.disable
         def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            forward_native_grouped_mm = moe_utils.forward_native_grouped_mm
+            forward_triton_grouped_gemm = moe_utils.forward_triton_grouped_gemm
+            forward_native_moe_loop = moe_utils.forward_native_moe_loop
+            """
+            Forward for Qwen3MoeSparseMoeBlock in new transformers (v5+).
+
+            In v5, self.gate is Qwen3MoeTopKRouter which returns:
+                (router_logits, router_scores, router_indices)
+            where router_scores are already normalized if norm_topk_prob=True.
+
+            Returns only the hidden states (router_logits are recorded separately).
+            """
             if hidden_states.dim() == 3:
                 batch_size, sequence_length, hidden_dim = hidden_states.shape
             else:
@@ -261,42 +256,24 @@ def patch_qwen3_moe():
 
             hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
-            # self.gate is Qwen3MoeTopKRouter which returns (router_logits, routing_weights, selected_experts)
-            gate_outputs = self.gate(hidden_states_reshaped)
+            # In v5, self.gate is Qwen3MoeTopKRouter
+            # It returns (router_logits, router_scores, router_indices)
+            # router_scores are already softmax'd and normalized if norm_topk_prob=True
+            gate_output = self.gate(hidden_states_reshaped)
 
-            if isinstance(gate_outputs, tuple):
-                # Expect at least 3 values: logits, weights, indices
-                if len(gate_outputs) >= 3:
-                     routing_weights = gate_outputs[1]
-                     selected_experts = gate_outputs[2]
-                else:
-                     raise ValueError(f"Expected at least 3 return values from gate, got {len(gate_outputs)}")
+            if isinstance(gate_output, tuple):
+                # New transformers v5: (router_logits, router_scores, router_indices)
+                _, routing_weights, selected_experts = gate_output
             else:
-                # Fallback: assume output is router_logits and manually compute weights/experts
-                router_logits = gate_outputs
+                # Fallback: old-style gate that returns just logits
+                router_logits = gate_output
+                top_k = getattr(self.gate, 'top_k', getattr(self, 'top_k', 2))
+                norm_topk_prob = getattr(self.gate, 'norm_topk_prob', getattr(self, 'norm_topk_prob', False))
+
                 routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-
-                # Attempt to retrieve top_k
-                if hasattr(self.gate, "top_k"):
-                    top_k = self.gate.top_k
-                elif hasattr(self, "config") and hasattr(self.config, "num_experts_per_tok"):
-                    top_k = self.config.num_experts_per_tok
-                else:
-                     # Default to 2 if unknown (risky but better than crashing) or raise error
-                     # Qwen2/3 typically use top_k=2 or similar.
-                     # Let's try to infer or error.
-                     logger.warning_once("Unsloth: Could not determine top_k for MoE routing. Defaulting to 2.")
-                     top_k = 2
-
                 routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-
-                norm_topk_prob = getattr(self.gate, "norm_topk_prob", False)
-                if not norm_topk_prob and hasattr(self, "config"):
-                     norm_topk_prob = getattr(self.config, "norm_topk_prob", False)
-
                 if norm_topk_prob:
-                    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
+                    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
                 routing_weights = routing_weights.to(hidden_states.dtype)
 
             final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
@@ -395,8 +372,10 @@ def patch_qwen3_moe():
             )
 
         Qwen3MoeForCausalLM.forward = _patched_causal_lm_forward
-        logger.info("Unsloth: Patched Qwen3MoeForCausalLM.forward for GRPO hidden states.")
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("Unsloth: Patched Qwen3MoeForCausalLM.forward for GRPO hidden states.")
     except Exception as e:
-        logger.warning(f"Unsloth: Could not patch Qwen3MoeForCausalLM.forward: {e}")
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch Qwen3MoeForCausalLM.forward: {e}")
 pass
 TEMPORARY_PATCHES.append(patch_qwen3_moe)
