@@ -1692,7 +1692,7 @@ def patch_moe_routing_weights_cast(module_cls: Any, source: str) -> Tuple[str, D
         new_route_source, replaced_count = re.subn(MOE_ROUTING_WEIGHTS_CAST_PATTERN, MOE_ROUTING_WEIGHTS_CAST_REPLACE, new_route_source)
         if replaced_count > 0:
             new_route_sources[method_name] = new_route_source
-    
+
     return re.sub(MOE_ROUTING_WEIGHTS_CAST_PATTERN, MOE_ROUTING_WEIGHTS_CAST_REPLACE, source), new_route_sources
 pass
 
@@ -2900,7 +2900,11 @@ def unsloth_compile_transformers(
             pass
 
             params = list(parameters.parameters.keys())
-            source = inspect.getsource(function)
+            try:
+                source = inspect.getsource(function)
+            except TypeError:
+                print(f"Unsloth: Cannot patch {module} since source cannot be inspected.")
+                continue
 
             where = source.find(str(parameters))
             if where == -1: where = source.find("\n") + 1

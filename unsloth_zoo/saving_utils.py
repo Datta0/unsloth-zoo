@@ -265,11 +265,14 @@ def assert_same_keys(model, new_state_dict):
     original_keys = inner_model.state_dict().keys()
     all_original_keys = set()
     for x in original_keys:
-        where_weight = x.rfind(".weight")
-        where_bias   = x.rfind(".bias")
-        if where_weight != -1: x = x[:where_weight + len(".weight")]
-        elif where_bias != -1: x = x[:where_bias   + len(".bias")  ]
+        if x.endswith(".weight"): pass
+        elif x.endswith(".bias"): pass
         else: pass
+        # where_weight = x.rfind(".weight")
+        # where_bias   = x.rfind(".bias")
+        # if where_weight != -1: x = x[:where_weight + len(".weight")]
+        # elif where_bias != -1: x = x[:where_bias   + len(".bias")  ]
+        # else: pass
 
         # Remove LoRA and base_layer
         j = max(x.rfind(".lora_"), x.rfind(".base_layer"))
@@ -370,12 +373,16 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 if "lora_" in key:
                     pass
                 elif "base_layer" in key:
-                    remove_keys.add(name + "." + key)
+                    if key.endswith("weight") or key.endswith("bias"):
+                        remove_keys.add(name + "." + key)
+                    else: pass
+                elif key == "weight" or key.endswith(".weight"):
+                     # Fix for weight_format issue
+                     remove_keys.add(name + "." + key)
                 elif "weight" in key and "base_layer" not in key and "lora_" not in key:
-                    # Maybe just "weight"?
-                    remove_keys.add(name + "." + key)
+                     pass
                 else:
-                    # Keep active_adapter etc
+                    # Keep SCB etc
                     pass
             pass
 
@@ -389,8 +396,14 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             lora_weights[name].module = module
             keep_keys.add(name + ".weight")
             if getattr(module, "bias", None) is not None: keep_keys.add(name + ".bias")
-            expand_module_keys(name, module, remove_keys)
-            remove_keys.add(name)
+
+            # expand_module_keys(name, module, remove_keys) # Too aggressive
+            for key in module.state_dict().keys():
+                if key.endswith(".weight") or key.endswith(".bias"):
+                     remove_keys.add(name + "." + key)
+                else:
+                     pass # Keep SCB, weight_format, etc.
+            pass
 
         elif ".lora_" in name: continue
 
@@ -410,13 +423,14 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     assert(module_count == lora_A_count == lora_B_count == scaling_count)
 
     # Also return state_dict if needed
+
     if return_state_dict:
         old_state_dict = inner_model.state_dict()
         state_dict     = collections.OrderedDict()
-        for name, param in old_state_dict.items():
 
-            if name.endswith(".base_layer.weight"):
-                name = name[:-len(".base_layer.weight")]
+        for name, param in old_state_dict.items():
+            if ".base_layer" in name:
+                name = name.replace(".base_layer", "")
 
             if name in lora_weights:
                 state_dict[name + ".weight"]   = lora_weights[name]
@@ -424,14 +438,13 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                     state_dict[name + ".bias"] = lora_weights[name].module.bias
                 continue
             elif name in keep_keys:
-                # Quantized modules with no LoRA adapters
                 lora_name = name[:-len(".weight")]
                 if lora_name in lora_weights:
                     param = lora_weights[lora_name]
                 else:
-                    # Bias term
                     pass
-            elif name in remove_keys: continue
+            elif name in remove_keys:
+                continue
 
             state_dict[name] = param
         pass
@@ -1249,6 +1262,24 @@ def merge_and_overwrite_lora(
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
+        # Hack to fix JSON serialization error where a function is in the config
+        import types
+        def _clean_obj(obj):
+            if isinstance(obj, dict):
+                for k, v in list(obj.items()):
+                    if isinstance(v, (types.FunctionType, types.MethodType)):
+                        print(f"Unsloth: Removing function from config dict: {k}")
+                        del obj[k]
+            elif hasattr(obj, "__dict__"):
+                for k, v in list(obj.__dict__.items()):
+                    if isinstance(v, (types.FunctionType, types.MethodType)):
+                        print(f"Unsloth: Removing function from config obj: {k}")
+                        delattr(obj, k)
+
+        _clean_obj(config)
+        if hasattr(config, "quantization_config"):
+            _clean_obj(config.quantization_config)
+
         config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
     elif save_method == "mxfp4":
