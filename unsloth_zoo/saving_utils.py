@@ -62,30 +62,6 @@ This {model_type} model was trained 2x faster with [Unsloth](https://github.com/
 
 import torch
 import bitsandbytes as bnb
-def patch_bitsandbytes_saving():
-    try:
-        import bitsandbytes.nn.modules
-        original_save = bitsandbytes.nn.modules.Linear4bit._save_to_state_dict
-        def patched_save(self, destination, prefix, keep_vars):
-            if not hasattr(self.weight, "quant_state"):
-                class DummyQuantState:
-                    packing_format_for_cpu = False
-                    def as_dict(self, packed=True): return {}
-                self.weight.quant_state = DummyQuantState()
-            return original_save(self, destination, prefix, keep_vars)
-        bitsandbytes.nn.modules.Linear4bit._save_to_state_dict = patched_save
-    except: pass
-pass
-def patch_revert_weight_conversion():
-    try:
-        import transformers.modeling_utils
-        def revert_weight_conversion(model, state_dict):
-            return state_dict
-        transformers.modeling_utils.revert_weight_conversion = revert_weight_conversion
-    except: pass
-pass
-patch_revert_weight_conversion()
-patch_bitsandbytes_saving()
 try:
     from huggingface_hub import get_token
 except:
@@ -265,14 +241,9 @@ def assert_same_keys(model, new_state_dict):
     original_keys = inner_model.state_dict().keys()
     all_original_keys = set()
     for x in original_keys:
-        if x.endswith(".weight"): pass
-        elif x.endswith(".bias"): pass
-        else: pass
-        # where_weight = x.rfind(".weight")
-        # where_bias   = x.rfind(".bias")
-        # if where_weight != -1: x = x[:where_weight + len(".weight")]
-        # elif where_bias != -1: x = x[:where_bias   + len(".bias")  ]
-        # else: pass
+        # Skip quantization metadata keys (SCB, weight_format, etc.)
+        if not (x.endswith(".weight") or x.endswith(".bias")):
+            continue
 
         # Remove LoRA and base_layer
         j = max(x.rfind(".lora_"), x.rfind(".base_layer"))
@@ -280,7 +251,12 @@ def assert_same_keys(model, new_state_dict):
 
         all_original_keys.add(x)
     pass
-    difference = all_original_keys ^ set(new_state_dict)
+    # Also filter new_state_dict keys to exclude quantization metadata
+    filtered_new_keys = set(
+        k for k in new_state_dict.keys()
+        if k.endswith(".weight") or k.endswith(".bias")
+    )
+    difference = all_original_keys ^ filtered_new_keys
     if len(difference) != 0:
         raise RuntimeError(f"Unsloth: Extracted keys = {difference} do not match!")
     pass
@@ -320,71 +296,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 hasattr(module, "active_adapters") else module.active_adapter
             lora_weights[name].alpha = module.scaling[active_adapter]
             scaling_count += 1
-            # expand_module_keys(name, module, remove_keys)
-
-            # We must not remove all keys!
-            lora_weights[name].module = module
-
-            # We must only remove the keys which we already saved
-            # ie "lora_A", "lora_B", "weight" etc
-            # If we remove all keys, we might remove "bias" or "base_layer" or other things
-            # which are not saved in lora_weights.
-
-            # Get all keys
-            all_keys = list(module.state_dict().keys())
-            for key in all_keys:
-                # We saved lora_A and lora_B and scaling?
-                # lora_A and lora_B are saved in the other if statements
-                # But notice they are "lora_A.default" etc.
-                # Here we are in the "Linear_LoRA_Layers" block which is the PARENT module?
-                # No, "Linear_LoRA_Layers" check is `isinstance(module, Linear_LoRA_Layers)`.
-                # PEFT wraps the layer. The name is `path.to.module`.
-                # The keys are `base_layer.weight`, `lora_A.default.weight`, etc.
-
-                # We must be careful.
-                # If we remove `base_layer.weight`, then we must have saved it.
-                # In `create_lora_statistics`, we save `lora_weights[name].module = module`?
-                # Wait, if we set `.module`, then later:
-                # `state_dict[name + ".weight"] = lora_weights[name]`
-                # `LoraStats` has `module`.
-                # But `state_dict` expects TENSORS if we return it?
-                # `create_lora_statistics` returns `lora_weights` AND `state_dict`.
-                # `state_dict` values can be `LoraStats`?
-                # Yes, `get_torch_storage_size_new` checks `isinstance(x, LoraStats)`.
-                # `prepare_saving` iterates `state_dict.values()`.
-
-                # So if we put `LoraStats` in `state_dict`, it is handled.
-                # BUT `_merge_and_overwrite_lora` uses `converted_lora_weights`.
-                # And `_convert_lora_keys_to_safetensor_format`.
-
-                # The issue is `remove_keys` causing `state_dict` population loop to SKIP `base_layer.weight`.
-                # AND `lora_weights` keys (which match `name`) being used to populate `state_dict[name + ".weight"]`.
-
-                # So for `Linear_LoRA_Layers`:
-                # We DO want `state_dict[name + ".weight"] = lora_weights[name]`.
-                # And we WANT to skip `name + ".base_layer.weight"` from the loop.
-                # So we DO want to add `base_layer.weight` to `remove_keys`.
-
-                # BUT we DO NOT want to add other keys like `active_adapter` (buffer) to `remove_keys`.
-                # Because if we do, they are skipped.
-                # And `lora_weights[name]` does NOT contain them.
-                # So they are lost.
-
-                if "lora_" in key:
-                    pass
-                elif "base_layer" in key:
-                    if key.endswith("weight") or key.endswith("bias"):
-                        remove_keys.add(name + "." + key)
-                    else: pass
-                elif key == "weight" or key.endswith(".weight"):
-                     # Fix for weight_format issue
-                     remove_keys.add(name + "." + key)
-                elif "weight" in key and "base_layer" not in key and "lora_" not in key:
-                     pass
-                else:
-                    # Keep SCB etc
-                    pass
-            pass
+            expand_module_keys(name, module, remove_keys)
 
         elif name.endswith(".base_layer"):
             lora_weights[name[:-len(".base_layer")]].module = module
@@ -396,14 +308,8 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             lora_weights[name].module = module
             keep_keys.add(name + ".weight")
             if getattr(module, "bias", None) is not None: keep_keys.add(name + ".bias")
-
-            # expand_module_keys(name, module, remove_keys) # Too aggressive
-            for key in module.state_dict().keys():
-                if key.endswith(".weight") or key.endswith(".bias"):
-                     remove_keys.add(name + "." + key)
-                else:
-                     pass # Keep SCB, weight_format, etc.
-            pass
+            expand_module_keys(name, module, remove_keys)
+            remove_keys.add(name)
 
         elif ".lora_" in name: continue
 
@@ -423,14 +329,13 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     assert(module_count == lora_A_count == lora_B_count == scaling_count)
 
     # Also return state_dict if needed
-
     if return_state_dict:
         old_state_dict = inner_model.state_dict()
         state_dict     = collections.OrderedDict()
-
         for name, param in old_state_dict.items():
-            if ".base_layer" in name:
-                name = name.replace(".base_layer", "")
+
+            if name.endswith(".base_layer.weight"):
+                name = name[:-len(".base_layer.weight")]
 
             if name in lora_weights:
                 state_dict[name + ".weight"]   = lora_weights[name]
@@ -438,13 +343,14 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                     state_dict[name + ".bias"] = lora_weights[name].module.bias
                 continue
             elif name in keep_keys:
+                # Quantized modules with no LoRA adapters
                 lora_name = name[:-len(".weight")]
                 if lora_name in lora_weights:
                     param = lora_weights[lora_name]
                 else:
+                    # Bias term
                     pass
-            elif name in remove_keys:
-                continue
+            elif name in remove_keys: continue
 
             state_dict[name] = param
         pass
@@ -959,6 +865,48 @@ def prepare_saving(
 pass
 
 
+def _clean_config_for_json(config):
+    """Remove non-serializable attributes (functions, methods) from config before saving."""
+    import types
+
+    # Types to skip (primitives and immutables)
+    SKIP_TYPES = (str, int, float, bool, type(None), list, tuple, dict, set, bytes)
+
+    def _clean_obj(obj, visited=None):
+        if visited is None:
+            visited = set()
+
+        # Skip primitives and already visited objects
+        if isinstance(obj, SKIP_TYPES):
+            return
+        obj_id = id(obj)
+        if obj_id in visited:
+            return
+        visited.add(obj_id)
+
+        # Only process objects with __dict__ that we can modify
+        try:
+            obj_vars = vars(obj)
+        except TypeError:
+            return
+
+        keys_to_delete = []
+        for key, value in list(obj_vars.items()):
+            if callable(value) and not isinstance(value, type):
+                keys_to_delete.append(key)
+            elif not isinstance(value, SKIP_TYPES) and hasattr(value, "__dict__"):
+                _clean_obj(value, visited)
+
+        for key in keys_to_delete:
+            try:
+                delattr(obj, key)
+            except (TypeError, AttributeError):
+                pass  # Skip if we can't delete
+
+    _clean_obj(config)
+    return config
+
+
 def _remove_quantization_config(config_path: Path):
     assert config_path.exists(), "Given config does not exist"
     with open(config_path, "r", encoding = "utf-8") as f:
@@ -1020,19 +968,19 @@ pass
 def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     """Check if filenames follow HF sharded naming: model-00001-of-00005.safetensors"""
     pattern = re.compile(r'^(.+?)-(\d+)-of-(\d+)\.safetensors$')
-
+    
     matches = [pattern.match(f) for f in filenames]
     if not all(matches):
         return False
-
+    
     # Keep strings to check padding
     parsed = [(m.group(1), m.group(2), m.group(3)) for m in matches]
-
+    
     # shard and total have same padding: turned off as deepseekocr padding is different
     # for prefix, shard_str, total_str in parsed:
     #     if len(shard_str) != len(total_str):
     #         return False
-
+    
     # same prefix and total
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
@@ -1262,24 +1210,7 @@ def merge_and_overwrite_lora(
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
-        # Hack to fix JSON serialization error where a function is in the config
-        import types
-        def _clean_obj(obj):
-            if isinstance(obj, dict):
-                for k, v in list(obj.items()):
-                    if isinstance(v, (types.FunctionType, types.MethodType)):
-                        print(f"Unsloth: Removing function from config dict: {k}")
-                        del obj[k]
-            elif hasattr(obj, "__dict__"):
-                for k, v in list(obj.__dict__.items()):
-                    if isinstance(v, (types.FunctionType, types.MethodType)):
-                        print(f"Unsloth: Removing function from config obj: {k}")
-                        delattr(obj, k)
-
-        _clean_obj(config)
-        if hasattr(config, "quantization_config"):
-            _clean_obj(config.quantization_config)
-
+        _clean_config_for_json(config)  # Remove non-serializable functions
         config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
     elif save_method == "mxfp4":
