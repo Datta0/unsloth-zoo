@@ -134,9 +134,25 @@ def patch_gpt_oss():
             matmul_ogs.FusedActivation,
             matmul_ogs.matmul_ogs,
         )
-        swiglu_fn = swiglu.swiglu_fn
-    except Exception as e:
-        return raise_error("triton_kernels", e)
+
+    if HAS_TRITON_KERNELS:
+        try:
+            from triton_kernels import matmul_ogs, swiglu
+
+            FnSpecs, FusedActivation, matmul_ogs = (
+                matmul_ogs.FnSpecs,
+                matmul_ogs.FusedActivation,
+                matmul_ogs.matmul_ogs,
+            )
+            swiglu_fn = swiglu.swiglu_fn
+        except Exception as e:
+            return raise_error("triton_kernels", e)
+    else:
+        # Skip MXFP4 patches when triton_kernels not available
+        # Fixes missing Mxfp4GptOssExperts on T4 / old GPUs
+        patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", GptOssExperts)
+        return
+
 
     try:
         import transformers.integrations.mxfp4
