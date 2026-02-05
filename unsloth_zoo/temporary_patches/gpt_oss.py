@@ -143,7 +143,7 @@ def patch_gpt_oss():
             "transformers.quantizers.quantizer_mxfp4.is_kernels_available", e
         )
 
-    if hasattr(
+    if HAS_TRITON_KERNELS and hasattr(
         transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"
     ):
         transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = (
@@ -171,16 +171,16 @@ def patch_gpt_oss():
             swiglu_fn = swiglu.swiglu_fn
         except Exception as e:
             return raise_error("triton_kernels", e)
-    else:
-        # Skip MXFP4 patches when triton_kernels not available
-        return
+    # Note: Don't return early - fallback code below handles T4/no-triton case
 
     try:
         import transformers.integrations.mxfp4
     except Exception as e:
         return raise_error("transformers.integrations.mxfp4", e)
 
+
     def swizzle_mxfp4(w, w_scale, *args, **kwargs):
+
         from triton_kernels import tensor, tensor_details
 
         FP4, convert_layout, wrap_torch_tensor = (
@@ -212,12 +212,14 @@ def patch_gpt_oss():
         w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
         return w, w_scale
 
-    patch_function(
-        transformers.integrations.mxfp4,
-        "swizzle_mxfp4",
-        swizzle_mxfp4,
-        match_level="relaxed",
-    )
+    if HAS_TRITON_KERNELS:
+        patch_function(
+            transformers.integrations.mxfp4,
+            "swizzle_mxfp4",
+            swizzle_mxfp4,
+            match_level="relaxed",
+        )
+
 
     class Mxfp4GptOssExperts_Training(torch.autograd.Function):
         @staticmethod
@@ -391,9 +393,100 @@ def patch_gpt_oss():
                     )
             return intermediate_cache3
 
+        def forward_fallback(
+            self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_indices: torch.Tensor
+        ) -> torch.Tensor:
+            """
+            Fallback forward for T4 GPUs without triton_kernels.
+            Performs on-the-fly dequantization per expert to minimize VRAM usage.
+
+            Args:
+                hidden_states: [num_tokens, hidden_size]
+                topk_weights: [num_tokens, top_k] - normalized routing weights
+                topk_indices: [num_tokens, top_k] - expert indices for each token
+
+            Returns:
+                output: [num_tokens, hidden_size]
+            """
+            from transformers.integrations.mxfp4 import dequantize
+
+            num_tokens, hidden_size = hidden_states.shape
+            top_k = topk_indices.shape[1]
+            device = hidden_states.device
+            dtype = torch.bfloat16
+
+            # Initialize output
+            output = torch.zeros(num_tokens, hidden_size, device=device, dtype=dtype)
+
+            # SwiGLU parameters
+            alpha = getattr(self, "alpha", 1.702)
+            limit = getattr(self, "limit", 7.0)
+
+            # Process each expert separately to minimize memory
+            for expert_idx in range(self.num_experts):
+                # Find tokens routed to this expert
+                # topk_indices: [num_tokens, top_k], values are expert ids
+                mask = (topk_indices == expert_idx)  # [num_tokens, top_k]
+                token_mask = mask.any(dim=1)  # [num_tokens] - tokens that use this expert
+
+                if not token_mask.any():
+                    continue
+
+                # Get the tokens and their weights for this expert
+                token_indices = token_mask.nonzero(as_tuple=True)[0]
+                expert_tokens = hidden_states[token_indices].to(dtype)  # [n, hidden_size]
+
+                # Get routing weights for this expert
+                # For each token, find the weight corresponding to this expert
+                expert_weights_list = []
+                for i, tok_idx in enumerate(token_indices):
+                    # Find position in topk where expert_idx appears
+                    expert_pos = (topk_indices[tok_idx] == expert_idx).nonzero(as_tuple=True)[0]
+                    if len(expert_pos) > 0:
+                        expert_weights_list.append(topk_weights[tok_idx, expert_pos[0]])
+                    else:
+                        expert_weights_list.append(torch.tensor(0.0, device=device, dtype=dtype))
+                expert_weights = torch.stack(expert_weights_list).unsqueeze(-1)  # [n, 1]
+
+                # Dequantize gate_up_proj for this expert only
+                gate_up_blocks = self.gate_up_proj_blocks[expert_idx]  # [2*intermediate, hidden/32, 16]
+                gate_up_scales = self.gate_up_proj_scales[expert_idx]  # [2*intermediate, hidden/32, 16]
+                gate_up_weight = dequantize(gate_up_blocks, gate_up_scales)  # [2*intermediate, hidden]
+                gate_up_bias = self.gate_up_proj_bias[expert_idx] if self.gate_up_proj_bias is not None else None
+
+                # Gate-up projection: [n, 2*intermediate]
+                pre_activation = torch.nn.functional.linear(expert_tokens, gate_up_weight, gate_up_bias)
+
+                # Free dequantized weights immediately
+                del gate_up_weight, gate_up_blocks, gate_up_scales
+
+                # Apply SwiGLU activation
+                swiglu_output = swiglu_torch_forward(pre_activation, alpha, limit)
+                del pre_activation
+
+                # Dequantize down_proj for this expert only
+                down_blocks = self.down_proj_blocks[expert_idx]  # [hidden, intermediate/32, 16]
+                down_scales = self.down_proj_scales[expert_idx]  # [hidden, intermediate/32, 16]
+                down_weight = dequantize(down_blocks, down_scales)  # [hidden, intermediate]
+                down_bias = self.down_proj_bias[expert_idx] if self.down_proj_bias is not None else None
+
+                # Down projection: [n, hidden]
+                expert_output = torch.nn.functional.linear(swiglu_output, down_weight, down_bias)
+
+                # Free dequantized weights immediately
+                del down_weight, down_blocks, down_scales, swiglu_output
+
+                # Weighted accumulation
+                output.index_add_(0, token_indices, (expert_output * expert_weights).to(output.dtype))
+                del expert_output, expert_weights
+
+            return output
+
         pass
 
-    patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
+    if HAS_TRITON_KERNELS:
+        patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
+
 
     if HAS_TRITON_KERNELS:
         try:
@@ -415,6 +508,34 @@ def patch_gpt_oss():
             return routed_out, router_logits
 
         patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
+    else:
+        # T4 / No triton_kernels fallback: Use PyTorch-based routing and on-the-fly dequantization
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("Unsloth: Adding T4 fallback mlp_forward with on-the-fly dequantization.")
+
+        def mlp_forward_fallback(self, hidden_states):
+            """
+            Fallback MLP forward for T4 (no triton_kernels).
+            Uses PyTorch topk routing and loop-based expert computation with on-the-fly dequantization.
+            """
+            batch_size = hidden_states.shape[0]
+            hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)
+            router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)
+
+            # PyTorch-based routing (topk)
+            top_k = self.router.top_k
+            routing_weights = torch.softmax(router_logits, dim=-1)
+            topk_weights, topk_indices = torch.topk(routing_weights, top_k, dim=-1)
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)  # Normalize
+
+            # Call fallback experts forward
+            routed_out = self.experts.forward_fallback(
+                hidden_states, topk_weights, topk_indices
+            )
+            routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
+            return routed_out, router_logits
+
+        patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward_fallback)
 
     if HAS_TRITON_KERNELS:
         try:
@@ -451,15 +572,8 @@ def patch_gpt_oss():
                 scales_attr = f"{proj}_scales"
                 blocks = getattr(module, blocks_attr)
                 scales = getattr(module, scales_attr)
-                # Check if both blocks and scales both not on meta device AND not all zeros
-                # (if blocks are all zeros, they're from initialization, not from checkpoint)
-                blocks_valid = (
-                    blocks.device.type != "meta"
-                    and scales.device.type != "meta"
-                    and blocks.numel() > 0
-                    and blocks.any()  # At least some non-zero values
-                )
-                if blocks_valid:
+                # Check if both blocks and scales are not on meta device
+                if blocks.device.type != "meta" and scales.device.type != "meta":
                     # need it for ep
                     local_experts = blocks.size(0)
                     if proj == "gate_up_proj":
@@ -473,6 +587,18 @@ def patch_gpt_oss():
                     blocks = blocks.to(target_device)
                     scales = scales.to(target_device)
                     with torch.cuda.device(target_device):
+                        # Ensure we have triton_kernels for swizzle
+                        if not HAS_TRITON_KERNELS:
+                            # Fallback: cannot swizzle without triton kernels
+                            # Keep MXFP4 blocks/scales as-is for on-the-fly dequantization
+                            if UNSLOTH_ENABLE_LOGGING:
+                                logger.warning_once(
+                                    "Unsloth: Skipping MXFP4 swizzle (triton_kernels unavailable).\n"
+                                    "Using on-the-fly dequantization path."
+                                )
+                            return
+
+
                         triton_weight_tensor, weight_scale = swizzle_mxfp4(
                             blocks.transpose(-2, -1), scales.transpose(-2, -1)
                         )
@@ -895,10 +1021,22 @@ def moe_forward_inference(self, hidden_states):
         outs = torch.stack(out_list, dim=0)
     else:
         # 3D parameter style (compatible with transformers)
+        # Handle ParameterModule (nn.Linear subclass with get_param()) or plain 3D tensor
+        gate_up_w = moe.gate_up_proj
+        if hasattr(gate_up_w, "get_param"):
+            gate_up_w = gate_up_w.get_param()
+        elif hasattr(gate_up_w, "weight"):
+            gate_up_w = gate_up_w.weight
+        down_w = moe.down_proj
+        if hasattr(down_w, "get_param"):
+            down_w = down_w.get_param()
+        elif hasattr(down_w, "weight"):
+            down_w = down_w.weight
+
         X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
         # gate_up_proj: (E, hidden_size, 2*expert_dim) - bmm: (E, N, H) @ (E, H, 2I) -> (E, N, 2I)
         gate_up = (
-            torch.bmm(X_rep, moe.gate_up_proj) + moe.gate_up_proj_bias[..., None, :]
+            torch.bmm(X_rep, gate_up_w) + moe.gate_up_proj_bias[..., None, :]
         )
         dtype = (
             torch.float32
@@ -916,7 +1054,7 @@ def moe_forward_inference(self, hidden_states):
         with torch.autocast(device_type=device_type, enabled=False):
             # down_proj: (E, expert_dim, hidden_size) - bmm: (E, N, I) @ (E, I, H) -> (E, N, H)
             outs = (
-                torch.bmm(fused.to(dtype), moe.down_proj)
+                torch.bmm(fused.to(dtype), down_w)
                 + moe.down_proj_bias[..., None, :]
             )
 
@@ -1398,6 +1536,13 @@ def should_dequantize_mxfp4():
     """
     global _MXFP4_DEQUANT_WARNED
 
+    # Fix for 39GB VRAM usage on T4 when loading BnB models
+    # If users load unsloth/gpt-oss-20b-bnb-4bit, we should NOT dequantize MXFP4
+    model_name = os.environ.get("UNSLOTH_MODEL_NAME", "").lower()
+    if "bnb" in model_name and "4bit" in model_name:
+        return False
+
+
     if not UNSLOTH_MXFP4_NO_DEQUANTIZE:
         # Default: dequantize to bf16
         if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
@@ -1409,14 +1554,16 @@ def should_dequantize_mxfp4():
         return True
 
     if not is_triton_kernels_available():
+        # On T4 / no triton_kernels: Use on-the-fly dequantization instead of load-time
+        # This keeps weights quantized in memory (low VRAM) and dequantizes per-expert during forward
         if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
             _MXFP4_DEQUANT_WARNED = True
-            logger.warning(
-                "Unsloth: UNSLOTH_MXFP4_NO_DEQUANTIZE=1 but triton_kernels not available. "
-                "Will dequantize MXFP4 to bf16 (~4x memory increase). "
-                "Install triton_kernels to keep 4-bit quantized weights."
+            logger.info(
+                "Unsloth: triton_kernels not available. Using on-the-fly MXFP4 dequantization. "
+                "Weights stay quantized (~10GB) and are dequantized per-expert during forward. "
+                "For faster inference, install triton_kernels."
             )
-        return True  # triton_kernels required for native MXFP4
+        return False  # Keep MXFP4 quantized for on-the-fly path
 
     if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
         _MXFP4_DEQUANT_WARNED = True
@@ -1427,7 +1574,10 @@ def should_dequantize_mxfp4():
 def patch_gpt_oss_linearized():
     """
     Patch GPT OSS for 4bit loading with grouped_mm support.
-    Only patches the GptOssExperts forward method - keeps original classes for proper weight loading.
+    Replaces GptOssExperts/GptOssTopKRouter/GptOssMLP classes so that
+    ParameterModule (nn.Linear subclass) expert weights can be quantized by BNB.
+    Without class replacement, the original 3D nn.Parameter tensors are NOT
+    quantized by BNB, causing ~39GB VRAM usage instead of ~10GB.
     """
     if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
     if "_load_in_4bit_" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
@@ -1436,33 +1586,17 @@ def patch_gpt_oss_linearized():
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
 
-    # Don't replace classes - just patch the forward method of GptOssExperts
-    # This keeps the original class structure which properly handles 4-bit weight loading
-    backend = select_moe_backend()
-
-    if backend == "grouped_mm":
-
-        def experts_forward(
-            self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
-        ) -> torch.Tensor:
-            return forward_native_grouped_mm(
-                self, hidden_states, router_indices, routing_weights
-            )
-    else:
-
-        def experts_forward(
-            self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
-        ) -> torch.Tensor:
-            return forward_native_moe_loop(
-                self, hidden_states, router_indices, routing_weights
-            )
-
-    # Patch the original transformers class forward method
-    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts.forward = experts_forward
+    # Replace classes so BNB can quantize ParameterModule (nn.Linear subclass) weights.
+    # GptOssExperts uses ParameterModule for gate_up_proj and down_proj, which BNB's
+    # replace_with_bnb_linear recognizes as nn.Linear and quantizes to Linear4bit.
+    # _load_from_state_dict handles 3D checkpoint tensor -> 2D weight conversion.
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExperts
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = GptOssMLP
 
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(
-            f"Unsloth: Patched GPT OSS MoE for 4bit loading (backend: {backend})"
+            f"Unsloth: Patched GPT OSS MoE for 4bit loading (class replacement for BNB quantization)"
         )
     return
 
