@@ -1108,7 +1108,7 @@ def patch_gpt_oss_moe_for_lora():
         )
 
 
-TEMPORARY_PATCHES.append(patch_gpt_oss_moe_for_lora)
+# TEMPORARY_PATCHES.append(patch_gpt_oss_moe_for_lora)
 
 
 # ============================================================================
@@ -1372,7 +1372,7 @@ def patch_mxfp4_gpt_oss_for_lora():
             )
 
 
-TEMPORARY_PATCHES.append(patch_mxfp4_gpt_oss_for_lora)
+# TEMPORARY_PATCHES.append(patch_mxfp4_gpt_oss_for_lora)
 
 
 _MXFP4_DEQUANT_WARNED = False
