@@ -743,13 +743,15 @@ pass
 def _merge_moe_gate_expert(gate_W, lora_stats, expert_idx, num_experts, output_dtype):
     """
     Merge LoRA for a single expert of gate_proj part of gate_up_proj.
+    Mirrors PEFT's `_activate_lora` for MoE: reshape A -> (E, r, in), B -> (out, r, E),
+    delta = B @ A (no transpose), then add directly to the stored weight.
     """
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
             return gate_W
 
-        total_rank, two_inter = lora_stats.lora_A.shape
-        in_dim, total_rank_B = lora_stats.lora_B.shape
+        total_rank = lora_stats.lora_A.shape[0]
+        two_inter, total_rank_B = lora_stats.lora_B.shape  # out_features, rank
 
         # Validation checks
         if total_rank_B != total_rank or two_inter % 2 != 0:
@@ -765,18 +767,18 @@ def _merge_moe_gate_expert(gate_W, lora_stats, expert_idx, num_experts, output_d
         if end > total_rank:
             return gate_W
 
-        a_slice = lora_stats.lora_A[start:end, :]          # (r, 2I)
-        b_slice = lora_stats.lora_B[:, start:end]          # (H, r)
+        a_slice = lora_stats.lora_A[start:end, :]          # (r, H)
+        b_slice = lora_stats.lora_B[:, start:end]          # (2I, r)
         inter_dim = two_inter // 2
 
-        # gate_proj corresponds to first half of A
-        gate_a = a_slice[:, :inter_dim]                    # (r, I)
+        # gate_proj corresponds to first half of the output dimension
+        gate_b = b_slice[:inter_dim, :]                    # (I, r)
 
         device = gate_W.device if gate_W.is_cuda else ("cuda" if torch.cuda.is_available() else "cpu")
-        gate_delta = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ gate_a.to(device, dtype = torch.float32, non_blocking = True)
+        gate_delta = gate_b.to(device, dtype = torch.float32, non_blocking = True) @ a_slice.to(device, dtype = torch.float32, non_blocking = True)
 
         gate_merged = gate_W.to(device, dtype = torch.float32, non_blocking = True)
-        gate_merged = gate_merged.add(gate_delta.transpose(0, 1), alpha = lora_stats.alpha)
+        gate_merged = gate_merged.add(gate_delta, alpha = lora_stats.alpha)
 
         return gate_merged.to(output_dtype)
     except Exception:
@@ -786,13 +788,14 @@ def _merge_moe_gate_expert(gate_W, lora_stats, expert_idx, num_experts, output_d
 def _merge_moe_up_expert(up_W, lora_stats, expert_idx, num_experts, output_dtype):
     """
     Merge LoRA for a single expert of up_proj part of gate_up_proj.
+    Same PEFT-derived rule: per-expert delta = B @ A, added directly without transpose.
     """
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
             return up_W
 
-        total_rank, two_inter = lora_stats.lora_A.shape
-        in_dim, total_rank_B = lora_stats.lora_B.shape
+        total_rank = lora_stats.lora_A.shape[0]
+        two_inter, total_rank_B = lora_stats.lora_B.shape  # out_features, rank
 
         # Validation checks
         if total_rank_B != total_rank or two_inter % 2 != 0:
@@ -808,18 +811,18 @@ def _merge_moe_up_expert(up_W, lora_stats, expert_idx, num_experts, output_dtype
         if end > total_rank:
             return up_W
 
-        a_slice = lora_stats.lora_A[start:end, :]          # (r, 2I)
-        b_slice = lora_stats.lora_B[:, start:end]          # (H, r)
+        a_slice = lora_stats.lora_A[start:end, :]          # (r, H)
+        b_slice = lora_stats.lora_B[:, start:end]          # (2I, r)
         inter_dim = two_inter // 2
 
-        # up_proj corresponds to second half of A
-        up_a   = a_slice[:, inter_dim:]                    # (r, I)
+        # up_proj corresponds to second half of the output dimension
+        up_b   = b_slice[inter_dim:, :]                    # (I, r)
 
         device = up_W.device if up_W.is_cuda else ("cuda" if torch.cuda.is_available() else "cpu")
-        up_delta   = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ up_a.to(device, dtype = torch.float32, non_blocking = True)
+        up_delta   = up_b.to(device, dtype = torch.float32, non_blocking = True) @ a_slice.to(device, dtype = torch.float32, non_blocking = True)
 
         up_merged = up_W.to(device, dtype = torch.float32, non_blocking = True)
-        up_merged = up_merged.add(up_delta.transpose(0, 1), alpha = lora_stats.alpha)
+        up_merged = up_merged.add(up_delta, alpha = lora_stats.alpha)
 
         return up_merged.to(output_dtype)
     except Exception:
@@ -830,16 +833,16 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
     """
     Merge LoRA for a single expert of down_proj.
     LoRA weights are stacked per expert:
-      lora_A: (E*R, H)    (swapped)
-      lora_B: (I, E*R)    (swapped)
-    delta = (lora_B @ lora_A)^T
+      lora_A: (E*R, in_features)
+      lora_B: (out_features, E*R)
+    delta = (lora_B @ lora_A)  # matches PEFT `_activate_lora` MoE path
     """
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
             return down_W
 
-        total_rank, out_dim = lora_stats.lora_A.shape
-        in_dim, total_rank_B = lora_stats.lora_B.shape
+        total_rank, in_features = lora_stats.lora_A.shape
+        out_features, total_rank_B = lora_stats.lora_B.shape
         if total_rank_B != total_rank:
             return down_W
 
@@ -853,13 +856,13 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
         if end > total_rank:
             return down_W
 
-        a_slice = lora_stats.lora_A[start:end, :]     # (r, H_out)
-        b_slice = lora_stats.lora_B[:, start:end]     # (I_in, r)
+        a_slice = lora_stats.lora_A[start:end, :]     # (r, in_features)
+        b_slice = lora_stats.lora_B[:, start:end]     # (out_features, r)
 
         device = down_W.device if down_W.is_cuda else ("cuda" if torch.cuda.is_available() else "cpu")
         delta = b_slice.to(device, dtype = torch.float32, non_blocking = True) @ a_slice.to(device, dtype = torch.float32, non_blocking = True)
         merged = down_W.to(device, dtype = torch.float32, non_blocking = True)
-        merged = merged.add(delta.transpose(0, 1), alpha = lora_stats.alpha)
+        merged = merged.add(delta, alpha = lora_stats.alpha)
         return merged.to(output_dtype)
     except Exception:
         return down_W
