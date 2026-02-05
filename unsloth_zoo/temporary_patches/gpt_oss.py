@@ -108,6 +108,7 @@ pass
 def patch_gpt_oss():
     try:
         import triton_kernels
+        HAS_TRITON_KERNELS = True
     except Exception as e:
         return raise_error("Please install triton_kernels", e)
 
@@ -134,6 +135,8 @@ def patch_gpt_oss():
             matmul_ogs.FusedActivation,
             matmul_ogs.matmul_ogs,
         )
+    except Exception as e:
+        return raise_error("triton_kernels", e)
 
     if HAS_TRITON_KERNELS:
         try:
