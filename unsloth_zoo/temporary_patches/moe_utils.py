@@ -2,1249 +2,1606 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published
-# by the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# GNU General Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
+# You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-import torch
-import torch.nn.functional as F
-import os
-import shutil
-from typing import Optional, Tuple
-from torch.autograd import Function
 
-# Get compile location
-UNSLOTH_COMPILE_LOCATION = os.environ.get(
-    "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import inspect
+from .common import (
+    TEMPORARY_PATCHES,
+    torch_compile,
+    _torch_compile,
+    get_torch_compile_options,
+    UNSLOTH_ENABLE_LOGGING,
+)
+from importlib.metadata import version as importlib_version
+from ..utils import Version
+transformers_version = Version(importlib_version("transformers"))
+has_static_cache = transformers_version >= Version("4.56.0.dev0")
+from .utils import (
+    patch_function,
+    patch_function_past_key_values,
+    dedent,
+    KWARGS_TYPE,
+    raise_error,
+    logger,
+    Cache,
+    process_return,
+)
+from ..hf_utils import dtype_from_config
+torch_cuda_device = torch.cuda.device
+
+
+@torch_compile(dynamic = True, fullgraph = True)
+def swiglu_torch_forward(a, alpha, limit, dtype = None):
+    a_gelu = a[..., ::2].to(torch.float32)
+    if limit is not None:
+        a_gelu = a_gelu.clamp(max=limit)
+    a_linear = a[..., 1::2].to(torch.float32)
+    if limit is not None:
+        a_linear = a_linear.clamp(min=-limit, max=limit)
+
+    out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
+    out = out_gelu * (a_linear + 1)
+    return out.to(a.dtype if dtype is None else dtype)
+pass
+
+@torch_compile(dynamic = True, fullgraph = True)
+def swiglu_torch_backward(pre_act, alpha, limit, g1):
+    g, l = pre_act[..., ::2].to(torch.float32), pre_act[..., 1::2].to(torch.float32)
+
+    if limit is not None:
+        mask_g = g <= limit
+        mask_l = l.abs() <= limit
+        ḡ = torch.where(mask_g, g, limit)
+        l̄ = torch.where(mask_l, l, l.sign() * limit)
+    else:                                            # no clipping
+        mask_g = mask_l = torch.ones_like(g, dtype=bool)
+        ḡ, l̄ = g, l
+
+    σ   = torch.sigmoid(alpha * ḡ)
+    dg  = (σ + alpha * ḡ * σ * (1 - σ)) * (l̄ + 1)
+    dl  = ḡ * σ
+    dg  = torch.where(mask_g, dg, 0.)                # clamp-grad
+    dl  = torch.where(mask_l, dl, 0.)
+
+    grad = torch.empty_like(pre_act)
+    grad[..., ::2], grad[..., 1::2] = dg, dl
+    return g1 * grad.to(g1.dtype)
+pass
+
+
+def patch_gpt_oss():
+    try:
+        import triton_kernels
+    except Exception as e:
+        return raise_error("Please install triton_kernels", e)
+
+    try:
+        import transformers.quantizers.quantizer_mxfp4
+        def is_kernels_available(): return True
+        transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
+    except Exception as e:
+        return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
+
+    if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
+
+    try:
+        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
+    except Exception as e:
+        return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
+
+    try:
+        from triton_kernels import matmul_ogs, swiglu
+        FnSpecs, FusedActivation, matmul_ogs = (
+            matmul_ogs.FnSpecs,
+            matmul_ogs.FusedActivation,
+            matmul_ogs.matmul_ogs,
+        )
+        swiglu_fn = swiglu.swiglu_fn
+    except Exception as e:
+        return raise_error("triton_kernels", e)
+
+    try:
+        import transformers.integrations.mxfp4
+    except Exception as e:
+        return raise_error("transformers.integrations.mxfp4", e)
+
+    def swizzle_mxfp4(w, w_scale, *args, **kwargs):
+        from triton_kernels import tensor, tensor_details
+        FP4, convert_layout, wrap_torch_tensor = (
+            tensor.FP4,
+            tensor.convert_layout,
+            tensor.wrap_torch_tensor,
+        )
+        layout = tensor_details.layout
+        StridedLayout = tensor_details.layout.StridedLayout
+
+        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
+        w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
+        # TODO : add that when we are actually sure that it works on B200
+        # if torch.cuda.get_device_capability()[0] == 10:
+        #     constraints = {
+        #         "is_persistent": True,
+        #         "epilogue_subtile": 1,
+        #     }
+        #     opt_flags.update_opt_flags_constraints(constraints)
+        # # transpose the tensor so that the quantization axis is on dim1
+
+        # TODO: there is still an issue with the scales on hopper
+        # scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(mx_axis=1, num_warps=8)
+        # w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout, **scale_layout_opts)
+        w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
+        return w, w_scale
+    patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level = "relaxed")
+
+    class Mxfp4GptOssExperts_Training(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx,
+            hidden_states,
+            self_class,
+            routing_data,
+            gather_idx,
+            scatter_idx,
+        ):
+            pre_activation = matmul_ogs(
+                hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
+                self_class.gate_up_proj,
+                self_class.gate_up_proj_bias,
+                routing_data,
+                gather_indx=gather_idx,
+                scatter_indx=None,
+                precision_config=self_class.gate_up_proj_precision_config,
+                gammas=None,
+                fused_activation=None,
+            )
+            swiglu_output = swiglu_torch_forward(
+                pre_activation,
+                self_class.alpha,
+                self_class.limit,
+            )
+            out = matmul_ogs(
+                swiglu_output,
+                self_class.down_proj,
+                self_class.down_proj_bias,
+                routing_data,
+                gather_indx=None,
+                scatter_indx=scatter_idx,
+                precision_config=self_class.down_proj_precision_config,
+                gammas=routing_data.gate_scal,
+                fused_activation=None,
+            )
+            ctx.save_for_backward(
+                pre_activation,
+                routing_data.gate_scal,
+                gather_idx.src_indx,
+                gather_idx.dst_indx,
+                scatter_idx.src_indx,
+                scatter_idx.dst_indx,
+            )
+            ctx.self_class   = self_class
+            ctx.gather_idx   = gather_idx
+            ctx.scatter_idx  = scatter_idx
+            ctx.routing_data = routing_data
+            return out
+        pass
+
+        @staticmethod
+        def backward(ctx, grad_token):
+            raise NotImplementedError(
+                "Backwards pass using MXFP4 is still under construction!\n"\
+                "Instead, use `unsloth/gpt-oss-20b-BF16` for bfloat16 training which will work for LoRA.\n"\
+                "Or, use `load_in_4bit = True` which allows finetuning."
+            )
+            (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
+            self_class = ctx.self_class
+            limit = self_class.limit
+            alpha = self_class.alpha
+
+            # 1) token ➜ expert (reverse of forward scatter)
+            grad_exp = grad_token.index_select(0, scatter_src)
+            grad_exp.mul_(gamma.unsqueeze(-1))
+            # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
+            Wd_T = ctx.self_class.down_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, d_model, d_ff)
+            g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
+            del Wd_T
+            # 3) activation derivative
+            g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
+            # 4) g1 · Wuᵀ
+            Wu_T = ctx.self_class.gate_up_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, 2*d_ff, d_model)
+            dx_exp = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
+            del Wu_T
+
+            # 5) expert ➜ token (reverse of forward gather)
+            dx_token = torch.zeros_like(grad_token)
+            dx_token.index_add_(0, gather_dst, dx_exp)
+            return (dx_token, None, None, None, None,)
+        pass
+    pass
+
+    class Mxfp4GptOssExperts(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+
+            self.num_experts = config.num_local_experts
+            self.intermediate_size = config.intermediate_size
+            self.hidden_size = config.hidden_size
+
+            self.gate_up_proj_blocks = nn.Parameter(
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, 16, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.gate_up_proj_scales = nn.Parameter(
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.gate_up_proj_bias = nn.Parameter(
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32), requires_grad=False
+            )
+
+            self.down_proj_blocks = nn.Parameter(
+                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16), dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.down_proj_scales = nn.Parameter(
+                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            self.down_proj_bias = nn.Parameter(
+                torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32), requires_grad=False
+            )
+            self.alpha = 1.702
+            self.limit = getattr(config, "swiglu_limit", 7.0)
+            self.gate_up_proj_precision_config = None
+            self.down_proj_precision_config = None
+
+        def forward(self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx) -> torch.Tensor:
+            with torch_cuda_device(hidden_states.device):
+                if not hasattr(self, "act"):
+                    self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
+                if not hidden_states.requires_grad:
+                    intermediate_cache1 = matmul_ogs(
+                        hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
+                        self.gate_up_proj,
+                        self.gate_up_proj_bias,
+                        routing_data,
+                        gather_indx=gather_idx,
+                        precision_config=self.gate_up_proj_precision_config,
+                        gammas=None,
+                        fused_activation=self.act,
+                    )
+                    intermediate_cache3 = matmul_ogs(
+                        intermediate_cache1,
+                        self.down_proj,
+                        self.down_proj_bias,
+                        routing_data,
+                        scatter_indx=scatter_idx,
+                        precision_config=self.down_proj_precision_config,
+                        gammas=routing_data.gate_scal if routing_data else None,
+                    )
+                else:
+                    intermediate_cache3 = Mxfp4GptOssExperts_Training.apply(
+                        hidden_states,
+                        self,
+                        routing_data,
+                        gather_idx,
+                        scatter_idx,
+                    )
+            return intermediate_cache3
+        pass
+    patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
+
+    try:
+        routing = triton_kernels.routing.routing
+        routing = torch.compiler.disable(routing)
+    except Exception as e:
+        return raise_error("triton_kernels.routing.routing", e)
+
+    def mlp_forward(self, hidden_states):
+        batch_size = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)
+        router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)
+
+        with torch_cuda_device(router_logits.device):
+            routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)
+
+        routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)
+        routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
+        return routed_out, router_logits
+    patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
+
+    try:
+        PrecisionConfig, FlexCtx, InFlexData = (
+            triton_kernels.matmul_ogs.PrecisionConfig,
+            triton_kernels.matmul_ogs.FlexCtx,
+            triton_kernels.matmul_ogs.InFlexData,
+        )
+    except Exception as e:
+        return raise_error("triton_kernels.matmul_ogs", e)
+
+    try:
+        from transformers.integrations.tensor_parallel import shard_and_distribute_module
+    except Exception as e:
+        return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
+
+    def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, *args, **kwargs):
+        model = kwargs.get("model", None)
+        empty_param = kwargs.get("empty_param", None)
+        casting_dtype = kwargs.get("casting_dtype", None)
+        to_contiguous = kwargs.get("to_contiguous", None)
+        rank = kwargs.get("rank", None)
+        device_mesh = kwargs.get("device_mesh", None)
+
+        for proj in ["gate_up_proj", "down_proj"]:
+            if proj in param_name:
+                if device_mesh is not None:
+                    shard_and_distribute_module(
+                        model, param_value, empty_param, param_name, casting_dtype, to_contiguous, rank, device_mesh
+                    )
+                else:
+                    setattr(module, param_name.rsplit(".", 1)[1], torch.nn.Parameter(param_value, requires_grad=False))
+                blocks_attr = f"{proj}_blocks"
+                scales_attr = f"{proj}_scales"
+                blocks = getattr(module, blocks_attr)
+                scales = getattr(module, scales_attr)
+                # Check if both blocks and scales both not on on meta device
+                if blocks.device.type != "meta" and scales.device.type != "meta":
+                    # need it for ep
+                    local_experts = blocks.size(0)
+                    if proj == "gate_up_proj":
+                        blocks = blocks.view(local_experts, module.intermediate_size * 2, -1)
+                    else:
+                        blocks = blocks.view(local_experts, -1, module.intermediate_size // 2)
+                    # TODO: we need to have the weights on cuda, refactor later
+                    if getattr(target_device, "type", target_device) == "cpu":
+                        target_device = "cuda"
+                    # TODO: check why we still do move the tensors despite the context manager
+                    blocks = blocks.to(target_device)
+                    scales = scales.to(target_device)
+                    with torch.cuda.device(target_device):
+                        triton_weight_tensor, weight_scale = swizzle_mxfp4(
+                            blocks.transpose(-2, -1), scales.transpose(-2, -1)
+                        )
+
+                    # need to overwrite the shapes for the kernels
+                    if proj == "gate_up_proj":
+                        triton_weight_tensor.shape = torch.Size(
+                            [local_experts, module.hidden_size, module.intermediate_size * 2]
+                        )
+                    else:
+                        triton_weight_tensor.shape = torch.Size(
+                            [local_experts, module.intermediate_size, module.hidden_size]
+                        )
+
+                    # triton_weight_tensor is what needs to be passed in oai kernels. It stores the data, the shapes and any more objects. It is like a subtensor
+                    setattr(module, proj, triton_weight_tensor)
+                    setattr(
+                        module,
+                        f"{proj}_precision_config",
+                        PrecisionConfig(weight_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData())),
+                    )
+
+                    # delete blocks and scales
+                    delattr(module, scales_attr)
+                    delattr(module, blocks_attr)
+                    # setattr(module, blocks_attr, torch.nn.Parameter(triton_weight_tensor.storage.data, requires_grad=False))
+                    del blocks
+    pass
+    patch_function(transformers.integrations.mxfp4, "load_and_swizzle_mxfp4", load_and_swizzle_mxfp4, match_level = "relaxed")
+
+    try:
+        from transformers.integrations.mxfp4 import _replace_with_mxfp4_linear
+    except Exception as e:
+        return raise_error("transformers.integrations.mxfp4._replace_with_mxfp4_linear", e)
+
+    def replace_with_mxfp4_linear(
+        model,
+        modules_to_not_convert=None,
+        current_key_name=None,
+        quantization_config=None,
+        config=None,
+    ):
+        if quantization_config.dequantize: return model
+        modules_to_not_convert = ["lm_head"] if modules_to_not_convert is None else modules_to_not_convert
+        if quantization_config.modules_to_not_convert is not None:
+            modules_to_not_convert.extend(quantization_config.modules_to_not_convert)
+        modules_to_not_convert = list(set(modules_to_not_convert))
+        model, has_been_replaced = _replace_with_mxfp4_linear(
+            model,
+            modules_to_not_convert,
+            current_key_name,
+            quantization_config,
+            config=config,
+        )
+        if not has_been_replaced:
+            logger.warning_once(
+                "You are loading your model using mixed-precision FP4 quantization but no linear modules were found in your model."
+                " Please double check your model architecture, or submit an issue on github if you think this is"
+                " a bug."
+            )
+
+        return model
+    patch_function(transformers.integrations.mxfp4, "replace_with_mxfp4_linear", replace_with_mxfp4_linear)
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss)
+
+
+class GptOssExperts(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.num_experts = config.num_local_experts
+        self.hidden_size = config.hidden_size
+        self.expert_dim = config.intermediate_size
+        self.alpha = 1.702
+        self.limit = getattr(config, "swiglu_limit", 7.0)
+        self.dtype = dtype_from_config(config)
+
+        self.gate_up_projs = nn.ModuleList([
+            nn.Linear(self.hidden_size, 2 * self.expert_dim, dtype=self.dtype)
+            for _ in range(self.num_experts)
+        ])
+        self.down_projs = nn.ModuleList([
+            nn.Linear(self.expert_dim, self.hidden_size, dtype=self.dtype)
+            for _ in range(self.num_experts)
+        ])
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_indices = None,
+        routing_weights = None
+    ) -> torch.Tensor:
+
+        batch_size = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        num_experts = routing_weights.shape[1]
+        if self.training:
+            next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
+            # with torch.no_grad():
+                # expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
+                # expert_mask = expert_mask.permute(2, 1, 0)
+                # expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            # for expert_idx in expert_hitted[:]:
+            for expert_idx in range(num_experts):
+                with torch.no_grad():
+                    # _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                    token_idx, _ = torch.where(router_indices == expert_idx)
+                current_state = hidden_states[token_idx]
+                gate_up = self.gate_up_projs[expert_idx](current_state)
+                gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
+                # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                # gate = gate.clamp(min=None, max=self.limit)
+                # up = up.clamp(min=-self.limit, max=self.limit)
+                # glu = gate * torch.sigmoid(gate * self.alpha)
+                # gated_output = (up + 1) * glu
+                out = self.down_projs[expert_idx](gated_output)
+                weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+                next_states.index_add_(0, token_idx, weighted_output)
+            next_states = next_states.view(batch_size, -1, self.hidden_size)
+            return next_states.to(hidden_states.dtype)
+        else:
+            X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+            gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
+            gate_up = torch.stack(gate_up_list, dim=0)
+            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = X_rep.dtype)
+            # gate = gate_up[..., ::2]
+            # up_h = gate_up[..., 1::2]
+            # gate = gate.clamp(max=self.limit)
+            # up_h = up_h.clamp(min=-self.limit, max=self.limit)
+            # glu = gate * torch.sigmoid(gate * self.alpha)
+            # fused = (up_h + 1) * glu
+            out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
+            outs = torch.stack(out_list, dim=0)
+            rw = routing_weights.transpose(0, 1).unsqueeze(-1)
+            mixed = (outs.to(torch.float32) * rw.to(torch.float32)).sum(dim=0)
+            return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
+pass
+
+class GptOssTopKRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_local_experts
+        self.hidden_dim = config.hidden_size
+        self.linear = nn.Linear(self.hidden_dim, self.num_experts, dtype=dtype_from_config(config))
+
+    @torch_compile(dynamic = True, fullgraph = True)
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = self.linear(hidden_states.to(self.linear.weight.dtype)) # (batch_size * seq_len, num_experts)
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1) # (seq_len, top_k)
+        dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
+        router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
+        return router_scores, router_indices
+pass
+
+
+# Combo kernels uses too much VRAM for low memory GPUs
+from ..device_type import DEVICE_TYPE
+if DEVICE_TYPE == "xpu":
+    device_memory = torch.xpu.memory.mem_get_info(0)[-1]
+else:
+    device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
+fused_torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False, # Too slow
+    shape_padding = True,
+    cudagraphs = True,
+    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    combo_kernels = use_combo_kernels,
+    memory_planning = True,
+    multi_kernel = False, # Fails on torch 2.10 nightly
+    use_block_ptr = True,
+    logging = UNSLOTH_ENABLE_LOGGING,
+)
+no_combo_fused_torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False, # Too slow
+    shape_padding = True,
+    cudagraphs = True,
+    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    combo_kernels = False, # Breaks on attention
+    memory_planning = True,
+    multi_kernel = False, # Fails on torch 2.10 nightly
+    use_block_ptr = True,
+    logging = UNSLOTH_ENABLE_LOGGING,
 )
 
+@_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+def moe_forward_inference(self, hidden_states):
+    """Torch compile for forward inference path only with CUDAGraphs"""
+    # Router
+    router_scores, router_indices = self.router(hidden_states)
+    routing_weights = router_scores
+    moe = self.experts
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, moe.hidden_size)
 
-def install_to_cache(source_path, destination_filename=None):
-    """
-    Copies a file to the unsloth_compiled_cache directory
-    to ensure it is available for compiled modules.
-    """
-    if not os.path.exists(UNSLOTH_COMPILE_LOCATION):
+    num_experts = routing_weights.shape[1]
+    X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+
+    # Gate up projection
+    gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(moe.gate_up_projs)]
+    gate_up = torch.stack(gate_up_list, dim = 0)
+    dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+    fused = swiglu_torch_forward(gate_up, moe.alpha, moe.limit, dtype = dtype)
+
+    # Down projection must be done in float32 if not bfloat16 otherwise infinites
+    fused = fused.to(dtype)
+    device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
+    with torch.autocast(device_type=device_type, enabled=False): # Force float32
+        out_list = [down_l(fused[e].to(dtype)) for e, down_l in enumerate(moe.down_projs)]
+    outs = torch.stack(out_list, dim=0)
+
+    rw = routing_weights.to(dtype).transpose(0, 1).unsqueeze(-1)
+    mixed = (outs * rw).sum(dim=0)
+    return mixed.view(batch_size, -1, moe.hidden_size).to(hidden_states.dtype)
+pass
+
+@torch_compile(dynamic = True, fullgraph = True)
+def moe_router_forward(self, hidden_states):
+    hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+    router_logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, self.bias)  # (seq_len, num_experts)
+    router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+    dtype = torch.float32 if router_logits.dtype == torch.float16 else router_logits.dtype
+    router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=torch.float32).to(dtype)
+    router_scores = torch.zeros_like(router_logits, dtype = dtype).scatter_(1, router_indices, router_top_value)
+    return router_scores, router_indices
+pass
+
+# Combo Kernels errors with InductorError: AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+@_torch_compile(dynamic = None, fullgraph = True, options = no_combo_fused_torch_compile_options)
+def moe_forward_inference_bf16(self, hidden_states):
+    router_scores, router_indices = moe_router_forward(self.router, hidden_states)
+    routing_weights = router_scores
+
+    moe = self.experts
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, moe.hidden_size)
+    num_experts = routing_weights.shape[1]
+    hidden_states = hidden_states.repeat(num_experts, 1)
+    hidden_states = hidden_states.view(num_experts, -1, moe.hidden_size)
+    gate_up = torch.bmm(hidden_states, moe.gate_up_proj) + moe.gate_up_proj_bias[..., None, :]
+    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+    gate = gate.clamp(min=None, max=moe.limit)
+    up = up.clamp(min=-moe.limit, max=moe.limit)
+    glu = gate * torch.sigmoid(gate.to(torch.float32) * moe.alpha).to(gate.dtype)
+    next_states = torch.bmm(((up + 1) * glu), moe.down_proj)
+    next_states = next_states + moe.down_proj_bias[..., None, :]
+    next_states = next_states.view(num_experts, batch_size, -1, moe.hidden_size)
+    next_states = next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
+    next_states = next_states.sum(dim=0)
+    return next_states
+pass
+
+
+class GptOssMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.router = GptOssTopKRouter(config)
+        self.experts = GptOssExperts(config)
+
+    def forward(self, hidden_states):
+        bsz, qlen, hd = hidden_states.shape
+        if qlen == 1 and not self.training:
+            return moe_forward_inference(self, hidden_states), None
+        router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
+        routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+        return routed_out, router_scores
+pass
+
+def patch_gpt_oss_linearized():
+    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    if "_load_in_4bit_" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
+
+    # We find down_proj overflows in GPT OSS
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            router_indices = None,
+            routing_weights = None
+        ) -> torch.Tensor:
+
+            batch_size = hidden_states.shape[0]
+            hidden_states = hidden_states.reshape(-1, self.hidden_size)
+            num_experts = routing_weights.shape[1]
+            if self.training:
+                next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
+                # with torch.no_grad():
+                #     expert_mask = torch.nn.functional.one_hot(router_indices, num_classes=num_experts)
+                #     expert_mask = expert_mask.permute(2, 1, 0)
+                #     expert_hitted = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+                # for expert_idx in expert_hitted[:]:
+                for expert_idx in range(num_experts):
+                    with torch.no_grad():
+                        # _, token_idx = torch.where(expert_mask[expert_idx[0]])
+                        token_idx, _ = torch.where(router_indices == expert_idx)
+                    current_state = hidden_states[token_idx]
+                    gate_up = self.gate_up_projs[expert_idx](current_state)
+                    down_proj = self.down_projs[expert_idx]
+                    gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
+                    # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                    # gate = gate.clamp(min=None, max=self.limit)
+                    # up = up.clamp(min=-self.limit, max=self.limit)
+                    # glu = gate * torch.sigmoid(gate * self.alpha)
+                    # gated_output = (up + 1) * glu
+
+                    # Force float32 matrix multiply on some down projection modules
+                    gated_output = gated_output.to(torch.float32)
+                    device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
+                    with torch.autocast(device_type=device_type, enabled=False): # Force float32
+                        out = down_proj(gated_output)
+                    weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+                    next_states.index_add_(0, token_idx, weighted_output)
+                next_states = next_states.view(batch_size, -1, self.hidden_size)
+                return next_states.to(torch.float32)
+            else:
+                X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+                gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
+                gate_up = torch.stack(gate_up_list, dim=0)
+                dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+                fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
+                # gate = gate_up[..., ::2]
+                # up_h = gate_up[..., 1::2]
+                # gate = gate.clamp(max=self.limit)
+                # up_h = up_h.clamp(min=-self.limit, max=self.limit)
+                # glu = gate * torch.sigmoid(gate * self.alpha)
+                # fused = (up_h + 1) * glu
+
+                # Force float32 matrix multiply on down projection only
+                device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
+                with torch.autocast(device_type=device_type, enabled=False): # Force float32
+                    out_list = [
+                        down_l(fused[e].to(dtype))
+                        for e, down_l in enumerate(self.down_projs)
+                    ]
+                outs = torch.stack(out_list, dim=0)
+                rw = routing_weights.transpose(0, 1).unsqueeze(-1)
+                mixed = (outs.to(dtype) * rw.to(dtype)).sum(dim=0)
+                return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
+            pass
+        pass
+        GptOssExperts.forward = forward
+    pass
+
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExperts
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
+    transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = GptOssMLP
+    return
+pass
+TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
+
+
+def patch_GptOssAttention():
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    try:
+        from ..flex_attention import (
+            flex_attention_with_sink,
+            is_flex_attention_decoding,
+            flex_attention_with_sink_decoding,
+            flex_attention_add_sinks,
+        )
+        assert flex_attention_with_sink is not None
+    except Exception as e:
+        return raise_error("flex_attention_with_sink", e)
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
+
+    torch._dynamo.config.cache_size_limit = 256
+    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+        num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+        """
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+    F_softmax = torch.nn.functional.softmax
+    F_dropout = nn.functional.dropout
+    matmul = torch.matmul
+    def inplace_eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+
+        bsz, n_heads, qlen, _  = query.shape
+        bsz, n_heads, kvlen, _ = key_states.shape
+        combined_logits = key_states.new_empty((bsz, n_heads, qlen, kvlen+1))
+
+        attn_weights = matmul(query, key_states.transpose(2, 3), out = combined_logits[:,:,:,:kvlen])
+        attn_weights *= scaling
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights += causal_mask
+
+        # sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        # combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+        combined_logits[:, :, :, -1] = module.sinks.reshape(1, -1, 1)
+
+        # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
+        # when training with bsz>1 we clamp max values.
+        # combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        probs = combined_logits
+        scores = probs[..., :-1]  # we drop the sink here
+        attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
+        attn_output = matmul(attn_weights, value_states, out = query)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output, None
+    pass
+
+    def eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+        attn_weights = matmul(query, key_states.transpose(2, 3))
+        attn_weights *= scaling
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights += causal_mask
+
+        sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+
+        # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
+        # when training with bsz>1 we clamp max values.
+        # combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+        combined_logits[:] = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        probs = combined_logits
+        scores = probs[..., :-1]  # we drop the sink here
+        attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
+        attn_output = matmul(attn_weights, value_states, out = query)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output, None
+    pass
+
+    apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
+    if False: # Version(torch.__version__) >= Version("2.10.0"):
+        eager_attention_forward = torch_compile(eager_attention_forward, dynamic = None, fullgraph = True)
+    else:
+        # Too many recompilation failures on 2.8.0, 2.9.0
+        eager_attention_forward = inplace_eager_attention_forward
+
+    def forward_function(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_value is not None:
+            cache_kwargs = {"cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # flex_attention_with_sink only works for training since KV cache is wrong
+        # switch to flex_attention_with_sink which allows all to work
+        # if is_flex_attention_decoding(self, query_states) and has_static_cache:
+        #     attn_output, logsumexp = flex_attention_with_sink_decoding(
+        #         self,
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #     )
+        #     attn_output = flex_attention_add_sinks(
+        #         self,
+        #         attn_output,
+        #         logsumexp,
+        #     )
+        # else:
+        #     attn_output = flex_attention_with_sink(
+        #         self,
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #         attention_mask,
+        #         has_static_cache = has_static_cache,
+        #     )
+        # attn_weights = None
+        if self.training:
+            attn_output = flex_attention_with_sink(
+                self,
+                query_states,
+                key_states,
+                value_states,
+            )
+            attn_weights = None
+        else:
+            # Weirdly for inference, flex attention returns gibberish
+            # Most likely due to left padding
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,  # diff with Llama
+                **kwargs,
+            )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+    pass
+
+    functions = []
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs)
+    functions.append(forward)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        return forward_function(self, hidden_states, position_embeddings, attention_mask, past_key_values, cache_position, **kwargs)
+    functions.append(forward)
+    patch_function_past_key_values(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", functions)
+    # Set env variable for padding purposes
+    os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
+pass
+TEMPORARY_PATCHES.append(patch_GptOssAttention)
+
+
+def patch_GptOssModel():
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    if "gpt_oss" not in os.environ.get("UNSLOTH_MODEL_NAME", ""): return
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel
+        from transformers.models.gpt_oss.modeling_gpt_oss import MoeModelOutputWithPast
+        from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
+    except Exception as e:
+        return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
+    try:
+        from transformers.models.gpt_oss.modeling_gpt_oss import DynamicCache
+    except Exception as e:
+        raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
+        DynamicCache = lambda *args, **kwargs: None
+
+    torch._dynamo.config.cache_size_limit = 256
+
+    # Disable mask creations since we don't need them for GPT-OSS
+    import transformers.masking_utils
+    import transformers.generation.utils
+    def wrap(f):
+        def return_attention_mask(*args, **kwargs):
+            if kwargs["input_embeds"].requires_grad:
+                if "attention_mask" in kwargs:
+                    return kwargs["attention_mask"]
+                for arg in args:
+                    if type(arg) is torch.Tensor and arg.dtype == torch.int32:
+                        return arg
+            else:
+                # Eager
+                return f(*args, **kwargs)
+            pass
+        return return_attention_mask
+    pass
+    create_causal_mask = getattr(
+        transformers.masking_utils,
+        "_old_create_causal_mask",
+        getattr(transformers.masking_utils, "create_causal_mask", None),
+    )
+    create_sliding_window_causal_mask = getattr(
+        transformers.masking_utils,
+        "_old_create_sliding_window_causal_mask",
+        getattr(transformers.masking_utils, "create_sliding_window_causal_mask", None),
+    )
+    if create_causal_mask is None:
+        return raise_error("transformers.masking_utils.create_causal_mask")
+    if create_sliding_window_causal_mask is None:
+        return raise_error("transformers.masking_utils.create_sliding_window_causal_mask")
+    if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
+        transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
+        transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
+        transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
+        transformers.models.gpt_oss.modeling_gpt_oss.create_sliding_window_causal_mask = transformers.masking_utils.create_sliding_window_causal_mask
+        transformers.masking_utils.create_masks_for_generate = wrap(transformers.masking_utils.create_masks_for_generate)
+        transformers.generation.utils.create_masks_for_generate = wrap(transformers.generation.utils.create_masks_for_generate)
+        transformers.masking_utils.__patched_causal_mask__ = True
+    pass
+
+    from ..flex_attention import (
+        is_flex_attention_decoding,
+        flex_attention_with_sink_decoding,
+        flex_attention_add_sinks,
+    )
+    apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
+    try:
+        from transformers.integrations.mxfp4 import mlp_forward
+    except:
+        mlp_forward = None
+
+    def pre_attention_decoding(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_values is not None:
+            cache_kwargs = {"cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        return query_states, key_states, value_states, input_shape
+    pass
+    # Do flex_attention_with_sink_decoding with cannot be compiled
+    # attn_output, logsumexp = flex_attention_with_sink_decoding(
+    #     self,
+    #     query_states,
+    #     key_states,
+    #     value_states,
+    # )
+    def post_attention_decoding(self_attn, attn_output, logsumexp, input_shape):
+        attn_output = flex_attention_add_sinks(self_attn, attn_output, logsumexp)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self_attn.o_proj(attn_output)
+        return attn_output
+    pass
+
+    # RMSNorm forward
+    def rms_layernorm_forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.square().mean(-1, keepdim=True)
+        variance += self.variance_epsilon
+        hidden_states *= torch.rsqrt_(variance)
+        hidden_states *= self.weight.to(hidden_states.device).to(torch.float32)
+        return hidden_states.to(input_dtype)  # main diff with Llama
+    pass
+
+    # Re-compiling for each new sequence length which is NOT ideal
+    @_torch_compile(dynamic = True, fullgraph = False, mode = "reduce-overhead")
+    def pre_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+    ):
+        hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
+        # Self Attention
+        query_states, key_states, value_states, input_shape = pre_attention_decoding(
+            self=self.self_attn,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+        return query_states, key_states, value_states, input_shape
+    pass
+    fused_torch_compile_options = get_torch_compile_options(
+        epilogue_fusion = True,
+        max_autotune = False, # Too slow
+        shape_padding = True,
+        cudagraphs = True,
+        coordinate_descent_tuning = False,
+        combo_kernels = False,
+        memory_planning = True,
+        multi_kernel = False, # Fails on torch 2.10 nightly
+        use_block_ptr = True,
+        logging = UNSLOTH_ENABLE_LOGGING,
+    )
+    @_torch_compile(dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+    def post_forward(
+        self,
+        residual: torch.Tensor,
+        attn_output: torch.Tensor,
+        logsumexp: torch.Tensor,
+        input_shape,
+    ):
+        hidden_states = post_attention_decoding(self.self_attn, attn_output, logsumexp, input_shape)
+        hidden_states += residual
+
+        # Fully Connected
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
+        return hidden_states, residual
+    pass
+
+    def inference_forward(
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        use_cache,
+        cache_position,
+        position_embeddings,
+        **kwargs,
+    ):
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(self.input_layernorm, hidden_states)
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states += residual.to(hidden_states.device)
+
+        # Fully Connected
+        residual = hidden_states.clone()
+        hidden_states = rms_layernorm_forward(self.post_attention_layernorm, hidden_states)
+        return hidden_states, residual
+    pass
+    # if has_static_cache and Version(torch.__version__) >= Version("2.10.0"):
+    #     # torch 2.9.0 has excessive compilations
+    #     inference_forward = _torch_compile(inference_forward, dynamic = None, fullgraph = True, options = fused_torch_compile_options)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: KWARGS_TYPE,
+    ) -> MoeModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if inputs_embeds is None:
+            # Account for CPU offloaded embed_tokens
+            embed_device = self.embed_tokens.weight.device
+            inputs_embeds = self.embed_tokens(input_ids.to(embed_device, non_blocking = True)).to(input_ids.device)
+        if not self.training:
+            inputs_embeds.requires_grad_(False)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
         try:
-            os.makedirs(UNSLOTH_COMPILE_LOCATION)
+            torch._dynamo.mark_static (hidden_states, 0)
+            torch._dynamo.mark_dynamic(hidden_states, 1)
+            torch._dynamo.mark_static (hidden_states, 2)
         except:
             pass
 
-    current_file = os.path.abspath(source_path)
-    if destination_filename is None:
-        destination_filename = os.path.basename(current_file)
+        # It may already have been prepared by e.g. `generate`
+        if not self.training and not isinstance(attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+            }
+            attention_mask = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+            }
 
-    destination = os.path.abspath(os.path.join(UNSLOTH_COMPILE_LOCATION, destination_filename))
-
-    # If source and dest are different, copy.
-    if current_file != destination:
-        try:
-            shutil.copy(current_file, destination)
-        except Exception:
-            pass
-
-
-install_to_cache(__file__, "moe_utils.py")
-
-# ============================================================================
-# Grouped MM wrapper
-# ============================================================================
-# Simple wrapper around torch._grouped_mm that ensures contiguous inputs.
-# Native backward works correctly - no custom autograd needed.
-# ============================================================================
-
-
-def _grouped_mm_with_backward_fix(
-    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    """
-    Grouped matmul with working backward pass.
-
-    Uses native torch._grouped_mm with contiguous inputs for correct gradients.
-    """
-    return torch._grouped_mm(inputs, weight, offs=offsets)
-
-
-# Global flag to check if grouped GEMM is available
-_GROUPED_GEMM_AVAILABLE = None
-_TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
-
-# Check if GPU supports torch._grouped_mm (verified via runtime check)
-_TORCH_GROUPED_MM_SUPPORTED = None
-
-
-def _check_torch_grouped_mm_supported():
-    """
-    Check if torch._grouped_mm is actually supported on the current GPU.
-    We check for existence and verify with a dummy call.
-    A runtime probe is the only reliable check.
-    """
-    global _TORCH_GROUPED_MM_SUPPORTED
-    if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
-
-    if not _TORCH_GROUPED_MM_AVAILABLE:
-        _TORCH_GROUPED_MM_SUPPORTED = False
-        return False
-
-    if not torch.cuda.is_available():
-        _TORCH_GROUPED_MM_SUPPORTED = False
-        return False
-
-    try:
-        # Attempt a dummy grouped_mm call to verify support.
-        # This handles cases where the symbol exists but hardware is unsupported (e.g. < H100).
-        # It also allows support on newer hardware or backports without code changes.
-        device = torch.cuda.current_device()
-        dtype = torch.float16
-
-        # Minimal dummy data: 1 expert, 1 token, dim 8 (safe alignment)
-        x = torch.ones((1, 8), device=device, dtype=dtype)
-        w = torch.ones((1, 8, 8), device=device, dtype=dtype)
-        offs = torch.tensor([1], device=device, dtype=torch.int32)
-
-        torch._grouped_mm(x, w, offs=offs)
-        del x, w, offs
-        _TORCH_GROUPED_MM_SUPPORTED = True
-    except Exception:
-        _TORCH_GROUPED_MM_SUPPORTED = False
-
-    return _TORCH_GROUPED_MM_SUPPORTED
-
-
-_TRITON_ALLOCATOR_INITIALIZED = False
-_PERSISTENT_BUFFER = None
-
-
-def _init_triton_allocator():
-    """
-    Initialize a persistent Triton allocator to avoid memory allocation overhead per call.
-    This significantly reduces GPU utilization fluctuation.
-    """
-    global _TRITON_ALLOCATOR_INITIALIZED, _PERSISTENT_BUFFER
-    if _TRITON_ALLOCATOR_INITIALIZED: return
-
-    try:
-        import triton
-
-        # Create a persistent buffer that grows as needed
-        # This avoids allocating new memory on every kernel call
-
-        def persistent_alloc_fn(size: int, alignment: int, stream):
-            global _PERSISTENT_BUFFER
-            # Round up size to avoid frequent reallocations
-            # Round to nearest 128 bytes for alignment
-            rounded_size = ((size + 128 - 1) // 128) * 128
-
-            if (
-                _PERSISTENT_BUFFER is None
-                or _PERSISTENT_BUFFER.numel() * _PERSISTENT_BUFFER.element_size()
-                < rounded_size
-            ):
-                # Allocate with small headroom (10%) to reduce reallocations
-                # Use ByteTensor (uint8) for raw byte storage
-                _PERSISTENT_BUFFER = torch.empty(
-                    int(rounded_size * 1.1), device="cuda", dtype=torch.uint8
+        # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
+        bsz, qlen, hd = hidden_states.shape
+        if not self.training and qlen == 1 and isinstance(attention_mask, dict):
+            # Add hack since residuals need to clone outside of the torch.compile region??
+            # This forces it to free past residuals
+            torch.compiler.cudagraph_mark_step_begin()
+            for decoder_layer in self.layers:
+                hidden_states, residual = inference_forward(
+                    decoder_layer,
+                    hidden_states,
+                    attention_mask[decoder_layer.attention_type],
+                    position_ids,
+                    past_key_values,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
+                    **kwargs,
                 )
-                _PERSISTENT_BUFFER.__hibernate__ = {"type": "ignore"}
-            return _PERSISTENT_BUFFER
-
-        triton.set_allocator(persistent_alloc_fn)
-        triton._unsloth_allocator_set = True
-        _TRITON_ALLOCATOR_INITIALIZED = True
-    except Exception:
-        pass
-
-
-def _check_grouped_gemm_available():
-    """Check if Unsloth grouped GEMM kernels are available."""
-    if os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1": return False
-
-    global _GROUPED_GEMM_AVAILABLE
-    if _GROUPED_GEMM_AVAILABLE is not None: return _GROUPED_GEMM_AVAILABLE
-
-    try:
-        from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
-        _GROUPED_GEMM_AVAILABLE = True
-        _init_triton_allocator()
-    except (ImportError, ModuleNotFoundError):
-        _GROUPED_GEMM_AVAILABLE = False
-    return _GROUPED_GEMM_AVAILABLE
-
-
-from functools import lru_cache
-
-
-@lru_cache(maxsize=1)
-def select_moe_backend():
-    """
-    Selects the MoE backend based on UNSLOTH_MOE_BACKEND environment variable and availability.
-    Choices: "grouped_mm", "unsloth_triton", "native_torch".
-    Default if unspecified: "grouped_mm".
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    requested = os.environ.get("UNSLOTH_MOE_BACKEND")
-    if requested:
-        if requested == "grouped_mm" and _check_torch_grouped_mm_supported():
-            return "grouped_mm"
-        if requested == "unsloth_triton" and _check_grouped_gemm_available():
-            return "unsloth_triton"
-        if requested == "native_torch":
-            return "native_torch"
-        print(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
-
-    if _check_torch_grouped_mm_supported():
-        print("Unsloth: Using MoE backend 'grouped_mm'")
-        return "grouped_mm"
-    if _check_grouped_gemm_available():
-        print("Unsloth: Using MoE backend 'unsloth_triton'")
-        return "unsloth_triton"
-    return "native_torch"
-
-
-def forward_moe_backend(
-    self,
-    hidden_states: torch.Tensor,
-    top_k_index: torch.Tensor,
-    top_k_weights: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Dispatch MoE forward to the selected backend.
-    Centralizes backend selection to keep model-specific patches minimal.
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    backend = select_moe_backend()
-    if backend == "grouped_mm":
-        return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
-    if backend == "unsloth_triton":
-        return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
-    return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
-
-
-@torch.no_grad()
-def _get_routing_indices(selected_experts, num_experts):
-    """
-    Compute token→expert mapping for grouped GEMM.
-    Uses bincount instead of histc to avoid float conversion overhead.
-
-    Returns:
-        token_counts_by_expert: (num_experts,) token counts per expert
-        gather_indices: (total_tokens,) indices for gathering tokens in expert order
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    flat_experts = selected_experts.view(-1)
-
-    # bincount is faster than histc since it doesn't require float conversion
-    token_counts_by_expert = torch.bincount(flat_experts, minlength=num_experts).to(torch.int32)
-
-    # argsort with stable=True preserves order within each expert
-    gather_indices = flat_experts.argsort(stable=True)
-
-    return token_counts_by_expert, gather_indices
-
-
-def _silu_and_mul(x):
-    """Fused SiLU activation and element-wise multiply for gate/up projections."""
-    gate, up = x.chunk(2, dim=-1)
-    return F.silu(gate) * up
-
-
-# ============================================================================
-# Separated LoRA Helper Functions
-# ============================================================================
-
-
-def _has_lora_adapters(param) -> bool:
-    """Check if parameter has active LoRA adapters (PEFT ParamWrapper)."""
-    # Check if this is a PEFT LoRA wrapper
-    if not hasattr(param, "lora_A") or not hasattr(param, "lora_B"):
-        return False
-    if hasattr(param, "disable_adapters") and param.disable_adapters:
-        return False
-    if hasattr(param, "merged") and param.merged:
-        return False
-    return len(param.lora_A) > 0
-
-
-def _extract_lora_from_wrapper(
-    wrapper, adapter_name: str = "default", experts_module=None
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, float, int]]:
-    """
-    Extract LoRA weights from PEFT ParamWrapper for MoE separated computation.
-
-    PEFT ParamWrapper for 3D parameters creates:
-    - lora_A: nn.Linear(in_dim, E*R) -> weight: (E*R, in_dim)
-    - lora_B: nn.Linear(E*R, out_dim) -> weight: (out_dim, E*R)
-
-    For grouped_mm: X @ first_weight @ second_weight
-
-    STANDARD FORMAT (Qwen3-MoE): weights stored as (E, out_dim, in_dim) for F.linear
-      gate_up_proj: (E, 2*I, H) - input X is (N, H), output is (N, 2*I)
-      down_proj:    (E, H, I)   - input X is (N, I), output is (N, H)
-
-      For gate_up with (E, 2*I, H):
-        lora_A: (E*R, H), lora_B: (2*I, E*R)
-        Input X (N, H) needs: X @ (E, H, R) @ (E, R, 2*I) -> (N, 2*I)
-        first_weight from lora_A: (E*R, H) -> (E, H, R) after view/permute
-        second_weight from lora_B: (2*I, E*R) -> (E, R, 2*I) after view/permute
-
-    TRANSPOSED FORMAT (Qwen3-VL-MoE): weights stored as (E, in_dim, out_dim) for grouped_mm
-      gate_up_proj: (E, H, 2*I) - input X is (N, H), output is (N, 2*I)
-      down_proj:    (E, I, H)   - input X is (N, I), output is (N, H)
-
-      For gate_up with (E, H, 2*I):
-        lora_A: (E*R, H), lora_B: (2*I, E*R)
-        Input X (N, H) needs: X @ (E, H, R) @ (E, R, 2*I) -> (N, 2*I)
-        first_weight from lora_A: (E*R, H) -> (E, H, R)
-        second_weight from lora_B: (2*I, E*R) -> (E, R, 2*I)
-
-    Returns:
-        (first_weight, second_weight, scaling, num_experts) or None
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    try:
-        if not hasattr(wrapper, "lora_A") or not hasattr(wrapper, "lora_B"):
-            return None
-
-        if hasattr(wrapper, "disable_adapters") and wrapper.disable_adapters:
-            return None
-        if hasattr(wrapper, "merged") and wrapper.merged:
-            return None
-
-        if not wrapper.lora_A:
-            return None
-
-        if adapter_name not in wrapper.lora_A:
-            adapter_name = list(wrapper.lora_A.keys())[0]
-
-        lora_A_module = wrapper.lora_A[adapter_name]
-        lora_B_module = wrapper.lora_B[adapter_name]
-
-        weight_A = lora_A_module.weight  # (E*R, dim1)
-        weight_B = lora_B_module.weight  # (dim2, E*R)
-        scaling = wrapper.scaling[adapter_name]
-        num_experts = getattr(wrapper, "num_experts", 1)
-
-        # GET EXPERTS MODULE TO CHECK FOR REGISTERED EXTRACTOR
-        if experts_module is None:
-            experts_module = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
-
-        # Check for model-specific LoRA extractor attached to the experts module
-        extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
-
-        if extractor_fn is not None:
-            return extractor_fn(wrapper, weight_A, weight_B, scaling, num_experts)
-
-        # DEFAULT BEHAVIOR (Standard Format / Non-MoE)
-        if num_experts > 1:
-            total_rank = weight_A.shape[0]
-            rank_per_expert = total_rank // num_experts
-            dim1 = weight_A.shape[1]
-            dim2 = weight_B.shape[0]
-
-            # STANDARD FORMAT (Qwen3-MoE / GLM4):
-            # Base weights are (E, out_dim, in_dim) for F.linear.
-            # LoRA weights follow PEFT: weight_A is (E*R, in_dim), weight_B is (out_dim, E*R).
-            # We need X @ (E, in_dim, R) @ (E, R, out_dim).
-
-            # first_weight: (E, in_dim, R) - from lora_A
-            # second_weight: (E, R, out_dim) - from lora_B
-            first_weight = weight_A.view(num_experts, rank_per_expert, dim1)
-            first_weight = first_weight.permute(0, 2, 1).contiguous()  # (E, dim1, R)
-
-            # second_weight (B): (E, R, out_dim)
-            second_weight = weight_B.view(dim2, num_experts, rank_per_expert)
-            second_weight = second_weight.permute(1, 2, 0).contiguous()  # (E, R, dim2)
-        else:
-            # Non-MoE case: return weights for X @ A.T @ B.T
-            first_weight = weight_A.T  # (dim1, R)
-            second_weight = weight_B.T  # (R, dim2)
-
-        return first_weight, second_weight, scaling, num_experts
-    except Exception:
-        return None
-
-
-def _extract_lora_weights(
-    param, adapter_name: str = "default", num_experts: int = None, experts_module=None
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
-    """
-    Extract LoRA A and B weights from PEFT ParamWrapper.
-
-    This is a compatibility wrapper around _extract_lora_from_wrapper.
-    Use _extract_lora_from_wrapper directly for new code.
-
-    Returns:
-        (first_weight, second_weight, scaling) for (X @ first) @ second
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    # Set num_experts on param if provided, so _extract_lora_from_wrapper can use it
-    if num_experts is not None and not hasattr(param, "num_experts"):
-        param.num_experts = num_experts
-
-    result = _extract_lora_from_wrapper(param, adapter_name, experts_module=experts_module)
-    if result is None:
-        return None
-    # Return first 3 elements (first_weight, second_weight, scaling) without num_experts
-    return result[0], result[1], result[2]
-
-
-def _get_base_weight(param):
-    """Get base weight from potentially wrapped parameter or module."""
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    # Recursively unwrap PEFT layers
-    while hasattr(param, "base_layer"):
-        param = param.base_layer
-
-    if hasattr(param, "get_param"):
-        return param.get_param()
-
-    # Handle Modules (Linear, etc.)
-    if hasattr(param, "weight"):
-        return param.weight
-
-    return param
-
-
-def _get_lora_wrapper_for_param(experts_module, param_name):
-    """
-    Get the PEFT ParamWrapper for a specific parameter (gate_up_proj or down_proj).
-    Uses the explicit key stored in __dict__ if available.
-    Does NOT lazily setup wrappers as that requires traversing logic not present here.
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    if hasattr(experts_module, f"{param_name}_lora_wrapper"):
-        return getattr(experts_module, f"{param_name}_lora_wrapper")
-
-    # Check simple attributes if it's directly wrapped
-    if hasattr(experts_module, param_name):
-        attr = getattr(experts_module, param_name)
-        if hasattr(attr, "lora_A"):  # Is a ParamWrapper
-            return attr
-
-    return None
-
-
-def native_moe_grouped_mm(
-    inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    """
-    Native implementation using grouped_mm with backward fix.
-
-    Uses custom autograd function to avoid PyTorch's grouped_mm backward stride bug.
-    """
-    return _grouped_mm_with_backward_fix(inputs, weight, offsets)
-
-
-def _apply_lora_grouped_mm(
-    inputs: torch.Tensor,
-    lora_B: torch.Tensor,
-    lora_A: torch.Tensor,
-    offsets: torch.Tensor,
-    scaling: float,
-    grouped_mm_func=native_moe_grouped_mm,
-) -> torch.Tensor:
-    """
-    Apply LoRA using grouped GEMM: result = ((X @ B) @ A) * scaling
-
-    Args:
-        inputs: (total_tokens, in_dim)
-        lora_B: (num_experts, in_dim, rank) - First projection
-        lora_A: (num_experts, rank, out_dim) - Second projection
-        offsets: Grouped GEMM offsets
-        scaling: LoRA scaling factor
-        grouped_mm_func: Function to use for grouped GEMM (default: native_moe_grouped_mm)
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    # 1. First Matmul (X @ B)
-    # lora_B is (E, in_dim, R)
-    # Native needs (E, in_dim, R) -> No Transpose
-    lora_intermediate = grouped_mm_func(inputs, lora_B.contiguous(), offsets)
-
-    # 2. Second Matmul (result @ A)
-    # lora_A is (E, R, out_dim)
-    # Native needs (E, R, out_dim) -> No Transpose
-    lora_delta = grouped_mm_func(lora_intermediate, lora_A.contiguous(), offsets)
-
-    return lora_delta * scaling
-
-
-def _should_use_separated_lora() -> bool:
-    """
-    Check if separated LoRA approach should be used (default: True).
-    Set UNSLOTH_MOE_LORA_MERGED=1 to use merged approach instead.
-    """
-    return os.environ.get("UNSLOTH_MOE_LORA_MERGED", "0") != "1"
-
-
-# ============================================================================
-# Model-specific Weight Preprocessing Hooks
-# ============================================================================
-# Each model can register its own preprocessing function for weight transposition.
-# This allows the generic backend to work with different model weight layouts.
-
-_WEIGHT_PREPROCESSORS = {}
-
-
-def register_weight_preprocessor(model_type: str, preprocessor_fn):
-    """
-    Register a weight preprocessor for a specific model type.
-
-    Args:
-        model_type: Model identifier (e.g., "qwen3_moe", "qwen3_vl_moe")
-        preprocessor_fn: Function(weight, proj_type, hidden_dim) -> processed_weight
-                        proj_type is "gate_up" or "down"
-    """
-    _WEIGHT_PREPROCESSORS[model_type] = preprocessor_fn
-
-
-def get_weight_preprocessor(model_type: str):
-    """Get registered weight preprocessor for model type."""
-    return _WEIGHT_PREPROCESSORS.get(model_type)
-
-
-def preprocess_weight(
-    weight: torch.Tensor, proj_type: str, hidden_dim: int, model_type=None
-):
-    """
-    Preprocess weight tensor for grouped_mm compatibility.
-
-    Uses model-specific preprocessor if registered, otherwise uses default logic.
-
-    Args:
-        weight: Weight tensor (E, dim1, dim2) or similar
-        proj_type: "gate_up" or "down"
-        hidden_dim: Hidden dimension for shape inference
-        model_type: Optional model type to use specific preprocessor
-
-    Returns:
-        Weight tensor in (E, in_dim, out_dim) format for grouped_mm
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    if model_type and model_type in _WEIGHT_PREPROCESSORS:
-        return _WEIGHT_PREPROCESSORS[model_type](weight, proj_type, hidden_dim)
-
-    # Default preprocessing: check if transposition is needed
-    if proj_type == "gate_up":
-        # For gate_up, we need (E, hidden_dim, 2*intermediate)
-        if weight.shape[1] == hidden_dim:
-            return weight
-        else:
-            return weight.transpose(-2, -1)
-    else:  # down
-        # For down, we need (E, intermediate, hidden_dim)
-        if weight.shape[2] == hidden_dim:
-            return weight
-        else:
-            return weight.transpose(-2, -1)
-
-
-# ============================================================================
-# Generic MoE Detection and ParamWrapper Patching
-# ============================================================================
-
-
-def _is_moe_experts_module(module) -> bool:
-    """
-    Check if module is an MoE experts layer (generic, not model-specific).
-
-    Detects modules with stacked expert weights as 3D nn.Parameter:
-    - gate_up_proj/down_proj pattern (Qwen3-MoE, Qwen3-VL-MoE, etc.)
-    - w1/w2/w3 pattern (older MoE models)
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    import torch.nn as nn
-
-    # Check for gate_up_proj pattern
-    if hasattr(module, "gate_up_proj"):
-        param = module.gate_up_proj
-        if isinstance(param, nn.Parameter) and param.ndim == 3:
-            return True
-
-    # Check for w1/w2 pattern (separate gate/up projections)
-    if hasattr(module, "w1") and hasattr(module, "w2"):
-        w1 = module.w1
-        if isinstance(w1, nn.Parameter) and w1.ndim == 3:
-            return True
-
-    return False
-
-
-# Aliases for compatibility with gpt_oss.py
-_get_moe_lora_weights = _extract_lora_from_wrapper
-
-
-# Store original ParamWrapper.forward for fallback
-_original_param_wrapper_forward = None
-
-
-def _patched_param_wrapper_forward(
-    self, x: torch.Tensor, *args, **kwargs
-) -> torch.Tensor:
-    """
-    Patched ParamWrapper.forward for MoE separated LoRA.
-
-    For MoE expert modules:
-    - Bypasses PEFTs _activate_lora parametrization context
-    - Stores LoRA data by parameter_name for forward_native_grouped_mm to use
-
-    For non-MoE modules:
-    - Falls back to original PEFT forward
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    # CRITICAL: Use self.base_layer for forward call (immediate parent)
-    # NOT self.get_base_layer() which recursively traverses to deepest layer!
-    # The wrapper chain must be preserved: down_proj -> gate_up_proj -> Qwen3MoeExperts
-    immediate_base_layer = self.base_layer
-
-    # For storing LoRA data, we DO need the actual experts module
-    # Use get_base_layer() to find it (recursive traversal is correct here)
-    experts_module = self.get_base_layer()
-
-    use_separated = _should_use_separated_lora()
-    param_name = getattr(self, "parameter_name", None)
-
-    # Check if this is an MoE experts module that should use separated LoRA
-    if (
-        use_separated
-        and param_name in ("gate_up_proj", "down_proj")
-        and _is_moe_experts_module(experts_module)
-    ):
-        # MoE experts: bypass PEFT's _activate_lora, use separated computation
-
-        # Check adapter state
-        if self.disable_adapters:
-            if self.merged:
-                self.unmerge()
-            return immediate_base_layer(x, *args, **kwargs)
-
-        if self.merged:
-            return immediate_base_layer(x, *args, **kwargs)
-
-        # Ensure wrapper.num_experts is set for LoRA weight reshaping
-        if not hasattr(self, "num_experts"):
-            if hasattr(experts_module, "num_experts"):
-                self.num_experts = experts_module.num_experts
-            elif hasattr(experts_module, param_name):
-                p = getattr(experts_module, param_name)
-                if hasattr(p, "shape") and len(p.shape) >= 1:
-                    self.num_experts = p.shape[0]
-
-        # Extract LoRA for this specific parameter
-        lora_data = _extract_lora_from_wrapper(self)
-
-        if lora_data is not None and param_name:
-            # Store LoRA data on the EXPERTS MODULE (not base_layer)
-            # e.g., _unsloth_lora_gate_up_proj or _unsloth_lora_down_proj
-            lora_attr = f"_unsloth_lora_{param_name}"
-            setattr(experts_module, lora_attr, lora_data)
-
-        try:
-            # Call IMMEDIATE base_layer to preserve wrapper chain
-            # (down_proj wrapper calls gate_up_proj wrapper calls Qwen3MoeExperts)
-            result = immediate_base_layer(x, *args, **kwargs)
-        finally:
-            # Clean up
-            if param_name:
-                lora_attr = f"_unsloth_lora_{param_name}"
-                if hasattr(experts_module, lora_attr):
-                    delattr(experts_module, lora_attr)
-
-        return result
-
-    # Non-MoE: use original PEFT forward with _activate_lora
-    return _original_param_wrapper_forward(self, x, *args, **kwargs)
-
-
-def patch_param_wrapper_for_moe():
-    """
-    Patch PEFT's ParamWrapper.forward to use separated LoRA for MoE.
-
-    This should be called after PEFT is imported.
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    global _original_param_wrapper_forward
-
-    try:
-        from peft.tuners.lora.layer import ParamWrapper
-
-        # Store original forward
-        if _original_param_wrapper_forward is None:
-            _original_param_wrapper_forward = ParamWrapper.forward
-
-        # Patch with our version
-        ParamWrapper.forward = _patched_param_wrapper_forward
-
-        return True
-    except ImportError:
-        return False
-
-
-def forward_native_grouped_mm(
-    self,
-    hidden_states: torch.Tensor,
-    top_k_index: torch.Tensor,
-    top_k_weights: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Native Pytorch grouped GEMM MoE forward pass.
-    Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
-    Requires torch._grouped_mm support (verified via runtime check).
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    # Runtime safety check - defense in depth
-    if not _check_torch_grouped_mm_supported():
-        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-        raise RuntimeError(
-            f"torch._grouped_mm is not supported on this device (Compute Capability {major}.{minor}). "
-            f"Set UNSLOTH_MOE_BACKEND='unsloth_triton' or 'native_torch' to use a compatible backend."
-        )
-
-    is_2d_input = hidden_states.dim() == 2
-    if is_2d_input:
-        sequence_length, hidden_dim = hidden_states.shape
-        batch_size = 1
-    else:
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-
-    hidden_states = hidden_states.view(-1, hidden_dim)
-
-    # 1. Calculate routing
-    flat_top_k = top_k_index.view(-1)
-    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
-
-    # 2. Sort indices to group tokens by expert
-    sorted_indices = torch.argsort(flat_top_k, stable=True)
-    token_indices = sorted_indices // top_k_index.shape[-1]
-
-    # 3. Permute Input
-    # We need to gather inputs. Since we may have expanded top_k, we use token_indices to map back to original input
-    permuted_input = hidden_states[token_indices]
-
-    # 4. Prepare Grouped MM arguments
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-
-    # ========================================================================
-    # Gate + Up projection with optional separated LoRA (DEFAULT)
-    # ========================================================================
-    use_separated_lora = _should_use_separated_lora()
-    gate_up_lora = None
-
-    # Check for injected LoRA data from patched ParamWrapper (preferred path)
-    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
-        gate_up_lora = self._unsloth_lora_gate_up_proj[
-            :3
-        ]  # (first_weight, second_weight, scaling)
-    # Fallback: check parameter directly (for older wrapping patterns)
-    elif (
-        use_separated_lora
-        and hasattr(self, "gate_up_proj")
-        and _has_lora_adapters(self.gate_up_proj)
-    ):
-        gate_up_lora = _extract_lora_weights(
-            self.gate_up_proj, num_experts=self.num_experts, experts_module=self
-        )
-
-    if hasattr(self, "gate_up_proj"):
-        # Get base weights (raw, without LoRA)
-        gate_up_base = _get_base_weight(self.gate_up_proj)
-
-        # Get model type for preprocessing (if registered)
-        model_type = getattr(self, "_unsloth_model_type", None)
-
-        # Handle different weight shapes using preprocessor
-        # torch._grouped_mm backward requires weights to be contiguous; preprocessing may return a transposed view.
-        w1 = preprocess_weight(gate_up_base, "gate_up", hidden_dim, model_type)
-        # Base forward: X @ W
-        mm1_out = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
-
-        # Add separated LoRA contribution: + ((X @ first) @ second) * scaling
-        # _extract_lora_from_wrapper returns (first_weight, second_weight, scaling)
-        if gate_up_lora is not None:
-            first_weight, second_weight, scaling = gate_up_lora
-
-            # Cast to input dtype (LoRA weights are float32, input may be bfloat16)
-            # Ensure contiguous for grouped_mm alignment requirements
-            first_weight = first_weight.to(permuted_input.dtype).contiguous()
-            second_weight = second_weight.to(permuted_input.dtype).contiguous()
-
-            # Step 1: permuted_input @ first_weight
-            try:
-                lora_out = _grouped_mm_with_backward_fix(permuted_input, first_weight, offsets)
-                lora_out = lora_out.contiguous()
-            except RuntimeError as e:
-                raise e
-
-            # Step 2: result @ second_weight
-            # Handle unaligned O dimension or other grouped_mm failures
-            try:
-                if second_weight.shape[-1] % 8 != 0:
-                    pad_size = 8 - (second_weight.shape[-1] % 8)
-                    second_weight_padded = F.pad(
-                        second_weight, (0, pad_size)
-                    ).contiguous()
-                    lora_delta = _grouped_mm_with_backward_fix(
-                        lora_out, second_weight_padded, offsets
-                    )
-                    lora_delta = lora_delta[:, :-pad_size]
+                if hasattr(decoder_layer.mlp.experts, "gate_up_projs"):
+                    hidden_states = moe_forward_inference(decoder_layer.mlp, hidden_states)
+                elif decoder_layer.mlp.experts.__class__.__name__ == "Mxfp4GptOssExperts":
+                    if mlp_forward is None:
+                        raise RuntimeError("Unsloth: MXFP4 forward is not found")
+                    hidden_states, _ = mlp_forward(decoder_layer.mlp, hidden_states)
                 else:
-                    lora_delta = _grouped_mm_with_backward_fix(
-                        lora_out, second_weight, offsets
-                    )
-            except RuntimeError:
-                # Fallback to manual loop if grouped_mm fails (e.g. stride alignment)
-                lora_delta = torch.empty(
-                    (lora_out.shape[0], second_weight.shape[-1]),
-                    dtype=lora_out.dtype,
-                    device=lora_out.device,
+                    hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
+                hidden_states += residual
+            pass
+            hidden_states = rms_layernorm_forward(self.norm, hidden_states)
+        else:
+            for decoder_layer in self.layers:
+                mask = attention_mask[decoder_layer.attention_type] if isinstance(attention_mask, dict) else attention_mask
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    attention_mask=mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
                 )
-                cpu_offsets = offsets.cpu().tolist()
-                prev_offset = 0
-                for i, end in enumerate(cpu_offsets):
-                    if prev_offset < end:
-                        lora_delta[prev_offset:end] = torch.matmul(
-                            lora_out[prev_offset:end], second_weight[i]
-                        )
-                    prev_offset = end
+            pass
+            hidden_states = self.norm(hidden_states)
+        # Fix float16 / float32 mismatching
+        hidden_states = hidden_states.to(inputs_embeds.dtype)
+        return process_return(MoeModelOutputWithPast, {
+            "last_hidden_state" : hidden_states,
+            "past_key_values" : past_key_values,
+        })
+    patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
+pass
+TEMPORARY_PATCHES.append(patch_GptOssModel)
 
-            # Add scaled LoRA contribution
-            mm1_out = mm1_out + lora_delta * scaling
-
-        if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
-            num_repeats = num_tokens_per_expert.to(self.gate_up_proj_bias.device)
-            bias_expanded = self.gate_up_proj_bias.repeat_interleave(num_repeats, dim=0)
-            mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
-
-        if "GptOssExperts" in self.__class__.__name__:
-            gate = mm1_out[..., ::2]
-            up = mm1_out[..., 1::2]
-        else:
-            gate, up = mm1_out.chunk(2, dim=-1)
-
-    elif hasattr(self, "w1") and hasattr(self, "w3"):
-        # Separate w1/w3 weights (older models)
-        w1_base = _get_base_weight(self.w1)
-        w3_base = _get_base_weight(self.w3)
-
-        w1 = w1_base.transpose(-2, -1)
-        w3 = w3_base.transpose(-2, -1)
-
-        gate = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
-        up = _grouped_mm_with_backward_fix(permuted_input, w3, offsets)
-
-        # Add LoRA for w1 and w3 separately if present
-        if use_separated_lora:
-            if _has_lora_adapters(self.w1):
-                w1_lora = _extract_lora_weights(self.w1, experts_module=self)
-                if w1_lora is not None:
-                    lora_A, lora_B, scaling = w1_lora
-                    lora_A_t = lora_A.transpose(-2, -1)
-                    lora_A_out = _grouped_mm_with_backward_fix(
-                        permuted_input, lora_A_t, offsets
-                    )
-                    lora_B_t = lora_B.transpose(-2, -1)
-                    lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
-                    gate = gate + lora_B_out * scaling
-
-            if _has_lora_adapters(self.w3):
-                w3_lora = _extract_lora_weights(self.w3, experts_module=self)
-                if w3_lora is not None:
-                    lora_A, lora_B, scaling = w3_lora
-                    lora_A_t = lora_A.transpose(-2, -1)
-                    lora_A_out = _grouped_mm_with_backward_fix(
-                        permuted_input, lora_A_t, offsets
-                    )
-                    lora_B_t = lora_B.transpose(-2, -1)
-                    lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
-                    up = up + lora_B_out * scaling
-    else:
-        raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
-
-    # Activation
-    if "GptOssExperts" in self.__class__.__name__:
-        # Custom activation from GptOss
-        limit = getattr(self, "limit", 7.0)
-        alpha = getattr(self, "alpha", 1.702)
-
-        gate = gate.clamp(min=None, max=limit)
-        up = up.clamp(min=-limit, max=limit)
-        glu = gate * torch.sigmoid(gate * alpha)
-        inter = (up + 1.0) * glu
-    else:
-        inter = F.silu(gate) * up
-
-    # ========================================================================
-    # Down projection with optional separated LoRA (DEFAULT)
-    # ========================================================================
-    down_lora = None
-
-    # Check for injected LoRA data from patched ParamWrapper (preferred path)
-    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
-        down_lora = self._unsloth_lora_down_proj[
-            :3
-        ]  # (first_weight, second_weight, scaling)
-    # Fallback: check parameter directly (for older wrapping patterns)
-    elif (
-        use_separated_lora
-        and hasattr(self, "down_proj")
-        and _has_lora_adapters(self.down_proj)
-    ):
-        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts, experts_module=self)
-
-    if hasattr(self, "down_proj"):
-        # Get base weights
-        down_base = _get_base_weight(self.down_proj)
-
-        # Get model type for preprocessing (if registered)
-        model_type = getattr(self, "_unsloth_model_type", None)
-
-        # Handle different weight shapes using preprocessor
-        w2 = preprocess_weight(down_base, "down", hidden_dim, model_type)
-
-        # Base forward
-        mm2_out = _grouped_mm_with_backward_fix(inter, w2, offsets)
-
-        # Add separated LoRA contribution if present
-        # _extract_lora_from_wrapper returns (first_weight, second_weight, scaling)
-        if down_lora is not None:
-            first_weight, second_weight, scaling = down_lora
-
-            # Cast to input dtype (LoRA weights are float32, input may be bfloat16)
-            first_weight = first_weight.to(inter.dtype).contiguous()
-            second_weight = second_weight.to(inter.dtype).contiguous()
-
-            # Step 1: inter @ first_weight
-            lora_out = _grouped_mm_with_backward_fix(inter, first_weight, offsets)
-            lora_out = lora_out.contiguous()
-
-            # Step 2: result @ second_weight
-            try:
-                lora_delta = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
-            except RuntimeError:
-                # Fallback to manual loop
-                lora_delta = torch.empty(
-                    (lora_out.shape[0], second_weight.shape[-1]),
-                    dtype=lora_out.dtype,
-                    device=lora_out.device,
-                )
-                cpu_offsets = offsets.cpu().tolist()
-                prev_offset = 0
-                for i, end in enumerate(cpu_offsets):
-                    if prev_offset < end:
-                        lora_delta[prev_offset:end] = torch.matmul(
-                            lora_out[prev_offset:end], second_weight[i]
-                        )
-                    prev_offset = end
-
-            # Add scaled LoRA contribution
-            mm2_out = mm2_out + lora_delta * scaling
-
-        if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
-            bias_expanded = self.down_proj_bias.repeat_interleave(
-                num_tokens_per_expert.to(self.down_proj_bias.device), dim=0
-            ).to(mm2_out.device)
-            mm2_out = mm2_out + bias_expanded.to(mm2_out.dtype)
-
-    elif hasattr(self, "w2"):
-        w2_base = _get_base_weight(self.w2)
-        w2 = w2_base.transpose(-2, -1)
-
-        # Base forward
-        mm2_out = _grouped_mm_with_backward_fix(inter, w2, offsets)
-
-        # Add LoRA if present
-        if use_separated_lora and _has_lora_adapters(self.w2):
-            w2_lora = _extract_lora_weights(self.w2, experts_module=self)
-            if w2_lora is not None:
-                lora_A, lora_B, scaling = w2_lora
-                lora_A_t = lora_A.transpose(-2, -1).contiguous()
-                lora_A_out = _grouped_mm_with_backward_fix(inter, lora_A_t, offsets)
-                lora_B_t = lora_B.transpose(-2, -1).contiguous()
-                lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
-                mm2_out = mm2_out + lora_B_out * scaling
-    else:
-        raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
-
-    # 5. Apply Routing Weights and Scatter Add (Reduce)
-    flat_weights = top_k_weights.view(-1)
-    permuted_weights = flat_weights[sorted_indices]
-    mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
-
-    final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
+try:
+    from openai_harmony import (
+        Author,
+        Conversation,
+        DeveloperContent,
+        HarmonyEncodingName,
+        Message,
+        Role,
+        SystemContent,
+        ToolDescription,
+        load_harmony_encoding,
+        ReasoningEffort
     )
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+except:
+    pass
+def encode_conversations_with_harmony(
+    messages,
+    reasoning_effort = "medium",
+    add_generation_prompt = True,
+    tool_calls = None,
+    developer_instructions = None,
+    model_identity = "You are ChatGPT, a large language model trained by OpenAI.",
+):
+    try:
+        SystemContent
+    except:
+        raise ImportError("Please install openai_harmony via `pip install openai_harmony`")
 
-    final_hidden_states.index_add_(0, token_indices, mm2_out.to(hidden_states.dtype))
+    assert reasoning_effort in ("low", "medium", "high")
 
-    if is_2d_input:
-        return final_hidden_states
+    match reasoning_effort:
+        case "low":    harmony_reasoning = ReasoningEffort.LOW
+        case "medium": harmony_reasoning = ReasoningEffort.MEDIUM
+        case "high":   harmony_reasoning = ReasoningEffort.HIGH
 
-    return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+    convos = []
 
-
-def forward_triton_grouped_gemm(
-    self,
-    hidden_states: torch.Tensor,
-    top_k_index: torch.Tensor,
-    top_k_weights: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Grouped GEMM MoE forward pass using Triton kernels.
-    Compatible with torch.compile (recommended mode="max-autotune" with cudagraph_mark_step_begin).
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-
-    # Import grouped GEMM interface
-    from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
-
-    # Import autotune cache
-    from unsloth.kernels.moe.autotune_cache import get_or_autotune_moe_kernels
-
-    # Helper to check TMA support - assumes helper function or just check directly
-    # In original: it was a cached closure. Here we can use _supports_tma() directly
-
-    # nonlocal _MODEL_DIMS_AND_CONFIGS # We need a way to store this!
-    # For now, let's attach it to self if possible, or use a global usage
-    # Attaching to self is cleaner: self._unsloth_moe_configs
-
-    # Create expert mask and find which experts have tokens
-
-    if not hasattr(self, "_unsloth_moe_configs"):
-        self._unsloth_moe_configs = None
-
-    use_separated_lora = _should_use_separated_lora()
-
-
-    # Handle 3D inputs (batch_size, seq_len, hidden_dim)
-    is_3d = hidden_states.dim() == 3
-    if is_3d:
-        batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        num_tokens = batch_size * seq_len
-        # Also flatten top_k inputs if they are 3D
-        if top_k_index.dim() == 3:
-            top_k_index = top_k_index.view(-1, top_k_index.shape[-1])
-        if top_k_weights.dim() == 3:
-            top_k_weights = top_k_weights.view(-1, top_k_weights.shape[-1])
-    else:
-        num_tokens, hidden_dim = hidden_states.shape
-
-    top_k = top_k_index.shape[1]
-
-    # Cache model dimensions and kernel configs on first call
-    if self._unsloth_moe_configs is None:
-        intermediate_dim = self.gate_up_proj.shape[1] // 2
-
-        # Autotune first GEMM
-        gemm1_configs = get_or_autotune_moe_kernels(
-            num_experts=self.num_experts,
-            hidden_dim=hidden_dim,
-            intermediate_dim=intermediate_dim * 2,
-            top_k=top_k,
-            dtype=hidden_states.dtype,
-        )
-
-        # Autotune second GEMM
-        gemm2_configs = get_or_autotune_moe_kernels(
-            num_experts=self.num_experts,
-            hidden_dim=intermediate_dim,
-            intermediate_dim=hidden_dim,  # Output dim for 2nd GEMM is hidden_dim
-            top_k=top_k,
-            dtype=hidden_states.dtype,
-        )
-
-        self._unsloth_moe_configs = (intermediate_dim, gemm1_configs, gemm2_configs)
-
-        # Clear autotuning memory overhead
-        torch.cuda.empty_cache()
-
-    # Unpack cached configs
-    intermediate_dim, gemm1_configs, gemm2_configs = self._unsloth_moe_configs
-
-    # Unpack specific kernel configs
-    fwd_config_1, bwd_dX_config_1, bwd_dW_config_1 = gemm1_configs
-    fwd_config_2, bwd_dX_config_2, bwd_dW_config_2 = gemm2_configs
-
-    # Compute routing indices for grouped GEMM
-    token_counts_by_expert, gather_indices = _get_routing_indices(
-        top_k_index, self.num_experts
+    # Create system message
+    import datetime
+    today = datetime.datetime.today().strftime("%Y-%m-%d")
+    system = Message.from_role_and_content(Role.SYSTEM,
+        SystemContent.new()
+            .with_model_identity(model_identity)
+            .with_reasoning_effort(harmony_reasoning)
+            .with_conversation_start_date(today)
+            .with_knowledge_cutoff("2024-06")
+            .with_required_channels(["analysis", "commentary", "final"])
     )
-    offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
+    convos.append(system)
 
-    if self.gate_up_proj.shape[-1] == hidden_dim:
-        w1 = self.gate_up_proj
-    else:
-        w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
+    # Developer message and tool calling
+    dev = DeveloperContent.new()
+    if developer_instructions is not None: dev = dev.with_instructions(developer_instructions)
+    if tool_calls is not None:
+        new_tools = []
+        for function in tool_calls:
+            function = function["function"]
+            name = function["name"]
+            description = function["description"]
+            parameters = function["parameters"]
+            tool = ToolDescription.new(name, description, parameters)
+            new_tools.append(tool)
+        dev = dev.with_function_tools(new_tools)
+    pass
+    if developer_instructions is not None or tool_calls is not None:
+        dev = Message.from_role_and_content(Role.DEVELOPER, dev)
+        convos.append(dev)
 
-    # First grouped GEMM: gate_up projection
-    first_gemm_output = grouped_gemm(
-        X=hidden_states,
-        W=w1,
-        m_sizes=token_counts_by_expert,
-        topk=top_k,
-        gather_indices=gather_indices,
-        permute_x=True,
-        permute_y=False,
-        autotune=False,  # We use cached configs
-        kernel_config_fwd=fwd_config_1,
-        kernel_config_bwd_dX=bwd_dX_config_1,
-        kernel_config_bwd_dW=bwd_dW_config_1,
-        is_first_gemm=True,
-    )
-
-    # Apply SiLU activation and multiply gate with up
-    intermediate = _silu_and_mul(first_gemm_output)
-
-    # Grouped GEMM 2: down projection
-
-    # Grouped GEMM 2: down projection
-    # Prepare LoRA data
-    down_lora = None
-    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
-        down_lora = self._unsloth_lora_down_proj[:3]
-    elif (
-        use_separated_lora
-        and hasattr(self, "down_proj")
-        and _has_lora_adapters(self.down_proj)
-    ):
-        down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
-
-    if self.down_proj.shape[-1] == intermediate.shape[-1]:
-        w2 = self.down_proj
-    else:
-        w2 = self.down_proj.transpose(-2, -1).contiguous()
-
-    second_gemm_output = grouped_gemm(
-        X=intermediate,
-        W=w2,
-        m_sizes=token_counts_by_expert,
-        topk=top_k,
-        gather_indices=gather_indices,
-        permute_x=False,
-        permute_y=True,
-        autotune=False,  # We use cached configs
-        kernel_config_fwd=fwd_config_2,
-        kernel_config_bwd_dX=bwd_dX_config_2,
-        kernel_config_bwd_dW=bwd_dW_config_2,
-        is_first_gemm=False,
-    )
-
-    # Add separated LoRA contribution for Down
-    if down_lora is not None:
-        first_weight, second_weight, scaling = down_lora
-
-        # Intermediate is already permuted from step 1.
-        # Offsets are same.
-
-        first_weight = first_weight.to(intermediate.dtype)
-        second_weight = second_weight.to(intermediate.dtype)
-
-        lora_delta = _apply_lora_grouped_mm(
-            intermediate,
-            first_weight,
-            second_weight,
-            offsets,
-            scaling,
-            grouped_mm_func=native_moe_grouped_mm
-        )
-
-        second_gemm_output = second_gemm_output + lora_delta
-
-    # Apply routing weights and sum across top_k experts
-    # Output shape: (num_tokens, top_k, hidden_dim) -> (num_tokens, hidden_dim)
-    # Ensure top_k_weights matches dtype (can be float32 from softmax)
-    top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
-    final_hidden_states = (
-        second_gemm_output.view(num_tokens, top_k, hidden_dim)
-        * top_k_weights_casted[..., None]
-    )
-    final_hidden_states = final_hidden_states.sum(dim=1)
-
-    if is_3d:
-        final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
-
-    return final_hidden_states
-
-
-@torch.compiler.disable
-def forward_native_moe_loop(
-    self,
-    hidden_states: torch.Tensor,
-    top_k_index: torch.Tensor,
-    top_k_weights: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Loop-based MoE forward pass. Loops over experts that have tokens routed to them.
-    Explicitly disabled for torch.compile to prevent graph breaks/recompilation issues with dynamic control flow.
-    """
-    # This Unsloth Zoo code section is licensed under AGPL3
-    final_hidden_states = torch.zeros_like(hidden_states)
-
-    # Create expert mask and find which experts have tokens
-    with torch.no_grad():
-        expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-        expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-    # Only loop over experts that actually have tokens routed to them
-    for expert_idx_t in expert_hit:
-        expert_idx = expert_idx_t.item()
-
-        # Find which tokens are routed to this expert
-        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-
-        # Gather only the tokens for this expert
-        current_state = hidden_states[token_idx]
-
-        # Compute gate_up projection for this expert only
-        # Handle 'gate_up_proj' or 'w1'/'w3'
-        if hasattr(self, "gate_up_proj"):
-            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(
-                2, dim=-1
+    for message in messages:
+        if message["role"] == "user":
+            convos.append(
+                Message.from_role_and_content(Role.USER, message["content"])
             )
-        else:
-            gate = F.linear(current_state, self.w1[expert_idx])
-            up = F.linear(current_state, self.w3[expert_idx])
+        elif message["role"] == "assistant":
+            if "thinking" in message:
+                x = Message.from_role_and_content(Role.ASSISTANT, message["content"])
+                x = x.with_channel("analysis")
+            elif "tool_calls" in message:
+                x = Message.from_role_and_content(Role.ASSISTANT, message['tool_calls'][0]["arguments"])
+                x = x.with_channel("commentary")\
+                     .with_recipient(f"functions.{message['tool_calls'][0]['name']}")\
+                     .with_content_type("json")
+            else:
+                x = Message.from_role_and_content(Role.ASSISTANT, message["content"])
+                x = x.with_channel("final")
+            convos.append(x)
+        elif message["role"] == "tool":
+            x = Message.from_author_and_content(
+                    Author.new(Role.TOOL, f"functions.{message['name']}"),
+                    message["content"],
+                ).with_recipient("assistant").with_channel("commentary")
+            convos.append(x)
+    pass
 
-        current_hidden_states = self.act_fn(gate) * up
+    # Create Harmony conversations
+    convos = Conversation.from_messages(convos)
+    if add_generation_prompt:
+        harmony_input_ids = encoding.render_conversation_for_completion(convos, Role.ASSISTANT)
+    else:
+        harmony_input_ids = encoding.render_conversation(convos)
+    harmony_decoded_text = encoding.decode(harmony_input_ids)
+    return harmony_decoded_text, harmony_input_ids
+pass
 
-        # Compute down projection for this expert only
-        if hasattr(self, "down_proj"):
-            current_hidden_states = F.linear(
-                current_hidden_states, self.down_proj[expert_idx]
+
+# Fix https://github.com/huggingface/transformers/pull/40474
+# RuntimeError: Unsloth: Failed to load model. Both AutoConfig and PeftConfig loading failed.
+# AutoConfig error: 'GptOssConfig' object has no attribute 'max_position_embeddings'
+try:
+    from transformers.configuration_utils import layer_type_validation
+    try:
+        from transformers.configuration_utils import PreTrainedConfig
+        PretrainedConfig = PreTrainedConfig
+    except:
+        from transformers.configuration_utils import PretrainedConfig
+
+    from transformers.modeling_rope_utils import rope_config_validation
+
+    class Old_GptOssConfig(PretrainedConfig):
+        r"""
+        This will yield a configuration to that of the BERT
+        [google-bert/bert-base-uncased](https://huggingface.co/google-bert/bert-base-uncased) architecture.
+
+        """
+
+        model_type = "gpt_oss"
+        base_model_pp_plan = {
+            "embed_tokens": (["input_ids"], ["inputs_embeds"]),
+            "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
+            "norm": (["hidden_states"], ["hidden_states"]),
+        }
+        base_model_tp_plan = {
+            "layers.*.self_attn.q_proj": "colwise",
+            "layers.*.self_attn.k_proj": "colwise",
+            "layers.*.self_attn.v_proj": "colwise",
+            "layers.*.self_attn.o_proj": "rowwise",
+            "layers.*.self_attn.sinks": "local_rowwise",
+            "layers.*.mlp.experts": "gather",
+            "layers.*.mlp.router": "ep_router",
+            "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
+            "layers.*.mlp.experts.gate_up_proj_bias": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj_bias": "grouped_gemm",
+        }
+
+        def __init__(
+            self,
+            num_hidden_layers: int = 36,
+            num_local_experts: int = 128,
+            vocab_size: int = 201088,
+            hidden_size: int = 2880,
+            intermediate_size: int = 2880,
+            head_dim: int = 64,
+            num_attention_heads: int = 64,
+            num_key_value_heads: int = 8,
+            sliding_window: int = 128,
+            rope_theta: float = 150000.0,
+            tie_word_embeddings=False,
+            hidden_act: str = "silu",
+            initializer_range: float = 0.02,
+            max_position_embeddings=131072,
+            rms_norm_eps: float = 1e-5,
+            rope_scaling={"rope_type": "yarn", "factor": 32.0, "beta_fast": 32.0, "beta_slow": 1.0, "truncate": False},
+            attention_dropout: float = 0.0,
+            num_experts_per_tok=4,
+            router_aux_loss_coef: float = 0.9,
+            output_router_logits=False,
+            use_cache=True,
+            layer_types=None,
+            **kwargs,
+        ):
+            self.vocab_size = vocab_size
+            self.hidden_size = hidden_size
+            self.intermediate_size = intermediate_size
+            self.num_hidden_layers = num_hidden_layers
+            self.num_attention_heads = num_attention_heads
+            self.num_local_experts = num_local_experts
+            self.sliding_window = sliding_window
+            self.num_experts_per_tok = num_experts_per_tok
+            # for backward compatibility
+            if num_key_value_heads is None:
+                num_key_value_heads = num_attention_heads
+
+            self.num_key_value_heads = num_key_value_heads
+            self.hidden_act = hidden_act
+            self.initializer_range = initializer_range
+            self.rms_norm_eps = rms_norm_eps
+            self.rope_theta = rope_theta
+            self.rope_scaling = rope_scaling
+            self.attention_dropout = attention_dropout
+            self.head_dim = head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
+            self.layer_types = layer_types
+            if self.layer_types is None:
+                self.layer_types = [
+                    "sliding_attention" if bool((i + 1) % 2) else "full_attention" for i in range(self.num_hidden_layers)
+                ]
+            layer_type_validation(self.layer_types)
+
+            # Validate the correctness of rotary position embeddings parameters
+            # BC: if there is a 'type' field, copy it it to 'rope_type'.
+            if self.rope_scaling is not None and "type" in self.rope_scaling:
+                self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+            rope_config_validation(self)
+
+            self.attention_bias = True
+            self.max_position_embeddings = max_position_embeddings
+            self.router_aux_loss_coef = router_aux_loss_coef
+            self.output_router_logits = output_router_logits
+            self.use_cache = use_cache
+            super().__init__(
+                tie_word_embeddings=tie_word_embeddings,
+                **kwargs,
             )
-        else:
-            current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])
 
-        # Apply routing weights
-        current_hidden_states = (
-            current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-        )
+    class GptOssConfig(PretrainedConfig):
+        r"""
+        This will yield a configuration to that of the BERT
+        [google-bert/bert-base-uncased](https://huggingface.co/google-bert/bert-base-uncased) architecture.
 
-        # Scatter back to final output
-        final_hidden_states.index_add_(
-            0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
-        )
+        """
 
-    return final_hidden_states
+        model_type = "gpt_oss"
+        base_model_pp_plan = {
+            "embed_tokens": (["input_ids"], ["inputs_embeds"]),
+            "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
+            "norm": (["hidden_states"], ["hidden_states"]),
+        }
+        base_model_tp_plan = {
+            "layers.*.self_attn.q_proj": "colwise",
+            "layers.*.self_attn.k_proj": "colwise",
+            "layers.*.self_attn.v_proj": "colwise",
+            "layers.*.self_attn.o_proj": "rowwise",
+            "layers.*.self_attn.sinks": "local_rowwise",
+            "layers.*.mlp.experts": "gather",
+            "layers.*.mlp.router": "ep_router",
+            "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
+            "layers.*.mlp.experts.gate_up_proj_bias": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj": "grouped_gemm",
+            "layers.*.mlp.experts.down_proj_bias": "grouped_gemm",
+        }
+
+        def __init__(
+            self,
+            num_hidden_layers: int = 36,
+            num_local_experts: int = 128,
+            vocab_size: int = 201088,
+            hidden_size: int = 2880,
+            intermediate_size: int = 2880,
+            head_dim: int = 64,
+            num_attention_heads: int = 64,
+            num_key_value_heads: int = 8,
+            sliding_window: int = 128,
+            rope_theta: float = 150000.0,
+            tie_word_embeddings=False,
+            hidden_act: str = "silu",
+            initializer_range: float = 0.02,
+            max_position_embeddings=131072,
+            rms_norm_eps: float = 1e-5,
+            rope_scaling={"rope_type": "yarn", "factor": 32.0, "beta_fast": 32.0, "beta_slow": 1.0, "truncate": False},
+            attention_dropout: float = 0.0,
+            num_experts_per_tok=4,
+            router_aux_loss_coef: float = 0.9,
+            output_router_logits=False,
+            use_cache=True,
+            layer_types=None,
+            **kwargs,
+        ):
+            self.vocab_size = vocab_size
+            self.hidden_size = hidden_size
+            self.intermediate_size = intermediate_size
+            self.num_hidden_layers = num_hidden_layers
+            self.num_attention_heads = num_attention_heads
+            self.num_local_experts = num_local_experts
+            self.sliding_window = sliding_window
+            self.num_experts_per_tok = num_experts_per_tok
+            # for backward compatibility
+            if num_key_value_heads is None:
+                num_key_value_heads = num_attention_heads
+
+            self.num_key_value_heads = num_key_value_heads
+            self.hidden_act = hidden_act
+            self.initializer_range = initializer_range
+            self.rms_norm_eps = rms_norm_eps
+            self.rope_theta = rope_theta
+            self.rope_scaling = rope_scaling
+            self.attention_dropout = attention_dropout
+            self.head_dim = head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
+            self.layer_types = layer_types
+            if self.layer_types is None:
+                self.layer_types = [
+                    "sliding_attention" if bool((i + 1) % 2) else "full_attention" for i in range(self.num_hidden_layers)
+                ]
+            layer_type_validation(self.layer_types)
+            self.attention_bias = True
+            self.max_position_embeddings = max_position_embeddings
+            self.router_aux_loss_coef = router_aux_loss_coef
+            self.output_router_logits = output_router_logits
+            self.use_cache = use_cache
+
+            # Validate the correctness of rotary position embeddings parameters
+            # BC: if there is a 'type' field, copy it it to 'rope_type'.
+            if self.rope_scaling is not None and "type" in self.rope_scaling:
+                self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+            rope_config_validation(self)
+
+            self.attention_bias = True
+            self.max_position_embeddings = max_position_embeddings
+            self.router_aux_loss_coef = router_aux_loss_coef
+            self.output_router_logits = output_router_logits
+            self.use_cache = use_cache
+            super().__init__(
+                tie_word_embeddings=tie_word_embeddings,
+                **kwargs,
+            )
+
+    def patch_gpt_oss_config():
+        try:
+            import transformers.models.gpt_oss.configuration_gpt_oss
+            transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig
+        except Exception as e:
+            return raise_error("transformers.models.gpt_oss.configuration_gpt_oss", e)
+
+        try:
+            current_class = dedent(inspect.getsource(transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig))
+            new_class = dedent(inspect.getsource(Old_GptOssConfig))
+            new_class = new_class.replace("Old_GptOssConfig", "GptOssConfig")
+            if new_class == current_class:
+                logger.info("Unsloth: Updating GPT OSS Config to fix missing `max_position_embeddings`")
+                patch_function(transformers.models.gpt_oss.configuration_gpt_oss, "GptOssConfig", GptOssConfig)
+        except Exception as e:
+            return raise_error("transformers.models.gpt_oss.configuration_gpt_oss", e)
+    pass
+    TEMPORARY_PATCHES.append(patch_gpt_oss_config)
+except Exception as e:
+    raise_error("transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig", e)
