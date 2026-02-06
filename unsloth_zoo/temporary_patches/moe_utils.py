@@ -1225,9 +1225,11 @@ def forward_native_moe_loop(
         # Compute gate_up projection for this expert only
         # Handle 'gate_up_proj' or 'w1'/'w3'
         if hasattr(self, "gate_up_proj"):
-            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(
-                2, dim=-1
-            )
+            gate_up_w = self.gate_up_proj[expert_idx]
+            # Transformers v5 stores (H, 2I); F.linear expects (2I, H)
+            if gate_up_w.shape[0] == self.hidden_size:
+                gate_up_w = gate_up_w.transpose(0, 1)
+            gate, up = F.linear(current_state, gate_up_w).chunk(2, dim=-1)
         else:
             gate = F.linear(current_state, self.w1[expert_idx])
             up = F.linear(current_state, self.w3[expert_idx])
@@ -1236,9 +1238,11 @@ def forward_native_moe_loop(
 
         # Compute down projection for this expert only
         if hasattr(self, "down_proj"):
-            current_hidden_states = F.linear(
-                current_hidden_states, self.down_proj[expert_idx]
-            )
+            down_w = self.down_proj[expert_idx]
+            # Transformers v5 stores (I, H); F.linear expects (H, I)
+            if down_w.shape[1] == self.hidden_size:
+                down_w = down_w.transpose(0, 1)
+            current_hidden_states = F.linear(current_hidden_states, down_w)
         else:
             current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])
 
