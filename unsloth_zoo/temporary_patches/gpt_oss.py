@@ -30,6 +30,7 @@ from .common import (
 )
 from importlib.metadata import version as importlib_version
 from ..utils import Version
+import transformers
 
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
