@@ -1142,8 +1142,7 @@ def patch_gpt_oss_bnb4bit_auto():
         return
     # Avoid compiler-generated modules missing BnB helpers
     os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
-    if Version(transformers.__version__) >= Version("5.0.0"):
-        patch_gpt_oss_bnb4bit()
+    patch_gpt_oss_bnb4bit()
     # Ensure inference path avoids torch.compile for 4-bit
     try:
         global moe_forward_inference
