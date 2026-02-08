@@ -1141,7 +1141,8 @@ def patch_gpt_oss_bnb4bit_auto():
         return
     # Avoid compiler-generated modules missing BnB helpers
     os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
-    patch_gpt_oss_bnb4bit()
+    if Version(transformers.__version__) >= Version("5.0.0"):
+        patch_gpt_oss_bnb4bit()
     # Ensure inference path avoids torch.compile for 4-bit
     try:
         global moe_forward_inference
@@ -1395,6 +1396,87 @@ from .moe_utils import (
 )
 
 
+@torch.compiler.disable
+def forward_gpt_oss_moe_adapter(self, hidden_states, router_indices=None, routing_weights=None):
+    """
+    Adapter that converts GPT-OSS's forward signature to the generic MoE
+    signature used by forward_native_grouped_mm, which already handles all
+    GPT-OSS specifics (biases, interleaved split, custom activation, LoRA).
+
+    GPT-OSS signature: (hidden_states, router_indices, routing_weights)
+      - routing_weights: (N, num_experts) full score matrix
+      - router_indices:  (N, top_k) selected expert indices
+    Generic signature:  (hidden_states, top_k_index, top_k_weights)
+      - top_k_weights:   (N, top_k) only the selected weights
+    """
+    # Extract top-k weights from the full (N, num_experts) routing score matrix
+    top_k_weights = routing_weights.gather(1, router_indices)
+
+    if _check_torch_grouped_mm_supported():
+        return forward_native_grouped_mm(self, hidden_states, router_indices, top_k_weights)
+
+    # Fallback: loop over experts with separated LoRA support
+    # (forward_native_moe_loop doesn't handle GPT-OSS specifics)
+    return _forward_gpt_oss_loop_with_lora(self, hidden_states, router_indices, routing_weights)
+
+
+@torch.compiler.disable
+def _forward_gpt_oss_loop_with_lora(self, hidden_states, router_indices, routing_weights):
+    """
+    Loop fallback for GPUs without torch._grouped_mm.
+    Matches the original GptOssExperts.forward training path exactly,
+    with separated LoRA support.
+    """
+    batch_size = hidden_states.shape[0]
+    hidden_states_flat = hidden_states.reshape(-1, self.hidden_size)
+    num_experts = routing_weights.shape[1]
+
+    next_states = torch.zeros_like(hidden_states_flat)
+
+    with torch.no_grad():
+        expert_mask = F.one_hot(router_indices, num_classes=num_experts + 1)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+    gate_up_lora = getattr(self, "_unsloth_lora_gate_up_proj", None)
+    down_lora = getattr(self, "_unsloth_lora_down_proj", None)
+
+    for expert_idx_t in expert_hit:
+        expert_idx = expert_idx_t[0]
+        if expert_idx == num_experts:
+            continue
+
+        with torch.no_grad():
+            _, token_idx = torch.where(expert_mask[expert_idx])
+
+        current_state = hidden_states_flat[token_idx]
+
+        gate_up = current_state @ self.gate_up_proj[expert_idx] + self.gate_up_proj_bias[expert_idx]
+        if gate_up_lora is not None:
+            first_w, second_w, scaling = gate_up_lora[:3]
+            lora_out = current_state @ first_w[expert_idx].to(current_state.dtype)
+            lora_out = lora_out @ second_w[expert_idx].to(current_state.dtype)
+            gate_up = gate_up + lora_out * scaling
+
+        gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+        gate = gate.clamp(min=None, max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        glu = gate * torch.sigmoid(gate * self.alpha)
+        gated_output = (up + 1) * glu
+
+        out = gated_output @ self.down_proj[expert_idx] + self.down_proj_bias[expert_idx]
+        if down_lora is not None:
+            first_w, second_w, scaling = down_lora[:3]
+            lora_out = gated_output @ first_w[expert_idx].to(gated_output.dtype)
+            lora_out = lora_out @ second_w[expert_idx].to(gated_output.dtype)
+            out = out + lora_out * scaling
+
+        weighted_output = out * routing_weights[token_idx, expert_idx, None]
+        next_states.index_add_(0, token_idx, weighted_output.to(hidden_states_flat.dtype))
+
+    return next_states.view(batch_size, -1, self.hidden_size)
+
+
 def _should_use_gpt_oss_bnb4bit() -> bool:
     """
     Decide if GPT-OSS should use BnB-compatible 4-bit experts.
@@ -1418,9 +1500,9 @@ def _is_transformers_v5() -> bool:
 
 def patch_gpt_oss_moe_for_lora():
     """
-    Patch GPT OSS MoE experts for LoRA training with grouped GEMM support.
+    Patch GPT OSS MoE experts for LoRA training with separated LoRA support.
     This patches the original GptOssExperts class (with 3D parameter tensors)
-    to use optimized grouped GEMM kernels with LoRA support.
+    to use a GPT-OSS-specific forward that handles LoRA correctly.
 
     IMPORTANT: We only patch the forward method, NOT replace the entire class.
     This preserves the original class structure so weights load correctly.
@@ -1430,9 +1512,7 @@ def patch_gpt_oss_moe_for_lora():
     if _is_gpt_oss_4bit_load() or _should_use_gpt_oss_bnb4bit():
         # 4-bit loads should keep quantized weights and use default PEFT LoRA.
         return
-    if not _is_transformers_v5():
-        # Split-LoRA grouped_mm path is only needed for transformers v5+
-        return
+
     # First patch ParamWrapper for MoE separated LoRA
     patch_param_wrapper_for_moe()
 
@@ -1450,27 +1530,16 @@ def patch_gpt_oss_moe_for_lora():
     if hasattr(GptOssExpertsClass, "_unsloth_lora_patched"):
         return
 
-    # Select backend
-    backend = select_moe_backend()
-
-    if backend == "grouped_mm":
-        forward = forward_native_grouped_mm
-    else:
-        forward = forward_native_moe_loop
-
-    # Store original forward and patch - but DON'T replace the class!
+    # Use adapter that delegates to forward_native_grouped_mm (reuses all
+    # GPT-OSS-specific logic already there) with a loop fallback
     GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
-    GptOssExpertsClass.forward = forward
+    GptOssExpertsClass.forward = forward_gpt_oss_moe_adapter
     GptOssExpertsClass._unsloth_lora_patched = True
 
     if UNSLOTH_ENABLE_LOGGING:
-        backend_desc = {
-            "grouped_mm": "torch._grouped_mm (batched, fastest)",
-            "unsloth_triton": "Triton kernels",
-            "native_torch": "loop fallback (slower)",
-        }.get(backend, backend)
+        backend = "grouped_mm" if _check_torch_grouped_mm_supported() else "loop fallback"
         logger.info(
-            f"Unsloth: Patched GPT OSS MoE for LoRA training using {backend_desc}"
+            f"Unsloth: Patched GPT OSS MoE for LoRA training ({backend})"
         )
 
 
