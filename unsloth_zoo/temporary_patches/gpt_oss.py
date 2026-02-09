@@ -1711,6 +1711,7 @@ def torch_native_forward(
                 token_idx, _ = torch.where(router_indices == expert_idx)
             current_state = hidden_states[token_idx]
             gate_up = self.gate_up_projs[expert_idx](current_state)
+            down_proj = self.down_projs[expert_idx]
             gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = torch.float32)
             # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
             # gate = gate.clamp(min=None, max=self.limit)
@@ -1749,7 +1750,7 @@ def torch_native_forward(
             ]
         outs = torch.stack(out_list, dim=0)
         rw = routing_weights.transpose(0, 1).unsqueeze(-1)
-        mixed = (outs.to(dtype) * rw.to(dtype)).sum(dim=0)
+        mixed = (outs.to(torch.float32) * rw.to(torch.float32)).sum(dim=0)
         return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
     pass
 pass
