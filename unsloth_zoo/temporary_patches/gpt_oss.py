@@ -293,7 +293,7 @@ def patch_gpt_oss():
                 requires_grad=False,
             )
             self.gate_up_proj_scales = nn.Parameter(
-                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, dtype=torch.uint8),
+                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, 16, dtype=torch.uint8),
                 requires_grad=False,
             )
             self.gate_up_proj_bias = nn.Parameter(
