@@ -1062,6 +1062,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     # Get layer configuration for this model type
     layer_config = get_model_layer_config()
 
+    packed_modules_mapping = getattr(vllm_internals, "packed_modules_mapping", None)
+
+    def _is_fused_module(name: str) -> bool:
+        if packed_modules_mapping is None:
+            return False
+        packed = packed_modules_mapping.get(name)
+        return isinstance(packed, (list, tuple)) and len(packed) == 1 and packed[0] == name
+
     # All layers
     skipped_layernorms = []
     for kk in range(len(vllm_text_model.layers)):
@@ -1071,9 +1079,16 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             qkv_proj = layer.self_attn.qkv_proj
             o_proj = layer.self_attn.o_proj
 
-            get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
-            get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
-            get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
+            use_fused_qkv = _is_fused_module("qkv_proj")
+            if use_fused_qkv:
+                # For some model types like phi3 vllm will expect fused qkv (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+                # so we should not split them here otherwise there will be a size mismatch when activating the adapter
+                # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+                get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
+            else:
+                get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
+                get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
+                get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
         elif hasattr(layer, "cross_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
@@ -1089,8 +1104,15 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
         proj = layer.mlp.gate_up_proj
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+        use_fused_gate_up = _is_fused_module("gate_up_proj")
+        if use_fused_gate_up:
+            # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+            # so we should not split them here otherwise there will be a size mismatch when activating the adapter
+            # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
+        else:
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
 
         proj = layer.mlp.down_proj
         get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
@@ -1329,7 +1351,11 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.quant_method = "fbgemm_fp8"
                 elif fp8_weight_scale.ndim == 2:
                     # This denotes that the model if FP8 dynamic quantized.
-                    layer = FP8Linear(in_features = 0, out_features = 0, bias = has_bias, dtype = dtype, block_size = kwargs['block_size'], device = get_target_device(), activation_scheme = kwargs['activation_scheme'])
+                    fp8_kwargs = dict(in_features=0, out_features=0, bias=has_bias, dtype=dtype, block_size=kwargs['block_size'], activation_scheme=kwargs['activation_scheme'])
+                    # transformers 5.0+ removed device param from FP8Linear.__init__
+                    if Version("transformers") < Version("5.0.0"):
+                        fp8_kwargs["device"] = get_target_device()
+                    layer = FP8Linear(**fp8_kwargs)
                     layer.in_features = weight.shape[1]
                     layer.out_features = weight.shape[0]
                     layer.weight = torch.nn.Parameter(weight, requires_grad = False)

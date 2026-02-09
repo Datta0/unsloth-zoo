@@ -882,7 +882,22 @@ def create_new_function(
                     overwrite = True
     pass
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
-        overwrite = False
+        # Even with OVERWRITE disabled, force recompile on transformers version mismatch
+        if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
+            cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
+            cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
+            # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
+            cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
+            if cached_tf_version != transformers_version:
+                logger.warning_once(
+                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but transformers version changed "
+                    f"({cached_tf_version} -> {transformers_version}). Forcing recompile of {name}."
+                )
+                # Don't set overwrite = False; keep overwrite = True from version mismatch detection
+            else:
+                overwrite = False
+        else:
+            overwrite = False
 
     # Check location
     def write_file(function_location, write_new_source):
@@ -3169,15 +3184,26 @@ def unsloth_compile_transformers(
             bad_torch_modules.add(module)
         pass
 
-        # Check if creating arrays in inside the function
-        # Error: DataDependentOutputException: aten._local_scalar_dense.default
+        # Check for data-dependent control flow that breaks torch.compile(fullgraph=True)
+        # Tier 1: Direct data escapes from tensor to Python
+        #   .nonzero() -> data-dependent output shape (variable-length)
+        #   .tolist()  -> materializes tensor values into Python list
+        #   .item()    -> materializes tensor scalar into Python
+        # Tier 2: MoE expert dispatch via torch.where + index_add
+        #   1-arg torch.where returns data-dependent indices; combined with
+        #   index_add this is the standard MoE routing loop pattern
         if (
-            "torch.arange(" in source
-            or "torch.zeros(" in source
-            or "torch.ones(" in source
+            ".nonzero()" in source
+            or ".tolist()" in source
+            or ".item()" in source
         ):
             print(
-                f"Unsloth: Failed compiling function {module} since array creations are done."
+                f"Unsloth: Will not compile {module} since data-dependent operations are done."
+            )
+            bad_torch_modules.add(module)
+        elif "torch.where(" in source and ".index_add" in source:
+            print(
+                f"Unsloth: Will not compile {module} since data-dependent routing is done."
             )
             bad_torch_modules.add(module)
         pass
