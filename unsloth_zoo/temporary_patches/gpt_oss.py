@@ -1651,6 +1651,10 @@ def torch_native_forward_float32(
     routing_weights = None
 ) -> torch.Tensor:
 
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, self.hidden_size)
+    num_experts = routing_weights.shape[1]
+
     if self.training:
         next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
         # with torch.no_grad():
@@ -1713,6 +1717,9 @@ def torch_native_forward_half(
     router_indices = None,
     routing_weights = None
 ) -> torch.Tensor:
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, self.hidden_size)
+    num_experts = routing_weights.shape[1]
 
     if self.training:
         next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
