@@ -1763,7 +1763,7 @@ def torch_native_forward_half(
         return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
 pass
 
-torch_native_forward = torch_native_forward_float32 if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1" else torch_native_forward_half
+torch_native_forward = torch_native_forward_float32 # if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1" else torch_native_forward_half
 
 def patch_gpt_oss_linearized():
     """
