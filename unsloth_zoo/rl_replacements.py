@@ -83,7 +83,24 @@ def chunked_hidden_states_selective_log_softmax(
     all_per_token_logps = []
 
     for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
-        chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
+        hidden_for_proj = chunk_hidden_states.to(lm_head.dtype)
+        try:
+            from torch.distributed.tensor import DTensor, Replicate
+        except Exception:
+            try:
+                from torch.distributed._tensor import DTensor, Replicate
+            except Exception:
+                DTensor = None
+                Replicate = None
+
+        if DTensor is not None and isinstance(lm_head, DTensor):
+            mesh = lm_head.device_mesh
+            repl = [Replicate() for _ in range(mesh.ndim)]
+            hidden_for_proj = DTensor.from_local(hidden_for_proj, mesh, repl)
+            chunk_logits = torch.nn.functional.linear(hidden_for_proj, lm_head)
+            chunk_logits = chunk_logits.redistribute(mesh, placements=repl).to_local()
+        else:
+            chunk_logits = torch.nn.functional.linear(hidden_for_proj, lm_head)
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply
