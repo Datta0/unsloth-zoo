@@ -2939,7 +2939,6 @@ DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
     "GraniteMoeHybridMoE",
     "GraniteMoeHybridMambaLayer",
-    "GptOssMLP",
     "GptOssExperts",
     "Gemma3nTextModel",
     "Glm4MoeLiteNaiveMoe",

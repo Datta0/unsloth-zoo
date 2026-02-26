@@ -648,6 +648,80 @@ class ParameterModule(nn.Linear):
         )
 
 
+@torch.compiler.disable
+def forward_gpt_oss_native_loop(
+    self,
+    hidden_states: torch.Tensor,
+    router_indices=None,
+    routing_weights=None,
+) -> torch.Tensor:
+    """
+    Loop-based MoE forward for GPT-OSS with custom SwiGLU activation.
+    Works with both nn.Parameter 3D tensors and ParameterModule weights.
+    Used as fallback when grouped_mm is unavailable (e.g. T4).
+    """
+    batch_size = hidden_states.shape[0]
+    hidden_states = hidden_states.reshape(-1, self.hidden_size)
+    num_experts = routing_weights.shape[1]
+
+    # Get 3D weight tensors — handle both nn.Parameter and ParameterModule
+    if hasattr(self.gate_up_proj, "get_param"):
+        gate_up_w = self.gate_up_proj.get_param()  # (E, H, 2I)
+    else:
+        gate_up_w = self.gate_up_proj  # already nn.Parameter (E, H, 2I)
+
+    if hasattr(self.down_proj, "get_param"):
+        down_w = self.down_proj.get_param()  # (E, I, H)
+    else:
+        down_w = self.down_proj  # already nn.Parameter (E, I, H)
+
+    # Ensure weights match input dtype (ParameterModule may return float32)
+    input_dtype = hidden_states.dtype
+    gate_up_w = gate_up_w.to(input_dtype)
+    down_w = down_w.to(input_dtype)
+
+    gate_up_bias = self.gate_up_proj_bias  # (E, 2I)
+    down_bias = self.down_proj_bias        # (E, H)
+    limit = getattr(self, "limit", 7.0)
+    alpha = getattr(self, "alpha", 1.702)
+
+    if self.training:
+        next_states = torch.zeros_like(
+            hidden_states, dtype=torch.float32, device=hidden_states.device
+        )
+        for expert_idx in range(num_experts):
+            with torch.no_grad():
+                token_idx, _ = torch.where(router_indices == expert_idx)
+            if token_idx.numel() == 0:
+                continue
+            current_state = hidden_states[token_idx]
+            # gate_up: current_state @ gate_up_w[expert_idx] + bias
+            gate_up = torch.matmul(current_state, gate_up_w[expert_idx]) + gate_up_bias[expert_idx]
+            gated_output = swiglu_torch_forward(gate_up, alpha, limit, dtype=torch.float32)
+            # Force float32 matmul on down projection for numerical stability
+            gated_output = gated_output.to(torch.float32)
+            device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
+            with torch.autocast(device_type=device_type, enabled=False):
+                out = torch.matmul(gated_output, down_w[expert_idx].to(torch.float32)) + down_bias[expert_idx].to(torch.float32)
+            weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
+            next_states.index_add_(0, token_idx, weighted_output)
+        next_states = next_states.view(batch_size, -1, self.hidden_size)
+        return next_states.to(hidden_states.dtype)
+    else:
+        # Inference: batched matmul over all experts
+        hidden_states_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
+        # (E, T, H) @ (E, H, 2I) -> (E, T, 2I)
+        gate_up = torch.bmm(hidden_states_rep, gate_up_w) + gate_up_bias[:, None, :]
+        dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+        fused = swiglu_torch_forward(gate_up, alpha, limit, dtype=dtype)
+        # (E, T, I) @ (E, I, H) -> (E, T, H)
+        next_states = torch.bmm(fused, down_w) + down_bias[:, None, :]
+        next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)
+        rw = routing_weights.transpose(0, 1).unsqueeze(-1)  # (E, T, 1)
+        mixed = (next_states.to(dtype) * rw.view(num_experts, batch_size, -1, 1).to(dtype)).sum(dim=0)
+        return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
+
+
 def patch_gpt_oss_compiler_exports():
     model_name = os.environ.get("UNSLOTH_MODEL_NAME", "").replace("-", "_")
     if "gpt_oss" not in model_name:
@@ -779,13 +853,13 @@ class GptOssExperts(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
     ) -> torch.Tensor:
-        """Forward using grouped_mm or loop fallback with LoRA support."""
-        # Use optimized grouped_mm if available
+        """Forward using grouped_mm or native loop fallback with LoRA support."""
+        # Use optimized grouped_mm if available (H100+)
         if _check_torch_grouped_mm_supported():
             return forward_native_grouped_mm(self, hidden_states, router_indices, routing_weights)
 
-        # Fallback to loop-based implementation
-        return torch_native_forward(self, hidden_states, router_indices, routing_weights)
+        # Fallback to GPT-OSS specific loop (works with both nn.Parameter and ParameterModule)
+        return forward_gpt_oss_native_loop(self, hidden_states, router_indices, routing_weights)
 
 
 pass
@@ -1395,7 +1469,7 @@ def patch_gpt_oss_moe_for_lora():
     if backend == "grouped_mm":
         forward = forward_native_grouped_mm
     else:
-        forward = torch_native_forward
+        forward = forward_gpt_oss_native_loop
 
     # Store original forward and patch - but DON'T replace the class!
     GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
@@ -1822,10 +1896,10 @@ def patch_gpt_oss_linearized():
         def experts_forward(
             self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
         ) -> torch.Tensor:
-            return torch_native_forward(self, hidden_states, router_indices, routing_weights)
+            return forward_gpt_oss_native_loop(self, hidden_states, router_indices, routing_weights)
 
-        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
-            transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts.forward = experts_forward
+        # Always patch for non-grouped_mm backends (T4, etc.)
+        transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts.forward = experts_forward
 
     if UNSLOTH_ENABLE_LOGGING: logger.info(f"Unsloth: Patched GPT OSS MoE for 4bit loading (backend: {backend})")
     return
