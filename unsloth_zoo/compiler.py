@@ -794,6 +794,225 @@ def _insert_kwargs_alias(source: str, func_name: str, replacement: str):
     lines.insert(insert_at, alias_text)
     return "".join(lines)
 
+
+_COMPILE_DEP_PROVIDER_MAP = {
+    "gpt_oss": ["gpt_oss", "moe_utils"],
+    "qwen3_moe": ["qwen3_moe", "moe_utils"],
+    "qwen3_next": ["qwen3_next_moe", "qwen3_moe", "moe_utils"],
+    "qwen3_5_moe": ["qwen3_5_moe", "qwen3_moe", "moe_utils"],
+    "qwen3_vl_moe": ["qwen3_vl_moe", "moe_utils"],
+    "deepseek_v3": ["deepseek_v3_moe", "moe_utils"],
+    "glm4_moe_lite": ["glm4_moe", "moe_utils"],
+}
+
+if isinstance(__builtins__, dict):
+    _PYTHON_BUILTIN_NAMES = set(__builtins__.keys())
+else:
+    _PYTHON_BUILTIN_NAMES = set(dir(__builtins__))
+
+_COMPILER_GLOBAL_SYMBOLS = {
+    "Tensor",
+    "torch",
+    "nn",
+    "F",
+    "os",
+    "sys",
+    "math",
+    "Any",
+    "List",
+    "Optional",
+    "Tuple",
+    "Union",
+    "Dict",
+    "Set",
+    "Callable",
+    "logger_compiler",
+    "UNSLOTH_ENABLE_LOGGING",
+    "UNSLOTH_ENABLE_CCE",
+    "UNSLOTH_COMPILE_DISABLE",
+    "UNSLOTH_STUDIO_ENABLED",
+    "INFERENCE_RUNS",
+    "torch_dynamo_eval_frame",
+    "torch_compiler_set_stance",
+    "flash_attn_supports_top_left_mask",
+    "_flash_attention_forward",
+    "FlashAttentionKwargs",
+    "flash_attn_varlen_func",
+    "fused_linear_cross_entropy",
+    "unsloth_fused_ce_loss",
+    "fast_linear_cross_entropy",
+    "disable_compile_scaled_dot_product_attention",
+    "scaled_dot_product_attention",
+    "torch_compile_options",
+    "__name__",
+    "__file__",
+    "__package__",
+}
+
+
+def _get_compile_dependency_providers(model_type: str) -> List[str]:
+    providers = list(_COMPILE_DEP_PROVIDER_MAP.get(model_type, []))
+    if model_type in providers:
+        return providers
+    maybe_provider = model_type
+    if maybe_provider.endswith("_moe"):
+        maybe_provider = maybe_provider
+    if maybe_provider not in providers:
+        providers.append(maybe_provider)
+    return providers
+
+
+def _collect_defined_symbols(source: str) -> Set[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+
+    defined = set()
+
+    def visit_target(target):
+        if isinstance(target, ast.Name):
+            defined.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                visit_target(elt)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                visit_target(target)
+        elif isinstance(node, ast.AnnAssign):
+            visit_target(node.target)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                defined.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                defined.add(alias.asname or alias.name)
+    return defined
+
+
+def _collect_loaded_symbols(source: str) -> Set[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+
+
+def _collect_unresolved_symbols(source: str, local_symbols: Set[str]) -> Set[str]:
+    unresolved = set()
+    for symbol in _collect_loaded_symbols(source):
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", symbol):
+            continue
+        if (
+            symbol in local_symbols
+            or symbol in _COMPILER_GLOBAL_SYMBOLS
+            or symbol in _PYTHON_BUILTIN_NAMES
+        ):
+            continue
+        unresolved.add(symbol)
+    return unresolved
+
+
+def _get_symbol_source_from_module(module, symbol: str):
+    if module is None or not hasattr(module, symbol):
+        return None
+    try:
+        source = inspect.getsource(getattr(module, symbol))
+    except Exception:
+        return None
+    return textwrap.dedent(source).strip()
+
+
+def _build_unresolved_fallback_imports(unresolved_symbols: Set[str], providers: List[str]) -> str:
+    if len(unresolved_symbols) == 0 or len(providers) == 0:
+        return ""
+    provider_modules = [f"unsloth_zoo.temporary_patches.{x}" for x in providers]
+    module_tuple = ", ".join(repr(x) for x in provider_modules)
+    code_lines = [
+        "# Unsloth: fallback imports for helper symbols not materialized into cache source",
+        f"_UNSLOTH_TMP_PATCH_MODULES = ({module_tuple},)",
+    ]
+    for symbol in sorted(unresolved_symbols):
+        code_lines += [
+            f"if '{symbol}' not in globals():",
+            "    for _unsloth_mod_name in _UNSLOTH_TMP_PATCH_MODULES:",
+            "        try:",
+            "            _unsloth_mod = __import__(_unsloth_mod_name, fromlist=['*'])",
+            f"            if hasattr(_unsloth_mod, '{symbol}'):",
+            f"                globals()['{symbol}'] = getattr(_unsloth_mod, '{symbol}')",
+            "                break",
+            "        except Exception:",
+            "            pass",
+        ]
+    return "\n".join(code_lines)
+
+
+def materialize_compile_dependencies(all_code: str, model_type: str, model_location: str):
+    providers = _get_compile_dependency_providers(model_type)
+    provider_modules = []
+    try:
+        provider_modules.append(importlib.import_module(model_location))
+    except Exception:
+        provider_modules.append(None)
+    for provider in providers:
+        try:
+            provider_modules.append(
+                importlib.import_module(f"unsloth_zoo.temporary_patches.{provider}")
+            )
+        except Exception:
+            provider_modules.append(None)
+
+    helper_sources = []
+    seen_sources = set()
+    local_symbols = _collect_defined_symbols(all_code)
+    unresolved_symbols = set()
+    max_passes = 8
+    for _ in range(max_passes):
+        combined_source = "\n\n".join(helper_sources + [all_code])
+        unresolved_now = sorted(_collect_unresolved_symbols(combined_source, local_symbols))
+        if len(unresolved_now) == 0:
+            unresolved_symbols = set()
+            break
+        progress = False
+        unresolved_next = set()
+        for symbol in unresolved_now:
+            symbol_source = None
+            for module in provider_modules:
+                symbol_source = _get_symbol_source_from_module(module, symbol)
+                if symbol_source is not None:
+                    break
+            if symbol_source is None:
+                unresolved_next.add(symbol)
+                continue
+            if symbol_source in seen_sources:
+                continue
+            helper_sources.append(symbol_source)
+            seen_sources.add(symbol_source)
+            local_symbols.update(_collect_defined_symbols(symbol_source))
+            progress = True
+        unresolved_symbols = unresolved_next
+        if not progress:
+            break
+
+    helper_code = "\n\n".join(helper_sources)
+    fallback_code = _build_unresolved_fallback_imports(unresolved_symbols, providers)
+    if fallback_code:
+        helper_code = (helper_code + "\n\n" + fallback_code) if helper_code else fallback_code
+    if helper_code:
+        helper_code += "\n"
+    return helper_code, local_symbols, unresolved_symbols
+
+
 def create_new_function(
     name,
     new_source,
@@ -803,6 +1022,7 @@ def create_new_function(
     append="",
     overwrite=True,
     add_torch_compile=False,
+    local_symbols=None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     old_new_source = new_source
@@ -837,6 +1057,8 @@ def create_new_function(
         for x in functions
         if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))
     ]
+    if local_symbols:
+        items = [x for x in items if x not in local_symbols]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
         items += ["SiglipEncoder"]
@@ -3980,6 +4202,19 @@ def unsloth_compile_transformers(
     pass
 
     all_code = "\n\n".join(final_all_standalone_classes)
+    helper_code, local_symbols, unresolved_symbols = materialize_compile_dependencies(
+        all_code,
+        model_type,
+        model_location,
+    )
+    if helper_code:
+        all_code = helper_code + "\n" + all_code
+    if len(unresolved_symbols) != 0 and UNSLOTH_ENABLE_LOGGING:
+        print(
+            "Unsloth: Warning: Could not materialize all helper symbols for "
+            f"{model_type}: {', '.join(sorted(unresolved_symbols))}. "
+            "Falling back to temporary_patches imports."
+        )
 
     try:
         combined_module = create_new_function(
@@ -3991,6 +4226,7 @@ def unsloth_compile_transformers(
             + f"\ntorch_compile_options = {torch_compile_options}\n"
             + _cross_entropy_code
             + "\n",
+            local_symbols=local_symbols,
         )
     except Exception as exception:
         if not disable:

@@ -1044,7 +1044,11 @@ def patch_gpt_oss_bnb4bit():
     # Inject BnB helpers so compiler-generated modules can import them
     # from transformers.models.gpt_oss.modeling_gpt_oss
     m = transformers.models.gpt_oss.modeling_gpt_oss
+    m.ParameterModule      = ParameterModule
     m._RouterLinearParams  = _RouterLinearParams
+    m._check_torch_grouped_mm_supported = _check_torch_grouped_mm_supported
+    m.forward_native_grouped_mm = forward_native_grouped_mm
+    m.torch_native_forward = torch_native_forward
     m.swiglu_torch_forward = swiglu_torch_forward
     m.dtype_from_config    = dtype_from_config
     m.transformers_version = transformers_version
