@@ -818,6 +818,8 @@ _COMPILER_GLOBAL_SYMBOLS = {
     "os",
     "sys",
     "math",
+    "self",
+    "cls",
     "Any",
     "List",
     "Optional",
@@ -852,13 +854,12 @@ _COMPILER_GLOBAL_SYMBOLS = {
 
 def _get_compile_dependency_providers(model_type: str) -> List[str]:
     providers = list(_COMPILE_DEP_PROVIDER_MAP.get(model_type, []))
-    if model_type in providers:
-        return providers
-    maybe_provider = model_type
-    if maybe_provider.endswith("_moe"):
-        maybe_provider = maybe_provider
-    if maybe_provider not in providers:
-        providers.append(maybe_provider)
+    try:
+        importlib.import_module(f"unsloth_zoo.temporary_patches.{model_type}")
+        if model_type not in providers:
+            providers.append(model_type)
+    except Exception:
+        pass
     return providers
 
 
@@ -880,11 +881,29 @@ def _collect_defined_symbols(source: str) -> Set[str]:
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             defined.add(node.name)
-        elif isinstance(node, ast.Assign):
+        # Collect function/method parameters as locally defined
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
+                defined.add(arg.arg)
+            if node.args.vararg:
+                defined.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                defined.add(node.args.kwarg.arg)
+        if isinstance(node, ast.Assign):
             for target in node.targets:
                 visit_target(target)
-        elif isinstance(node, ast.AnnAssign):
+        elif isinstance(node, ast.AnnAssign) and node.target:
             visit_target(node.target)
+        elif isinstance(node, ast.For):
+            visit_target(node.target)
+        elif isinstance(node, ast.comprehension):
+            visit_target(node.target)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            defined.add(node.name)
+        elif isinstance(node, ast.With):
+            for item in node.items:
+                if item.optional_vars:
+                    visit_target(item.optional_vars)
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 defined.add(alias.asname or alias.name.split(".")[0])
@@ -924,10 +943,18 @@ def _collect_unresolved_symbols(source: str, local_symbols: Set[str]) -> Set[str
 
 
 def _get_symbol_source_from_module(module, symbol: str):
+    # Avoid copying config classes into compiled cache source since they often
+    # rely on module-local aliases/import context (eg PretrainedConfig aliases).
+    if symbol.endswith("Config") or symbol.endswith("ConfigMixin"):
+        return None
     if module is None or not hasattr(module, symbol):
         return None
+    obj = getattr(module, symbol)
+    owner_module = getattr(obj, "__module__", None)
+    if owner_module is not None and owner_module != getattr(module, "__name__", ""):
+        return None
     try:
-        source = inspect.getsource(getattr(module, symbol))
+        source = inspect.getsource(obj)
     except Exception:
         return None
     return textwrap.dedent(source).strip()
@@ -959,18 +986,26 @@ def _build_unresolved_fallback_imports(unresolved_symbols: Set[str], providers: 
 
 def materialize_compile_dependencies(all_code: str, model_type: str, model_location: str):
     providers = _get_compile_dependency_providers(model_type)
-    provider_modules = []
+    model_module = None
+    model_module_symbols = set()
     try:
-        provider_modules.append(importlib.import_module(model_location))
+        model_module = importlib.import_module(model_location)
+        model_module_symbols = set(dir(model_module))
     except Exception:
-        provider_modules.append(None)
+        model_module = None
+        model_module_symbols = set()
+    provider_modules = []
+    provider_module_names = []
+    provider_symbol_names = set()
     for provider in providers:
         try:
-            provider_modules.append(
-                importlib.import_module(f"unsloth_zoo.temporary_patches.{provider}")
-            )
+            full_provider = f"unsloth_zoo.temporary_patches.{provider}"
+            imported_provider = importlib.import_module(full_provider)
+            provider_modules.append(imported_provider)
+            provider_module_names.append(provider)
+            provider_symbol_names.update(dir(imported_provider))
         except Exception:
-            provider_modules.append(None)
+            continue
 
     helper_sources = []
     seen_sources = set()
@@ -979,13 +1014,19 @@ def materialize_compile_dependencies(all_code: str, model_type: str, model_locat
     max_passes = 8
     for _ in range(max_passes):
         combined_source = "\n\n".join(helper_sources + [all_code])
-        unresolved_now = sorted(_collect_unresolved_symbols(combined_source, local_symbols))
+        unresolved_now = sorted(
+            x
+            for x in _collect_unresolved_symbols(combined_source, local_symbols)
+            if x in provider_symbol_names
+        )
         if len(unresolved_now) == 0:
             unresolved_symbols = set()
             break
         progress = False
         unresolved_next = set()
         for symbol in unresolved_now:
+            if symbol in model_module_symbols:
+                continue
             symbol_source = None
             for module in provider_modules:
                 symbol_source = _get_symbol_source_from_module(module, symbol)
@@ -1005,7 +1046,10 @@ def materialize_compile_dependencies(all_code: str, model_type: str, model_locat
             break
 
     helper_code = "\n\n".join(helper_sources)
-    fallback_code = _build_unresolved_fallback_imports(unresolved_symbols, providers)
+    fallback_code = _build_unresolved_fallback_imports(
+        unresolved_symbols,
+        provider_module_names,
+    )
     if fallback_code:
         helper_code = (helper_code + "\n\n" + fallback_code) if helper_code else fallback_code
     if helper_code:
@@ -1351,6 +1395,25 @@ def create_standalone_class(
     old_init = inspect.getsource(f.__init__)
     if forward_source is None:
         forward_source = old_source
+
+    # If a patched class is aliased (eg GptOssExpertsBnb4bit exposed as
+    # modeling_gpt_oss.GptOssExperts), normalize the emitted class name to the
+    # target module symbol so downstream references resolve correctly.
+    class_name_match = re.search(
+        r"(^[\t ]*class[\t ]+)([A-Za-z_][A-Za-z0-9_]*)([\t ]*\()",
+        full_class,
+        flags=re.MULTILINE,
+    )
+    if class_name_match is not None:
+        current_class_name = class_name_match.group(2)
+        if current_class_name != module:
+            full_class = re.sub(
+                r"(^[\t ]*class[\t ]+)[A-Za-z_][A-Za-z0-9_]*([\t ]*\()",
+                r"\1" + module + r"\2",
+                full_class,
+                count=1,
+                flags=re.MULTILINE,
+            )
 
     # We disable this for nn.Embedding modules if torch is older than 2.5 since
     if OLD_TORCH_VERSION and "nn.Embedding(" in old_init:

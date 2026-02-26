@@ -1024,11 +1024,14 @@ def patch_gpt_oss_bnb4bit():
         transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssTopKRouter = \
             transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter
 
-    # Replace with BnB 4bit compatible versions
-    # Preserve original symbol names for compiler-generated modules.
-    GptOssExpertsBnb4bit.__name__ = "GptOssExperts"
-    GptOssExpertsBnb4bit.__qualname__ = "GptOssExperts"
-
+    # Replace with BnB 4bit compatible versions.
+    # Keep class names untouched when compile is enabled: inspect.getsource
+    # uses __name__/__qualname__, and mutating them can make compiler patching
+    # pick the wrong class body.
+    # For compile-disabled paths, preserve legacy name behavior for compatibility.
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial"):
+        GptOssExpertsBnb4bit.__name__ = "GptOssExperts"
+        GptOssExpertsBnb4bit.__qualname__ = "GptOssExperts"
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts = GptOssExpertsBnb4bit
     # Use the unsloth GptOssTopKRouter (with self.linear = nn.Linear) for the router.
     # The BnB 4-bit checkpoint stores router weights as router.linear.weight/bias.
@@ -2759,8 +2762,17 @@ def patch_gpt_oss_init_weights_modulelist_fix():
     _original_init_weights = GptOssPreTrainedModel._init_weights
 
     def _patched_init_weights(self, module):
-        if isinstance(module, GptOssExperts) and not hasattr(module, "gate_up_proj"):
+        # Intercept _init_weights for patched GptOssExperts classes.
+        # The original does `module.gate_up_proj.data.normal_(...)` which only
+        # works for the original nn.Parameter layout. We need to handle:
+        # 1. BnB4bit path: gate_up_projs (ModuleList of nn.Linear)
+        # 2. ParameterModule path: gate_up_proj is nn.Linear subclass
+        if isinstance(module, GptOssExperts) and (
+            not hasattr(module, "gate_up_proj")
+            or isinstance(getattr(module, "gate_up_proj", None), nn.Linear)
+        ):
             std = self.config.initializer_range
+            # ModuleList path (BnB 4bit)
             for up in getattr(module, "gate_up_projs", []):
                 init.normal_(up.weight, mean=0.0, std=std)
                 if up.bias is not None:
@@ -2769,6 +2781,15 @@ def patch_gpt_oss_init_weights_modulelist_fix():
                 init.normal_(down.weight, mean=0.0, std=std)
                 if down.bias is not None:
                     init.zeros_(down.bias)
+            # ParameterModule path (BF16 with LoRA)
+            if isinstance(getattr(module, "gate_up_proj", None), nn.Linear):
+                init.normal_(module.gate_up_proj.weight, mean=0.0, std=std)
+            if isinstance(getattr(module, "down_proj", None), nn.Linear):
+                init.normal_(module.down_proj.weight, mean=0.0, std=std)
+            if hasattr(module, "gate_up_proj_bias") and isinstance(module.gate_up_proj_bias, nn.Parameter):
+                init.zeros_(module.gate_up_proj_bias)
+            if hasattr(module, "down_proj_bias") and isinstance(module.down_proj_bias, nn.Parameter):
+                init.zeros_(module.down_proj_bias)
             return
         _original_init_weights(self, module)
 
