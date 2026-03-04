@@ -644,6 +644,10 @@ def patch_vllm_enable_sleep_mode():
     pass
 
     def delete_memory():
+        free, total = torch.cuda.mem_get_info()
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        print(f"Free: {free/1024**3:.4f} GiB, Total: {total/1024**3:.4f} GiB, Allocated: {allocated/1024**3:.4f} GiB, Reserved: {reserved/1024**3:.4f} GiB")
         torch.cuda.empty_cache()
         gc.collect()
     pass
