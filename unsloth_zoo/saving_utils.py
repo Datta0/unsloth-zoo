@@ -1470,8 +1470,17 @@ from huggingface_hub import (
 
 def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
-        shape = (x.module.in_features, x.module.out_features)
-        return int(np.prod(shape)) * element_size
+        module = getattr(x, "module", None)
+        if module is not None:
+            if hasattr(module, "in_features") and hasattr(module, "out_features"):
+                shape = (module.in_features, module.out_features)
+                return int(np.prod(shape)) * element_size
+            weight = _get_modules_to_save_weight(module)
+            if weight is None and hasattr(module, "weight"):
+                weight = module.weight
+            if weight is not None:
+                return int(np.prod(tuple(weight.shape))) * element_size
+        return 0
     else:
         return get_torch_storage_size(x)
 pass
