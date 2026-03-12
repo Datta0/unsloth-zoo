@@ -521,9 +521,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
 
         device =_new_logps.device
         grad_inputs = torch.empty_like(_new_logps)
-        accumulated_loss              = torch.zeros(1, device = device)
-        accumulated_completion_length = torch.zeros(1, device = device)
-        accumulated_mean_kl           = torch.zeros(1, device = device)
+        accumulated_loss              = torch.zeros((), device = device)
+        accumulated_completion_length = torch.zeros((), device = device)
+        accumulated_mean_kl           = torch.zeros((), device = device)
         accumulated_delta             = []
         accumulated_flat_is_ratio     = []
         accumulated_coef_1            = []
@@ -846,7 +846,7 @@ def grpo_accumulated_loss(
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
             #Only the activations are needed so if we keep entire computational graph, keeps unnecessary memory on CPU so we detach it
-            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True) 
+            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True)
             ctx.device = hidden_states.device
             ctx.dtype = hidden_states.dtype
 

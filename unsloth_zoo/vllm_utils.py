@@ -2354,6 +2354,10 @@ def load_vllm(
     pass
     # Save maximum requests length since llm.generate fails to partition inputs sometimes
     llm.approx_max_num_seqs = approx_max_num_seqs
+    # Mark engines created through Unsloth fast-inference load_vllm as sharing
+    # weights with the attached HF model so downstream TRL patches can decide
+    # whether sync/reload steps are actually redundant.
+    llm.shared_weights = True
 
     # Unpatch vLLM compute_dtype for bitsandbytes
     unpatch_vllm_compute_dtype(BitsAndBytesConfig)
