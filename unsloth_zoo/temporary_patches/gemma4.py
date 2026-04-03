@@ -350,44 +350,30 @@ def patch_Gemma4TextAttention_generic():
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
 
-        # Attention mask
+        # Attention mask: keep None / 4D masks, drop 2D (SDPA uses is_causal)
         attn_mask_for_sdpa = attention_mask
-        if isinstance(attn_mask_for_sdpa, torch.Tensor) and attn_mask_for_sdpa.dtype != torch.bool:
-            attn_mask_for_sdpa = attn_mask_for_sdpa.to(target_dtype)
+        if isinstance(attn_mask_for_sdpa, torch.Tensor):
+            if attn_mask_for_sdpa.dim() == 2:
+                attn_mask_for_sdpa = None
+            elif attn_mask_for_sdpa.dtype != torch.bool:
+                attn_mask_for_sdpa = attn_mask_for_sdpa.to(target_dtype)
 
         attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
         if _UNSLOTH_FLEX_ATTENTION_DISABLED:
             attn_impl = "sdpa"
-        if attn_impl == "flex_attention":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
-            attn_output, attn_weights = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attn_mask_for_sdpa,
-                dropout=self.attention_dropout if self.training else 0.0,
-                scaling=getattr(self, "scaling", None),
-                sliding_window=getattr(self, "sliding_window", None),
-                **kwargs,
-            )
-        else:
-            is_causal = query_states.shape[2] > 1 and attn_mask_for_sdpa is None and getattr(self, "is_causal", True)
-            if torch_jit_is_tracing() and isinstance(is_causal, torch.Tensor): is_causal = is_causal.item()
-            attn_output = scaled_dot_product_attention(
-                query_states.contiguous(),
-                key_states.contiguous(),
-                value_states.contiguous(),
-                attn_mask=attn_mask_for_sdpa,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                is_causal=is_causal,
-                scale=getattr(self, "scaling", None),
-                enable_gqa=getattr(self, "num_key_value_groups", 1) != 1,
-            )
-            attn_weights = None
 
-        if attn_impl != "flex_attention":
-            attn_output = attn_output.transpose(1, 2).contiguous()
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get(attn_impl, eager_attention_forward)
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attn_mask_for_sdpa,
+            dropout=self.attention_dropout if self.training else 0.0,
+            scaling=getattr(self, "scaling", None),
+            sliding_window=getattr(self, "sliding_window", None),
+            **kwargs,
+        )
 
         attn_output = attn_output.reshape(*input_shape, -1)
         attn_output = self.o_proj(attn_output)

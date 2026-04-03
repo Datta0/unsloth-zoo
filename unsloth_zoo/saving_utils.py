@@ -596,7 +596,6 @@ def _merge_and_overwrite_lora(
                     pass
 
             # Fast path for MoE models with stacked experts: merge by iterating LoRA modules instead of per-weight scan
-            # Matches standard (.mlp.experts), Gemma4 (.experts without .mlp), and .moe naming
             if any(".experts" in k or ".moe" in k for k in converted_lora_weights.keys()):
                 count = _merge_moe_experts_file(
                     mm = mm,
@@ -726,7 +725,7 @@ def _merge_and_overwrite_lora(
                 # Check for LoRA merge
                 lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
                 lora_stats = converted_lora_weights.get(lora_key, None)
-                # Fallback: handle Gemma4ClippableLinear (.linear.weight -> .weight)
+                # Gemma4ClippableLinear: .linear.weight -> .weight
                 if lora_stats is None and lora_key.endswith(".linear"):
                     lora_stats = converted_lora_weights.get(
                         lora_key[:-len(".linear")], None
@@ -1024,8 +1023,6 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 is_gpt_oss_format = True
                 break
 
-    # Determine if fused 3D format is transposed (GPT-OSS) or standard (Gemma4)
-    # from gate_up_proj shape: (E, H, 2*I) → transposed, (E, 2*I, H) → standard
     _is_transposed_format = None
     if is_gpt_oss_format:
         for key, meta in header_metadata.items():
@@ -1041,13 +1038,11 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
         except Exception:
             pass
 
-    # Build mapping from model LoRA module path -> safetensor expert prefix
-    # Handles Gemma4 (.experts without .mlp), standard (.mlp.experts), and .moe patterns
+    # Map LoRA module path -> safetensor expert prefix (handles .moe -> .experts remapping)
     _moe_lora_to_shard_prefix = {}
     for lora_key in converted_lora_weights.keys():
         if ".experts" in lora_key or ".moe" in lora_key:
             base = lora_key.replace(".base_layer", "")
-            # Try direct match first (standard models)
             if f"{base}.gate_up_proj" in header_metadata or f"{base}.down_proj" in header_metadata:
                 _moe_lora_to_shard_prefix[lora_key] = base
             else:
@@ -1209,10 +1204,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
 def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_transposed=None):
     """
     Merge LoRA for fused gate_up_proj 3D tensor.
-    Supports both formats:
-      - Transposed (GPT-OSS): (E, H, 2*I) with lora_A (E*R, H), lora_B (2*I, E*R)
-      - Standard (Gemma4):    (E, 2*I, H) with lora_A (E*R, H), lora_B (2*I, E*R)
-    is_transposed: if provided, overrides dimension-based heuristic (needed when dims are equal).
+    GPT-OSS: (E, H, 2*I) transposed; Gemma4: (E, 2*I, H) standard.
     """
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:
@@ -1265,10 +1257,7 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
 def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_transposed=None):
     """
     Merge LoRA for fused down_proj 3D tensor.
-    Supports both formats:
-      - Transposed (GPT-OSS): (E, H, I) with lora_A (E*R, I), lora_B (H, E*R)
-      - Standard (Gemma4):    (E, H, I) with lora_A (E*R, H), lora_B (I, E*R)
-    is_transposed: if provided, overrides dimension-based heuristic (needed when H==I).
+    GPT-OSS: (E, H, I) transposed; Gemma4: (E, H, I) standard.
     """
     try:
         if lora_stats.lora_A is None or lora_stats.lora_B is None:

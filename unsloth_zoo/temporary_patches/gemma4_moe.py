@@ -22,6 +22,10 @@ from .utils import patch_function, raise_error, logger
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
+    _extract_lora_from_wrapper,
+    _has_lora_adapters,
+    _should_use_separated_lora,
+    _get_lora_wrapper_for_param,
 )
 
 
@@ -33,7 +37,6 @@ def patch_gemma4_moe():
     # Patch PEFT ParamWrapper for separated LoRA weights
     patch_param_wrapper_for_moe()
 
-    # Try to import Gemma4 MoE classes
     try:
         from transformers.models.gemma4.modeling_gemma4 import (
             Gemma4TextMoEBlock,
@@ -42,7 +45,6 @@ def patch_gemma4_moe():
     except Exception:
         return  # Gemma4 not available in this transformers version
 
-    # Check if already patched
     if hasattr(Gemma4TextMoEBlock, "_unsloth_already_patched"):
         return
 
@@ -66,11 +68,30 @@ def patch_gemma4_moe():
             # Non-persistent buffer keeps _init_weights happy without appearing in state_dict
             moe_block.register_buffer("per_expert_scale", torch.ones(config.num_experts), persistent=False)
             object.__setattr__(moe_block, "_router_ref", self.router)
+            object.__setattr__(moe_block, "_unsloth_decoder_layer_ref", self)
 
     Gemma4TextDecoderLayer.__init__ = _patched_decoder_init
 
-    # Gemma4 uses standard F.linear format (E, out_dim, in_dim), same as Qwen3MoE.
-    # The default _extract_lora_from_wrapper handles this correctly — no custom extractor needed.
+    # ====================================================================
+    # LoRA extraction for Gemma4 (standard F.linear format, but PEFT's
+    # dimension interpretation for 3D params differs from the default).
+    # ====================================================================
+    def _gemma4_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+        total_rank = weight_A.shape[0]
+        rank_per_expert = total_rank // num_experts
+        dim_A = weight_A.shape[1]
+        dim_B = weight_B.shape[0]
+
+        # PEFT ParamWrapper for (E, dim1, dim2) creates:
+        #   lora_A: (E*R, dim1), lora_B: (dim2, E*R)
+        # grouped_mm needs: first (E, dim2, R), second (E, R, dim1)
+        first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
+        first_weight = first_weight.permute(1, 0, 2).contiguous()  # (E, dim_B, R)
+        second_weight = weight_A.view(num_experts, rank_per_expert, dim_A)  # (E, R, dim_A)
+
+        return first_weight, second_weight, scaling, num_experts
+
+    Gemma4TextMoEBlock._unsloth_lora_extractor_fn = staticmethod(_gemma4_lora_extractor)
 
     # ====================================================================
     # Patch Gemma4TextMoEBlock.forward with optimized grouped GEMM backend.
@@ -79,13 +100,45 @@ def patch_gemma4_moe():
     # ====================================================================
     _moe_backend = get_forward_moe_backend()
 
+    def _find_param_wrapper(module):
+        """Walk up a PEFT ParamWrapper chain to find wrappers for each param."""
+        wrappers = {}
+        current = module
+        while hasattr(current, "parameter_name") and hasattr(current, "base_layer"):
+            wrappers[current.parameter_name] = current
+            current = current.base_layer
+        return wrappers
+
     def _gemma4_moe_forward(self, hidden_states, top_k_index, top_k_weights):
         # Fold per_expert_scale into routing weights before grouped_mm
         router_ref = getattr(self, "_router_ref", None)
         if router_ref is not None:
             pes = router_ref.per_expert_scale
             top_k_weights = top_k_weights * pes[top_k_index].to(top_k_weights.dtype)
-        return _moe_backend(self, hidden_states, top_k_index, top_k_weights)
+
+        # self.moe bypasses ParamWrapper (object.__setattr__), so extract
+        # LoRA data manually from the ParamWrapper in _modules["experts"].
+        if _should_use_separated_lora():
+            parent = getattr(self, "_unsloth_decoder_layer_ref", None)
+            if parent is not None:
+                pw = parent._modules.get("experts")
+                if pw is not None and pw is not self:
+                    wrappers = _find_param_wrapper(pw)
+                    for param_name, wrapper in wrappers.items():
+                        if param_name in ("gate_up_proj", "down_proj"):
+                            if not hasattr(wrapper, "num_experts"):
+                                wrapper.num_experts = self.num_experts
+                            lora_data = _extract_lora_from_wrapper(wrapper)
+                            if lora_data is not None:
+                                setattr(self, f"_unsloth_lora_{param_name}", lora_data)
+
+        try:
+            return _moe_backend(self, hidden_states, top_k_index, top_k_weights)
+        finally:
+            # Clean up temporary LoRA data
+            for attr in ("_unsloth_lora_gate_up_proj", "_unsloth_lora_down_proj"):
+                if hasattr(self, attr):
+                    delattr(self, attr)
 
     patch_function(Gemma4TextMoEBlock, "forward", _gemma4_moe_forward, force=True)
 
