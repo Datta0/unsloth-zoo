@@ -105,6 +105,7 @@ _GC_OFFLOAD_BACKENDS = {
     "hooks_prefetch",
     "unsloth_group",
     "unsloth_async",
+    "unsloth_stream",
 }
 # `boundary` is an alias for `noop`: both route via _NoopSaveInputs.setup_context
 # so only the checkpoint-region's input tensors get offloaded (skipping the
@@ -786,6 +787,7 @@ def set_offload_backend(model, backend):
         from .training_utils import (
             _install_hook_based_offload_wrapper,
             _install_unsloth_async_offload_wrapper,
+            _install_unsloth_stream_offload_wrapper,
             _remove_hook_based_offload_wrapper,
         )
         dtype = getattr(getattr(model, "config", None), "torch_dtype", None)
@@ -793,6 +795,8 @@ def set_offload_backend(model, backend):
             _install_hook_based_offload_wrapper(model, dtype)
         elif (not use_reentrant) and backend == "unsloth_async":
             _install_unsloth_async_offload_wrapper(model, dtype)
+        elif (not use_reentrant) and backend == "unsloth_stream":
+            _install_unsloth_stream_offload_wrapper(model, dtype)
         else:
             _remove_hook_based_offload_wrapper(model)
     except Exception:
@@ -2817,6 +2821,340 @@ class UnslothActivationWindowScheduler:
             self.staged_window_count = 0
 
 
+class _UnslothHostActivation:
+    """Pinned host slot for one stashed activation tensor."""
+
+    __slots__ = (
+        "host_tensor",
+        "device",
+        "device_tensor",
+        "host_ready_event",
+        "device_ready_event",
+    )
+
+    def __init__(self, host_tensor, device, host_ready_event=None):
+        self.host_tensor = host_tensor
+        self.device = device
+        self.device_tensor = None
+        self.host_ready_event = host_ready_event
+        self.device_ready_event = None
+
+
+class UnslothStreamActivationScheduler:
+    """Layer-window scheduler with direct pinned-host activation staging."""
+
+    def __init__(self, num_host_windows, num_layer_windows):
+        self.num_host_windows = max(0, int(num_host_windows))
+        self.num_layer_windows = max(1, int(num_layer_windows))
+        self.parameter_storage = set()
+        self._parameter_storage_cache = {}
+        self._d2h_streams = {}
+        self._h2d_streams = {}
+        self.clone_boundary_layers = set()
+        self.clone_boundary_output = False
+        self.reset_step_windows()
+
+        self.forward_window_map = {}
+        constant = 0
+        for i in range(self.num_host_windows):
+            self.forward_window_map[i] = ((self.num_layer_windows // self.num_host_windows) * (i + 1)) - 1
+            if i < (self.num_layer_windows % self.num_host_windows):
+                self.forward_window_map[i] += i + 1
+                constant = i + 1
+            else:
+                self.forward_window_map[i] += constant
+
+    def reset_step_windows(self):
+        self.current_window = 0
+        self.tensor_count_current_window = 0
+        self.ticket_state = {}
+        self.device_hold_refs = {}
+        self.host_windows = {}
+        self.active_windows = set()
+        self.staged_window_count = 0
+
+    def update_model_parameters(self, module):
+        cache_key = id(module)
+        cached = self._parameter_storage_cache.get(cache_key)
+        if cached is not None:
+            self.parameter_storage = cached
+            return
+
+        storage = set()
+        try:
+            params = module.parameters()
+        except Exception:
+            params = ()
+        for param in params:
+            try:
+                tensor = _unwrap_dtensor(param.data)
+                storage.add(tensor.untyped_storage().data_ptr())
+            except Exception:
+                pass
+        self.parameter_storage = storage
+        self._parameter_storage_cache[cache_key] = storage
+
+    def _cuda_stream(self, cache, device):
+        if DEVICE_TYPE not in ("cuda", "hip"):
+            return None
+        if getattr(device, "type", None) not in ("cuda", "hip"):
+            return None
+        try:
+            device_index = device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            stream = cache.get(device_index)
+            if stream is None:
+                with torch.cuda.device(device_index):
+                    stream = torch.cuda.Stream()
+                cache[device_index] = stream
+            return stream
+        except Exception:
+            return None
+
+    def _d2h_stream(self, device):
+        return self._cuda_stream(self._d2h_streams, device)
+
+    def _h2d_stream(self, device):
+        return self._cuda_stream(self._h2d_streams, device)
+
+    def should_stage(self, tensor: torch.Tensor) -> bool:
+        if _gc_disable_cpu_offload():
+            return False
+        tensor = _unwrap_dtensor(tensor)
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
+            if torch.compiler.is_compiling():
+                return False
+        if not torch.is_tensor(tensor):
+            return False
+        if getattr(tensor, "is_meta", False):
+            return False
+        if tensor.numel() < UnslothGradientCheckpointer._minimum_size:
+            return False
+        if tensor.device.type == "cpu":
+            return False
+        if tensor.layout != torch.strided:
+            return False
+        if (not tensor.is_contiguous()) or (tensor.storage_offset() != 0):
+            return False
+        try:
+            if tensor.untyped_storage().data_ptr() in self.parameter_storage:
+                return False
+        except Exception:
+            pass
+        return True
+
+    def stash_tensor(self, tensor: torch.Tensor):
+        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+            _UNSLOTH_STREAM_PUSHES[0] += 1
+        if not self.should_stage(tensor):
+            return tensor
+        try:
+            max_tensors_per_window = int(os.environ.get("UNSLOTH_GC_STREAM_MAX_TENSORS_PER_WINDOW", "1"))
+        except ValueError:
+            max_tensors_per_window = 1
+        if max_tensors_per_window > 0 and self.tensor_count_current_window >= max_tensors_per_window:
+            return tensor
+        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+            _UNSLOTH_STREAM_STASHED_TENSORS[0] += 1
+            _UNSLOTH_STREAM_STAGED_BYTES[0] += int(tensor.numel()) * int(tensor.element_size())
+        self.active_windows.add(self.current_window)
+        tensor_tag = (self.current_window, self.tensor_count_current_window)
+        self.tensor_count_current_window += 1
+        self.ticket_state[tensor_tag] = tensor
+        if self.current_window < self.num_host_windows:
+            self.device_hold_refs[tensor_tag] = tensor
+        return _UnslothActivationTicket(self, tensor_tag)
+
+    def _new_host_tensor(self, tensor):
+        size = tuple(tensor.size())
+        stride = tuple(tensor.stride())
+        try:
+            return torch.empty_strided(
+                size,
+                stride,
+                dtype=tensor.dtype,
+                layout=tensor.layout,
+                device="cpu",
+                pin_memory=True,
+            )
+        except TypeError:
+            host = torch.empty_strided(
+                size,
+                stride,
+                dtype=tensor.dtype,
+                layout=tensor.layout,
+                device="cpu",
+            )
+            return host.pin_memory()
+
+    def _copy_to_host(self, tensor):
+        device = tensor.device
+        stream = self._d2h_stream(device)
+        event = None
+        with torch.no_grad():
+            host = self._new_host_tensor(tensor)
+            if stream is None:
+                host.copy_(tensor, non_blocking=False)
+            else:
+                current_stream = torch.cuda.current_stream(device)
+                stream.wait_stream(current_stream)
+                with torch.cuda.stream(stream):
+                    host.copy_(tensor, non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(stream)
+        return _UnslothHostActivation(host, device, event)
+
+    def _wait_host_ready(self, slot):
+        event = getattr(slot, "host_ready_event", None)
+        if event is None:
+            return
+        if DEVICE_TYPE not in ("cuda", "hip"):
+            return
+        try:
+            torch.cuda.current_stream(slot.device).wait_event(event)
+        except Exception:
+            pass
+
+    def _restore_slot_to_device(self, slot):
+        if slot.device_tensor is not None:
+            return False
+        stream = self._h2d_stream(slot.device)
+        with torch.no_grad():
+            if stream is None:
+                if slot.host_tensor is None:
+                    return False
+                slot.device_tensor = slot.host_tensor.to(slot.device, non_blocking=False)
+                return True
+            current_stream = torch.cuda.current_stream(slot.device)
+            stream.wait_stream(current_stream)
+            if slot.host_ready_event is not None:
+                try:
+                    stream.wait_event(slot.host_ready_event)
+                except Exception:
+                    pass
+            with torch.cuda.stream(stream):
+                if slot.host_tensor is None:
+                    return False
+                restored = torch.empty_strided(
+                    tuple(slot.host_tensor.size()),
+                    tuple(slot.host_tensor.stride()),
+                    dtype=slot.host_tensor.dtype,
+                    layout=slot.host_tensor.layout,
+                    device=slot.device,
+                )
+                restored.copy_(slot.host_tensor, non_blocking=True)
+                slot.device_tensor = restored
+                slot.device_ready_event = torch.cuda.Event()
+                slot.device_ready_event.record(stream)
+            current_stream.wait_event(slot.device_ready_event)
+        return True
+
+    def _view_slot(self, slot, shape, stride, requires_grad, dtype):
+        if slot.device_tensor is None:
+            self._restore_slot_to_device(slot)
+        result = slot.device_tensor
+        if result is None:
+            raise RuntimeError("Unsloth: staged activation was requested before device restore completed")
+        if tuple(result.shape) != tuple(shape):
+            result = result.view(shape)
+        if tuple(result.stride()) != tuple(stride):
+            result = result.as_strided(shape, stride)
+        if result.dtype != dtype:
+            result = result.to(dtype)
+        return result
+
+    def restore_tensor(self, token):
+        if not isinstance(token, _UnslothActivationTicket):
+            return token
+        state = self.ticket_state.pop(token.tag)
+        self.device_hold_refs.pop(token.tag, None)
+        if isinstance(state, tuple) and len(state) == 6 and state[0] == "slot":
+            _, slot, shape, stride, requires_grad, dtype = state
+            return self._view_slot(slot, shape, stride, requires_grad, dtype)
+        return state
+
+    def stage_window_to_host(self, window_index):
+        if window_index in self.host_windows:
+            return
+        staged = {}
+        for tensor_tag, state in list(self.ticket_state.items()):
+            group_id, _ = tensor_tag
+            if group_id != window_index or not torch.is_tensor(state):
+                continue
+            key = _get_unique_tensor_key(state)
+            slot = staged.get(key)
+            if slot is None:
+                slot = self._copy_to_host(state)
+                staged[key] = slot
+            self.ticket_state[tensor_tag] = (
+                "slot",
+                slot,
+                state.shape,
+                state.stride(),
+                state.requires_grad,
+                state.dtype,
+            )
+        self.host_windows[window_index] = staged
+        if staged and os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+            _UNSLOTH_STREAM_STAGED_WINDOWS[0] += 1
+            _UNSLOTH_STREAM_STAGED_TENSORS[0] += len(staged)
+
+    def advance_forward_window(self, current_window):
+        if self.num_host_windows <= 0 or self.staged_window_count >= self.num_host_windows:
+            return
+        if current_window == 0:
+            self.stage_window_to_host(current_window)
+        if self.forward_window_map.get(self.staged_window_count) == current_window:
+            for slot in self.host_windows.get(self.staged_window_count, {}).values():
+                self._wait_host_ready(slot)
+            for tensor_tag in list(self.device_hold_refs.keys()):
+                if tensor_tag[0] == self.staged_window_count:
+                    self.device_hold_refs[tensor_tag] = None
+            if self.staged_window_count < (self.num_host_windows - 1):
+                self.stage_window_to_host(self.staged_window_count + 1)
+            self.staged_window_count += 1
+
+    def restore_window_to_device(self, window_index):
+        mapping = self.host_windows.pop(window_index, None)
+        if not mapping:
+            return
+        restored = 0
+        for slot in mapping.values():
+            if self._restore_slot_to_device(slot):
+                restored += 1
+        if restored and os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+            _UNSLOTH_STREAM_RESTORED_WINDOWS[0] += 1
+            _UNSLOTH_STREAM_RESTORED_TENSORS[0] += restored
+
+    def seal_forward_region(self):
+        if self.current_window not in self.active_windows:
+            return
+        self.active_windows.discard(self.current_window)
+        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+            _UNSLOTH_STREAM_BOUNDARIES[0] += 1
+        self.advance_forward_window(self.current_window)
+        self.current_window += 1
+        self.tensor_count_current_window = 0
+
+    def rewind_for_backward_region(self):
+        self.current_window -= 1
+        if self.current_window < 0:
+            self.current_window = 0
+            return
+        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+            _UNSLOTH_STREAM_BACKWARD_BOUNDARIES[0] += 1
+        if self.num_host_windows <= 0 or self.staged_window_count <= 0:
+            return
+        idx = self.staged_window_count - 1
+        if self.forward_window_map.get(idx) == self.current_window:
+            self.restore_window_to_device(idx)
+            self.staged_window_count -= 1 if self.staged_window_count > 1 else 0
+        if self.current_window == 0:
+            self.host_windows.clear()
+            self.staged_window_count = 0
+
+
 class _UnslothActivationSaveScope(torch.autograd.graph.saved_tensors_hooks):
     """Saved-tensor hooks that route tensors through an Unsloth stash."""
 
@@ -3280,21 +3618,29 @@ def _install_eager_prefetch_hook(outputs, cls):
         pass
 
 
-def _resolve_unsloth_async_scheduler_from_checkpoint_function(function):
+def _resolve_unsloth_scheduler_from_checkpoint_function(function, attr_name):
     bound_module = getattr(function, "__self__", None)
-    scheduler = getattr(bound_module, "_unsloth_async_scheduler", None)
+    scheduler = getattr(bound_module, attr_name, None)
     if scheduler is not None:
         return scheduler, bound_module
     inner = getattr(function, "func", None)
     if inner is not None and inner is not function:
-        inner_scheduler, inner_module = _resolve_unsloth_async_scheduler_from_checkpoint_function(inner)
+        inner_scheduler, inner_module = _resolve_unsloth_scheduler_from_checkpoint_function(inner, attr_name)
         if inner_scheduler is not None:
             return inner_scheduler, inner_module
     for arg in getattr(function, "args", ()) or ():
-        scheduler = getattr(arg, "_unsloth_async_scheduler", None)
+        scheduler = getattr(arg, attr_name, None)
         if scheduler is not None:
             return scheduler, arg
     return None, bound_module
+
+
+def _resolve_unsloth_async_scheduler_from_checkpoint_function(function):
+    return _resolve_unsloth_scheduler_from_checkpoint_function(function, "_unsloth_async_scheduler")
+
+
+def _resolve_unsloth_stream_scheduler_from_checkpoint_function(function):
+    return _resolve_unsloth_scheduler_from_checkpoint_function(function, "_unsloth_stream_scheduler")
 
 
 def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
@@ -3318,11 +3664,12 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
     old_checkpoint = getattr(torch.utils.checkpoint, "_old_checkpoint", None)
     original_checkpoint = old_checkpoint or torch.utils.checkpoint.checkpoint
 
-    if _gc_disable_cpu_offload() or offload_backend in ("hooks", "hooks_prefetch", "unsloth_group", "unsloth_async"):
+    if _gc_disable_cpu_offload() or offload_backend in ("hooks", "hooks_prefetch", "unsloth_group", "unsloth_async", "unsloth_stream"):
         token = None
         is_hooks = offload_backend in ("hooks", "hooks_prefetch")
         is_unsloth_group = offload_backend == "unsloth_group"
         is_unsloth_async = offload_backend == "unsloth_async"
+        is_unsloth_stream = offload_backend == "unsloth_stream"
         # Opt-in: when UNSLOTH_GC_BOUNCE=1 is set on the `hooks` backend AND
         # prefetch is explicitly requested via UNSLOTH_GC_PREFETCH_DEPTH>0 or
         # UNSLOTH_GC_EAGER_PREFETCH=1, route bounce through the prefetch
@@ -3415,6 +3762,48 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
                     debug=debug,
                     **kwargs
                 )
+            if is_unsloth_stream and not _gc_disable_cpu_offload():
+                scheduler, bound_module = _resolve_unsloth_stream_scheduler_from_checkpoint_function(function)
+                if (
+                    os.environ.get("UNSLOTH_GC_TRACE_STREAM", "") in ("1", "true", "True")
+                    and not getattr(_unsloth_checkpoint_nonreentrant, "_unsloth_stream_dbg", False)
+                ):
+                    _unsloth_checkpoint_nonreentrant._unsloth_stream_dbg = True
+                    print(
+                        f"[unsloth_stream] checkpoint boundary function={type(function)} "
+                        f"bound_module={type(bound_module)} scheduler={'yes' if scheduler is not None else 'no'}",
+                        flush=True,
+                    )
+                if scheduler is not None:
+                    if bound_module is not None:
+                        scheduler.update_model_parameters(bound_module)
+                        scheduler.clone_boundary_output = (
+                            getattr(bound_module, "_unsloth_stream_layer_idx", -1)
+                            in getattr(scheduler, "clone_boundary_layers", set())
+                        )
+                    checkpoint_group = scheduler.current_window
+                    with _UnslothActivationSaveScope(scheduler):
+                        outputs = original_checkpoint(
+                            function, *args,
+                            use_reentrant=False,
+                            preserve_rng_state=preserve,
+                            context_fn=context_fn,
+                            determinism_check=determinism_check,
+                            debug=debug,
+                            **kwargs
+                        )
+                    if checkpoint_group in scheduler.active_windows:
+                        return _attach_activation_boundary(outputs, scheduler)
+                    return outputs
+                return original_checkpoint(
+                    function, *args,
+                    use_reentrant=False,
+                    preserve_rng_state=preserve,
+                    context_fn=context_fn,
+                    determinism_check=determinism_check,
+                    debug=debug,
+                    **kwargs
+                )
             if is_hooks and not _gc_disable_cpu_offload():
                 with UnslothOffloadActivations(dtype=dtype):
                     outputs = original_checkpoint(
@@ -3493,6 +3882,15 @@ _UNSLOTH_ASYNC_RELOAD_GROUPS = [0]
 _UNSLOTH_ASYNC_RESTORE_TENSORS = [0]
 _UNSLOTH_ASYNC_PUSHES = [0]
 _UNSLOTH_ASYNC_OFFLOADABLE_PUSHES = [0]
+_UNSLOTH_STREAM_BOUNDARIES = [0]
+_UNSLOTH_STREAM_BACKWARD_BOUNDARIES = [0]
+_UNSLOTH_STREAM_PUSHES = [0]
+_UNSLOTH_STREAM_STASHED_TENSORS = [0]
+_UNSLOTH_STREAM_STAGED_WINDOWS = [0]
+_UNSLOTH_STREAM_RESTORED_WINDOWS = [0]
+_UNSLOTH_STREAM_STAGED_TENSORS = [0]
+_UNSLOTH_STREAM_RESTORED_TENSORS = [0]
+_UNSLOTH_STREAM_STAGED_BYTES = [0]
 _UNSLOTH_CHECKPOINT_HIT_REPORTED = [False]
 
 def _report_checkpoint_hit_count():
@@ -3526,7 +3924,16 @@ def _report_checkpoint_hit_count():
             f"unsloth_async_reload_groups={_UNSLOTH_ASYNC_RELOAD_GROUPS[0]} "
             f"unsloth_async_restore_tensors={_UNSLOTH_ASYNC_RESTORE_TENSORS[0]} "
             f"unsloth_async_pushes={_UNSLOTH_ASYNC_PUSHES[0]} "
-            f"unsloth_async_offloadable_pushes={_UNSLOTH_ASYNC_OFFLOADABLE_PUSHES[0]}",
+            f"unsloth_async_offloadable_pushes={_UNSLOTH_ASYNC_OFFLOADABLE_PUSHES[0]} "
+            f"unsloth_stream_boundaries={_UNSLOTH_STREAM_BOUNDARIES[0]} "
+            f"unsloth_stream_backward_boundaries={_UNSLOTH_STREAM_BACKWARD_BOUNDARIES[0]} "
+            f"unsloth_stream_pushes={_UNSLOTH_STREAM_PUSHES[0]} "
+            f"unsloth_stream_stashed_tensors={_UNSLOTH_STREAM_STASHED_TENSORS[0]} "
+            f"unsloth_stream_staged_windows={_UNSLOTH_STREAM_STAGED_WINDOWS[0]} "
+            f"unsloth_stream_restored_windows={_UNSLOTH_STREAM_RESTORED_WINDOWS[0]} "
+            f"unsloth_stream_staged_tensors={_UNSLOTH_STREAM_STAGED_TENSORS[0]} "
+            f"unsloth_stream_restored_tensors={_UNSLOTH_STREAM_RESTORED_TENSORS[0]} "
+            f"unsloth_stream_staged_MiB={_UNSLOTH_STREAM_STAGED_BYTES[0]/1024/1024:.1f}",
             flush=True,
         )
 

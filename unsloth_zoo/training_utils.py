@@ -34,6 +34,7 @@ from .gradient_checkpointing import (
     _bind_gradient_checkpointing_func,
     UnslothOffloadActivations,
     UnslothActivationWindowScheduler,
+    UnslothStreamActivationScheduler,
     UnslothGradientCheckpointer,
     _hooks_offload_state,
     resolve_gc_offload_backend,
@@ -89,6 +90,18 @@ def _remove_hook_based_offload_wrapper(model):
         delattr(model, "_unsloth_async_wrapped_layers")
     if hasattr(model, "_unsloth_async_scheduler"):
         delattr(model, "_unsloth_async_scheduler")
+    for layer in getattr(model, "_unsloth_stream_layers", []):
+        try:
+            if hasattr(layer, "_unsloth_stream_scheduler"):
+                delattr(layer, "_unsloth_stream_scheduler")
+            if hasattr(layer, "_unsloth_stream_layer_idx"):
+                delattr(layer, "_unsloth_stream_layer_idx")
+        except Exception:
+            pass
+    if hasattr(model, "_unsloth_stream_layers"):
+        delattr(model, "_unsloth_stream_layers")
+    if hasattr(model, "_unsloth_stream_scheduler"):
+        delattr(model, "_unsloth_stream_scheduler")
     target = getattr(model, "_unsloth_offload_wrapper_target", None)
     original_forward = getattr(model, "_unsloth_offload_original_forward", None)
     if target is not None and original_forward is not None:
@@ -195,6 +208,52 @@ def _install_unsloth_async_offload_wrapper(model, dtype):
     model._unsloth_async_scheduler = scheduler
     model._unsloth_async_layers = async_layers
     model._unsloth_offload_forward_installed = False
+
+
+def _install_unsloth_stream_offload_wrapper(model, dtype):
+    _remove_hook_based_offload_wrapper(model)
+    layers = _find_transformer_layers(model)
+    if not layers:
+        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+            print("[unsloth_stream] no transformer layers found; falling back to no wrapper", flush=True)
+        return
+    if not UnslothGradientCheckpointer._initialized:
+        UnslothGradientCheckpointer.initialize(dtype)
+    try:
+        skip_last_groups = max(1, int(os.environ.get("UNSLOTH_GC_STREAM_SKIP_LAST_WINDOWS", "2")))
+    except ValueError:
+        skip_last_groups = 2
+    scheduler = UnslothStreamActivationScheduler(
+        num_host_windows=max(0, len(layers) - skip_last_groups),
+        num_layer_windows=len(layers),
+    )
+    config = getattr(model, "config", None)
+    is_vlm = bool(
+        getattr(config, "vision_config", None) is not None
+        or "vl" in str(getattr(config, "model_type", "") or "").lower()
+        or "vision" in type(model).__name__.lower()
+    )
+    deepstack_indexes = getattr(getattr(config, "vision_config", None), "deepstack_visual_indexes", None)
+    deepstack_count = len(deepstack_indexes or []) if is_vlm else 0
+    scheduler.clone_boundary_layers = set(range(deepstack_count))
+    scheduler.clone_boundary_output = False
+    if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+        print(
+            f"[unsloth_stream] installing layer-level stream wrapper layers={len(layers)} "
+            f"host_windows={max(0, len(layers) - skip_last_groups)}",
+            flush=True,
+        )
+
+    stream_layers = []
+    for layer_idx, layer in enumerate(layers):
+        layer._unsloth_stream_scheduler = scheduler
+        layer._unsloth_stream_layer_idx = layer_idx
+        stream_layers.append(layer)
+
+    model._unsloth_stream_scheduler = scheduler
+    model._unsloth_stream_layers = stream_layers
+    model._unsloth_offload_forward_installed = False
+
 
 @torch.inference_mode
 def fix_zero_training_loss(model, tokenizer, train_dataset):
@@ -434,6 +493,8 @@ def prepare_model_for_training(
             _install_hook_based_offload_wrapper(model, dtype)
         elif (not effective_reentrant) and offload_backend == "unsloth_async":
             _install_unsloth_async_offload_wrapper(model, dtype)
+        elif (not effective_reentrant) and offload_backend == "unsloth_stream":
+            _install_unsloth_stream_offload_wrapper(model, dtype)
         else:
             _remove_hook_based_offload_wrapper(model)
     else:
