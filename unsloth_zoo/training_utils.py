@@ -16,6 +16,7 @@
 
 import torch
 import math
+import functools
 import datasets
 from transformers import set_seed as transformers_set_seed
 from transformers import get_scheduler as transformers_get_scheduler
@@ -23,12 +24,19 @@ from transformers import Trainer
 from transformers.trainer_utils import seed_worker as trainer_utils_seed_worker
 from tqdm import tqdm as ProgressBar
 import time
-from typing import Any, Optional, List, Dict, Tuple
+from typing import Any, Optional
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
+    patch_unsloth_smart_gradient_checkpointing,
+    _bind_gradient_checkpointing_func,
+    UnslothOffloadActivations,
+    UnslothActivationWindowScheduler,
+    UnslothGradientCheckpointer,
+    _hooks_offload_state,
+    resolve_gc_offload_backend,
 )
 import os
 import re
@@ -37,8 +45,156 @@ __all__ = [
     "fix_zero_training_loss",
     "unsloth_train",
     "prepare_model_for_training",
+    "maybe_enable_trl_activation_offloading",
+    "configure_activation_offloading_checkpointing",
 ]
 
+
+# Backward-compat no-op shims for callers that import the old TRL
+# activation-offloading entry points. The non-reentrant Mode A / Mode B
+# backends supersede them; these remain so `unsloth.models.rl` imports don't
+# break for installations that haven't picked up the companion unsloth-side PR.
+def maybe_enable_trl_activation_offloading(trainer = None, *args, **kwargs):
+    return None
+
+
+def configure_activation_offloading_checkpointing(*args, **kwargs):
+    return None
+
+
+def _resolve_offload_wrapper_target(model):
+    inner_model = model
+    while hasattr(inner_model, "model"):
+        inner_model = inner_model.model
+    return inner_model
+
+
+def _remove_hook_based_offload_wrapper(model):
+    for layer in getattr(model, "_unsloth_async_layers", []):
+        try:
+            if hasattr(layer, "_unsloth_async_scheduler"):
+                delattr(layer, "_unsloth_async_scheduler")
+        except Exception:
+            pass
+    if hasattr(model, "_unsloth_async_layers"):
+        delattr(model, "_unsloth_async_layers")
+    for layer, original_forward in getattr(model, "_unsloth_async_wrapped_layers", []):
+        try:
+            layer.forward = original_forward
+            if hasattr(layer, "_unsloth_async_scheduler"):
+                delattr(layer, "_unsloth_async_scheduler")
+        except Exception:
+            pass
+    if hasattr(model, "_unsloth_async_wrapped_layers"):
+        delattr(model, "_unsloth_async_wrapped_layers")
+    if hasattr(model, "_unsloth_async_scheduler"):
+        delattr(model, "_unsloth_async_scheduler")
+    target = getattr(model, "_unsloth_offload_wrapper_target", None)
+    original_forward = getattr(model, "_unsloth_offload_original_forward", None)
+    if target is not None and original_forward is not None:
+        target.forward = original_forward
+    if hasattr(model, "_unsloth_offload_wrapper_target"):
+        delattr(model, "_unsloth_offload_wrapper_target")
+    if hasattr(model, "_unsloth_offload_original_forward"):
+        delattr(model, "_unsloth_offload_original_forward")
+    if hasattr(model, "_unsloth_offload_ctx"):
+        delattr(model, "_unsloth_offload_ctx")
+    model._unsloth_offload_forward_installed = False
+
+
+def _find_transformer_layers(model):
+    target = _resolve_offload_wrapper_target(model)
+    candidates = []
+    stack = [target]
+    seen = set()
+    while stack:
+        module = stack.pop()
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+        layers = getattr(module, "layers", None)
+        if isinstance(layers, torch.nn.ModuleList) and len(layers) >= 2:
+            candidates.append(layers)
+        for child in module.children():
+            stack.append(child)
+    if candidates:
+        return list(max(candidates, key=len))
+    return []
+
+
+def _install_hook_based_offload_wrapper(model, dtype):
+    _remove_hook_based_offload_wrapper(model)
+    target = _resolve_offload_wrapper_target(model)
+    current_target = getattr(model, "_unsloth_offload_wrapper_target", None)
+    if current_target is not None and current_target is not target:
+        _remove_hook_based_offload_wrapper(model)
+
+    if getattr(model, "_unsloth_offload_forward_installed", False):
+        return
+
+    offload_ctx = UnslothOffloadActivations(dtype=dtype)
+    original_forward = target.forward
+
+    @functools.wraps(original_forward)
+    def _offloading_forward(*args, **kwargs):
+        if target.training:
+            with offload_ctx:
+                return original_forward(*args, **kwargs)
+        return original_forward(*args, **kwargs)
+
+    target.forward = _offloading_forward
+    model._unsloth_offload_ctx = offload_ctx
+    model._unsloth_offload_original_forward = original_forward
+    model._unsloth_offload_wrapper_target = target
+    model._unsloth_offload_forward_installed = True
+
+
+def _install_unsloth_async_offload_wrapper(model, dtype):
+    _remove_hook_based_offload_wrapper(model)
+    layers = _find_transformer_layers(model)
+    if not layers:
+        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+            print("[unsloth_async] no transformer layers found; falling back to no wrapper", flush=True)
+        return
+    cls = UnslothGradientCheckpointer
+    if not cls._initialized:
+        cls.initialize(dtype)
+    offloader = cls.begin_checkpoint(dtype)
+    try:
+        skip_last_groups = max(1, int(os.environ.get("UNSLOTH_GC_ASYNC_SKIP_LAST_GROUPS", "2")))
+    except ValueError:
+        skip_last_groups = 2
+    scheduler = UnslothActivationWindowScheduler(
+        offloader,
+        num_host_windows=max(0, len(layers) - skip_last_groups),
+        num_layer_windows=len(layers),
+    )
+    config = getattr(model, "config", None)
+    is_vlm = bool(
+        getattr(config, "vision_config", None) is not None
+        or "vl" in str(getattr(config, "model_type", "") or "").lower()
+        or "vision" in type(model).__name__.lower()
+    )
+    deepstack_indexes = getattr(getattr(config, "vision_config", None), "deepstack_visual_indexes", None)
+    deepstack_count = len(deepstack_indexes or []) if is_vlm else 0
+    scheduler.clone_boundary_layers = set(range(deepstack_count))
+    scheduler.clone_boundary_output = False
+    if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+        print(
+            f"[unsloth_async] installing layer-level async wrapper layers={len(layers)} "
+            f"offload_groups={max(0, len(layers) - skip_last_groups)}",
+            flush=True,
+        )
+
+    async_layers = []
+    for layer_idx, layer in enumerate(layers):
+        layer._unsloth_async_scheduler = scheduler
+        layer._unsloth_async_layer_idx = layer_idx
+        async_layers.append(layer)
+
+    model._unsloth_async_scheduler = scheduler
+    model._unsloth_async_layers = async_layers
+    model._unsloth_offload_forward_installed = False
 
 @torch.inference_mode
 def fix_zero_training_loss(model, tokenizer, train_dataset):
@@ -200,18 +356,32 @@ def prepare_model_for_training(
     if use_gradient_checkpointing != "unsloth":
         unpatch_unsloth_gradient_checkpointing()
         unpatch_unsloth_smart_gradient_checkpointing()
+
+    def _enable_gc(_module):
+        if not hasattr(_module, "gradient_checkpointing_enable"):
+            return
+        try:
+            _module.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": use_reentrant},
+            )
+            return
+        except TypeError:
+            # Older HF signatures might not accept kwargs; fall back.
+            pass
+        _module.gradient_checkpointing_enable()
+
     m = model
     while hasattr(m, "model"):
         if use_gradient_checkpointing == "unsloth":
             m._offloaded_gradient_checkpointing = True
         if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-            m.gradient_checkpointing_enable()
+            _enable_gc(m)
         m = m.model
     pass
     if use_gradient_checkpointing == "unsloth":
         m._offloaded_gradient_checkpointing = True
     if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-        m.gradient_checkpointing_enable()
+        _enable_gc(m)
 
     # Also set HF version manually to stop failures
     if hasattr(model, "_set_gradient_checkpointing"):
@@ -223,8 +393,68 @@ def prepare_model_for_training(
                 if hasattr(module, "gradient_checkpointing"):
                     module.gradient_checkpointing = False
 
-    # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
-    if use_reentrant:
+    # HF caches checkpoint callables on modules; rebind to the active one so
+    # mode switches and monkey patches apply consistently. Only the "unsloth"
+    # path rewires the module-level `_gradient_checkpointing_func`; when
+    # `use_gradient_checkpointing == True` the caller has asked for vanilla
+    # PyTorch checkpointing via HF's `gradient_checkpointing_enable` above, so
+    # leave the per-module function alone and strip any prior unsloth offload
+    # wrapper / attribute so benchmarks isolate the native path.
+    if use_gradient_checkpointing == "unsloth":
+        # Activate the smart-checkpoint dispatcher so torch.utils.checkpoint.checkpoint
+        # routes through `_unsloth_checkpoint_nonreentrant`. Without this, HF Trainer's
+        # `_activate_gradient_checkpointing` rebinds module-level _gradient_checkpointing_func
+        # to vanilla `functools.partial(torch.utils.checkpoint.checkpoint, ...)` and the
+        # `_hooks_offload_state` ContextVar that gates `UnslothOffloadActivations._pack_hook`
+        # never gets set, so CPU offload silently no-ops. Historically only
+        # `FastLanguageModel.from_pretrained` activated this; consumers of
+        # `prepare_model_for_training` directly (custom AutoModelForCausalLM flows,
+        # the FSDP2 backend matrix benches) silently lost the offload mechanism.
+        try:
+            patch_unsloth_smart_gradient_checkpointing(
+                dtype=dtype,
+                use_reentrant=use_reentrant,
+            )
+        except Exception:
+            pass
+
+        checkpoint_fn = torch.utils.checkpoint.checkpoint
+        context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+        effective_reentrant = getattr(model, "_unsloth_use_reentrant", None)
+        if type(effective_reentrant) is not bool:
+            effective_reentrant = bool(use_reentrant)
+        offload_backend = getattr(model, "_unsloth_gc_offload_backend", None)
+        offload_backend = resolve_gc_offload_backend(offload_backend)
+        model._unsloth_gc_offload_backend = offload_backend
+        _bind_gradient_checkpointing_func(
+            model, checkpoint_fn, effective_reentrant, context_fn, offload_backend,
+        )
+
+        if (not effective_reentrant) and offload_backend == "hooks":
+            _install_hook_based_offload_wrapper(model, dtype)
+        elif (not effective_reentrant) and offload_backend == "unsloth_async":
+            _install_unsloth_async_offload_wrapper(model, dtype)
+        else:
+            _remove_hook_based_offload_wrapper(model)
+    else:
+        _remove_hook_based_offload_wrapper(model)
+        if use_gradient_checkpointing is True and hasattr(model, "_unsloth_gc_offload_backend"):
+            # Native path: drop the unsloth offload attribute so downstream
+            # fallbacks (e.g. `_default_offload_backend`, env-var lookup in
+            # `_unsloth_checkpoint_nonreentrant`) don't accidentally apply an
+            # unsloth offload backend to a user requesting vanilla GC.
+            try:
+                delattr(model, "_unsloth_gc_offload_backend")
+            except Exception:
+                model._unsloth_gc_offload_backend = None
+
+    # Non-reentrant torch.utils.checkpoint.checkpoint needs the saved-tensor
+    # graph to anchor on a tensor with requires_grad=True to trigger its
+    # recompute path. With LoRA (frozen base weights) the embedding output has
+    # requires_grad=False, so without this call the checkpoint hooks don't
+    # activate and activations stay resident (silently disabling GC). This was
+    # only called for reentrant previously, matching historical assumptions.
+    if use_gradient_checkpointing in (True, "unsloth"):
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         else:
@@ -444,6 +674,7 @@ def unsloth_train(trainer):
     if leftover_samples == 0: leftover_ga = ga
 
     logging_steps = training_args.logging_steps
+
     # Go through each epoch
     start_time = time.time()
     with ProgressBar(total = max_steps, dynamic_ncols = True) as progress_bar:
