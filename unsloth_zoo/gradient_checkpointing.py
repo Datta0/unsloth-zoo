@@ -17,23 +17,18 @@
 import torch
 import numpy as np
 import functools
-from typing import Union, Optional, List, Any, Callable, Tuple
+from typing import Union, Optional, List, Any, Tuple
 import os
 import warnings
 import gc
-import weakref
 import time
 import atexit
 from collections import defaultdict
 from contextvars import ContextVar
 from .utils import _get_dtype, Version
 from .device_type import (
-    is_hip,
-    get_device_type,
     DEVICE_TYPE,
     DEVICE_TYPE_TORCH,
-    DEVICE_COUNT,
-    ALLOW_PREQUANTIZED_MODELS,
 )
 
 __all__ = [
@@ -89,11 +84,6 @@ _GC_OFFLOAD_BACKENDS = {
 # Release backend surface: `unsloth_original` preserves the normal Unsloth
 # checkpointing path; `unsloth_stream` is the supported activation-offload
 # backend for both non-reentrant and reentrant stream checkpointing.
-# Ring slot count for prefetch-capable unpack. Must be strictly greater than
-# the max prefetch depth you intend to use; with depth D the prefetch of K+D
-# runs while main_stream is still consuming slot K, so we need at least D+1
-# distinct slots to avoid aliasing. Override via UNSLOTH_GC_PREFETCH_RING_SIZE.
-_GC_PREFETCH_RING_SIZE = int(os.environ.get("UNSLOTH_GC_PREFETCH_RING_SIZE", "4"))
 _gc_profile_module: ContextVar[Optional[str]] = ContextVar("_gc_profile_module", default=None)
 _gc_profile_enabled_cache: Optional[bool] = None
 _gc_profile_registered = False
@@ -103,9 +93,6 @@ _gc_profile_state = {
     "module_stats": defaultdict(lambda: defaultdict(float)),
     "shape_stats": defaultdict(lambda: defaultdict(float)),
     "bucket_stats": defaultdict(lambda: defaultdict(float)),
-    "skip_reasons": defaultdict(int),
-    "cuda_wait_events": [],
-    "cuda_wait_events_finalized": False,
 }
 
 
@@ -177,12 +164,6 @@ def _gc_profile_ensure(mode: str) -> bool:
         atexit.register(_gc_profile_dump_summary)
         _gc_profile_registered = True
     return True
-
-
-def _gc_profile_record_skip(reason: str) -> None:
-    if not _gc_profile_enabled():
-        return
-    _gc_profile_state["skip_reasons"][reason] += 1
 
 
 def _gc_profile_record(
@@ -260,59 +241,6 @@ def _gc_profile_record(
         bucket_stats[f"{kind}_not_ready_count"] += 1
 
 
-def _gc_profile_record_cuda_wait(
-    *,
-    mode: str,
-    module_name: str,
-    shape,
-    dtype,
-    numel: int,
-    kind: str,
-    start_event,
-    end_event,
-    ready_at_wait: Optional[bool],
-) -> None:
-    if not _gc_profile_ensure(mode):
-        return
-    _gc_profile_state["cuda_wait_events"].append({
-        "mode": mode,
-        "module_name": module_name,
-        "shape": tuple(shape),
-        "dtype": dtype,
-        "numel": int(numel),
-        "kind": kind,
-        "start_event": start_event,
-        "end_event": end_event,
-        "ready_at_wait": ready_at_wait,
-    })
-
-
-def _gc_profile_finalize_cuda_waits() -> None:
-    if _gc_profile_state["cuda_wait_events_finalized"]:
-        return
-    _gc_profile_state["cuda_wait_events_finalized"] = True
-    for item in _gc_profile_state["cuda_wait_events"]:
-        start_event = item.get("start_event")
-        end_event = item.get("end_event")
-        if start_event is None or end_event is None:
-            continue
-        try:
-            end_event.synchronize()
-            cuda_wait_s = float(start_event.elapsed_time(end_event)) / 1000.0
-        except Exception:
-            continue
-        _gc_profile_record(
-            mode = item.get("mode") or _gc_profile_state["mode"] or "unknown",
-            module_name = item["module_name"],
-            shape = item["shape"],
-            dtype = item["dtype"],
-            numel = item["numel"],
-            kind = item["kind"],
-            cuda_wait_s = cuda_wait_s,
-            ready_at_wait = item.get("ready_at_wait"),
-        )
-
-
 def _gc_profile_top_lines(stats_dict, primary_key: str, extra_keys: Tuple[str, ...], limit: int = 10):
     items = [
         (name, values)
@@ -371,7 +299,6 @@ def _gc_profile_medium_shape_lines(primary_key: str, extra_keys: Tuple[str, ...]
 def _gc_profile_dump_summary() -> None:
     if not _gc_profile_enabled():
         return
-    _gc_profile_finalize_cuda_waits()
     totals = _gc_profile_state["totals"]
     mode = _gc_profile_state["mode"] or "unknown"
     print(f"Unsloth GC profile summary ({mode}):")
@@ -391,13 +318,6 @@ def _gc_profile_dump_summary() -> None:
         f"cpu_buffer_allocs={totals.get('cpu_buffer_allocs', 0):.0f}, "
         f"wait_stream_fallbacks={totals.get('wait_stream_fallbacks', 0):.0f}"
     )
-    if _gc_profile_state["skip_reasons"]:
-        reasons = ", ".join(
-            f"{reason}={count}"
-            for reason, count in sorted(_gc_profile_state["skip_reasons"].items())
-        )
-        print(f"  skips: {reasons}")
-
     bucket_lines = _gc_profile_top_lines(
         _gc_profile_state["bucket_stats"],
         "pack_count",
@@ -983,17 +903,13 @@ pass
 
 
 from torch.utils.checkpoint import (
-    ContextManager,
     _DEFAULT_DETERMINISM_MODE,
     _infer_device_type,
     _get_autocast_kwargs,
     _get_device_module,
     get_device_states,
-    check_backward_validity,
     contextlib,
     DefaultDeviceType,
-    # set_device_states,
-    detach_variable,
     noop_context_fn,
 )
 # Added [device_type] in Torch 2.5!
@@ -1053,22 +969,6 @@ def _gc_disable_cpu_offload():
     if value is None:
         return False
     return str(value).strip().lower() not in ("0", "false", "no", "off", "")
-pass
-
-
-def _gc_env_flag(name: str) -> bool:
-    value = os.environ.get(name, None)
-    if value is None:
-        return False
-    return str(value).strip().lower() not in ("0", "false", "no", "off", "")
-
-
-def _gc_aux_stream() -> bool:
-    return _gc_env_flag("UNSLOTH_GC_AUX_STREAM")
-
-
-def _gc_narrow_wait() -> bool:
-    return _gc_env_flag("UNSLOTH_GC_NARROW_WAIT")
 pass
 
 
@@ -1137,60 +1037,26 @@ def _unwrap_dtensor(tensor):
     return tensor
 
 
-# In practice you probably don't need to rewrap after restoring from CPU,
-# because autograd only needs the local shard for backward and FSDP2
-# handles gradient reduction separately. Kept here for completeness
-# in case a future codepath requires DTensor metadata on restored tensors.
-#
-# def _rewrap_dtensor(restored, original):
-#     """Re-wrap a plain tensor as DTensor using the original's metadata."""
-#     if hasattr(original, "_spec") and hasattr(original, "device_mesh"):
-#         try:
-#             from torch.distributed.tensor import DTensor
-#             return DTensor.from_local(
-#                 restored,
-#                 device_mesh=original.device_mesh,
-#                 placements=original.placements,
-#             )
-#         except Exception:
-#             pass
-#     return restored
-
-
 class UnslothGradientCheckpointer:
     """
     All Unsloth Zoo code licensed under LGPLv3
 
-    Non-reentrant gradient checkpointing with smart CPU offloading.
-    """
-    _cpu_buffers: List[torch.Tensor] = []
-    _cpu_free_buffers: dict = {}
-    _gpu_buffers: dict = {}
-    # Persistent GPU restore buffer -- mirrors reentrant's GPU_BUFFERS pattern.
-    # One buffer per (dtype, device_index), never freed, only grown.
-    # Avoids CUDA allocator fragmentation from repeated alloc/free during backward.
-    _gpu_restore_persistent: dict = {}  # (dtype, device_index) -> GPU tensor (single-slot mode)
-    _gpu_restore_ring: dict = {}        # (dtype, device_index, slot) -> GPU tensor (prefetch mode)
-    _gpu_pack_ring: dict = {}           # (dtype, device_index, slot) -> GPU tensor (bounce mode)
-    _gpu_pack_ring_last_event: dict = {} # (dtype, device_index, slot) -> last pack_event for that slot
-    _pending_unpacks: list = []         # PackedCPUBuffer in pack order awaiting unpack
-    _pending_releases: list = []        # [(tensor, pack_event)] — event-based keepalive for
-                                        # source tensors when record_stream is disabled.
-                                        # Drained at start of each pack_hook call.
-    _next_pack_idx: int = 0             # monotonic pack counter for ring-slot assignment
-    _main_streams: dict = {}
-    _extra_streams: dict = {}
-    _extra_streams_aux: dict = {}
-    _initialized: bool = False
+    Lightweight state holder for stream checkpointing metadata.
 
-    _current_gc_index: int = 0
-    _last_gc_index: int = 0
-    _first_pass: bool = True
-    _backward_pass: bool = True
+    The supported release paths are:
+    - original Unsloth reentrant checkpointing, implemented by
+      ``UnslothCheckpointFunction`` and the module-level CPU/GPU buffers below;
+    - Unsloth stream checkpointing, implemented by
+      ``UnslothStreamActivationScheduler`` and ``_UnslothActivationSaveScope``.
+
+    Older class-local saved-tensors pack/unpack implementations were removed
+    from the release surface. This class remains only because downstream code
+    imports it and the stream scheduler uses ``_minimum_size`` as its staging
+    threshold.
+    """
+    _initialized: bool = False
     _minimum_size: int = 2 * 1024 * 1024 // 2
-    _use_unsloth_gc_message: bool = True
     _dtype: torch.dtype = None
-    _events_supported: Optional[bool] = None
     _meta_initialized: bool = False
 
     @classmethod
@@ -1217,972 +1083,25 @@ class UnslothGradientCheckpointer:
 
     @classmethod
     def initialize(cls, dtype: torch.dtype = None, num_devices: int = None):
-        if dtype is None:
-            if DEVICE_TYPE == "cuda":
-                major_version, minor_version = torch.cuda.get_device_capability()
-                supports_bfloat16 = (major_version >= 8)
-            elif DEVICE_TYPE in ("hip", "xpu"):
-                supports_bfloat16 = True
-            else:
-                supports_bfloat16 = True
-            dtype = torch.bfloat16 if supports_bfloat16 else torch.float16
-
-        if cls._initialized:
-            cls.ensure_metadata(dtype)
-            cls._ensure_cpu_pool_for_dtype(dtype)
-            return
-
-        cls._dtype = dtype
-        n_bytes = torch.finfo(dtype).bits // 8
-        try:
-            _min_mib = float(os.environ.get("UNSLOTH_GC_MIN_OFFLOAD_MB", "2"))
-        except ValueError:
-            _min_mib = 2.0
-        cls._minimum_size = int(_min_mib * 1024 * 1024) // n_bytes
-        cls._meta_initialized = True
-
-        cls._ensure_cpu_pool_for_dtype(dtype)
-
-        if num_devices is None:
-            num_devices = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
-
-        try:
-            for device_idx in range(num_devices):
-                device = torch.device(f"{DEVICE_TYPE_TORCH}:{device_idx}")
-                cls._gpu_buffers[device_idx] = torch.empty(
-                    INITIAL_GPU_BUFFER_SIZE, dtype=dtype, device=device,
-                )
-                if DEVICE_TYPE in ("cuda", "hip"):
-                    cls._main_streams[device_idx] = torch.cuda.default_stream(device)
-                    cls._extra_streams[device_idx] = torch.cuda.Stream(device)
-                    if _gc_aux_stream():
-                        cls._extra_streams_aux[device_idx] = torch.cuda.Stream(device)
-                elif DEVICE_TYPE == "xpu":
-                    cls._main_streams[device_idx] = torch.xpu.current_stream(device)
-                    cls._extra_streams[device_idx] = torch.xpu.Stream(device)
-                    if _gc_aux_stream():
-                        cls._extra_streams_aux[device_idx] = torch.xpu.Stream(device)
-        except Exception:
-            print("="*10 + "\n")
-            print("Unsloth: Your setup does not support `PYTORCH_CUDA_ALLOC_CONF`\n")
-            print("Please set `import os; os.environ['PYTORCH_CUDA_ALLOC_CONF'] = '';`\n")
-            print("Then re-run Unsloth from the start.")
-            print("="*10 + "\n")
-            raise
-
+        cls.ensure_metadata(dtype)
         cls._initialized = True
 
     @classmethod
-    def _ensure_cpu_pool_for_dtype(cls, dtype: torch.dtype) -> None:
-        pool = cls._cpu_free_buffers.get(dtype)
-        if pool:
-            return
-        # UNSLOTH_GC_PIN_POOL_MIB: if set, pre-allocate a pool of pinned buffers
-        # of the given MiB size × UNSLOTH_GC_PIN_POOL_COUNT (default 64). This
-        # avoids cudaHostRegister during steady-state pack_hook calls, which
-        # would otherwise allocate new 256-MiB pinned buffers per pack every
-        # step for text SFT and stall the main Python thread.
-        _pool_mib = os.environ.get("UNSLOTH_GC_PIN_POOL_MIB", "").strip()
-        buffers = []
-        if _pool_mib:
-            try:
-                _pool_bytes = int(float(_pool_mib) * 1024 * 1024)
-                _pool_count = int(os.environ.get("UNSLOTH_GC_PIN_POOL_COUNT", "64"))
-                _pool_numel = _pool_bytes // (torch.finfo(dtype).bits // 8)
-                _track_pinned_alloc(_pool_numel * _pool_count, dtype)
-                buffers = [
-                    torch.empty(_pool_numel, dtype=dtype, device="cpu", pin_memory=True)
-                    for _ in range(_pool_count)
-                ]
-                print(
-                    f"[gc_pool] pre-allocated {_pool_count} × {_pool_mib} MiB pinned buffers "
-                    f"(dtype={dtype}, total={_pool_count * _pool_bytes / 1024**3:.2f} GiB)",
-                    flush=True,
-                )
-            except Exception as _exc:
-                print(f"[gc_pool] pool pre-alloc failed: {_exc}", flush=True)
-                _track_pinned_alloc(INITIAL_CPU_BUFFER_SIZE * INITIAL_CPU_BUFFER_COUNT, dtype)
-                buffers = [
-                    torch.empty(INITIAL_CPU_BUFFER_SIZE, dtype=dtype, device="cpu", pin_memory=True)
-                    for _ in range(INITIAL_CPU_BUFFER_COUNT)
-                ]
-        else:
-            _track_pinned_alloc(INITIAL_CPU_BUFFER_SIZE * INITIAL_CPU_BUFFER_COUNT, dtype)
-            buffers = [
-                torch.empty(INITIAL_CPU_BUFFER_SIZE, dtype=dtype, device="cpu", pin_memory=True)
-                for _ in range(INITIAL_CPU_BUFFER_COUNT)
-            ]
-        cls._cpu_buffers.extend(buffers)
-        cls._cpu_free_buffers[dtype] = [(buf, None, None) for buf in buffers]
-
-    @classmethod
     def reset_for_new_training(cls):
-        global _pinned_bytes_allocated, _cpu_ram_warned
-        if not cls._initialized:
-            return
-
-        _pinned_bytes_allocated = 0
-        _cpu_ram_warned = False
-        cls._cpu_free_buffers = {}
-        cls._current_gc_index = 0
-        cls._last_gc_index = 0
-        cls._first_pass = True
-        cls._backward_pass = True
-        cls._use_unsloth_gc_message = True
-
-        kept_buffers = []
-        per_dtype_counts = defaultdict(int)
-        for buf in cls._cpu_buffers:
-            if buf is None:
-                continue
-            dtype = getattr(buf, "dtype", cls._dtype)
-            if per_dtype_counts[dtype] < INITIAL_CPU_BUFFER_COUNT:
-                if hasattr(buf, "resize_"):
-                    buf.resize_(INITIAL_CPU_BUFFER_SIZE)
-                kept_buffers.append(buf)
-                per_dtype_counts[dtype] += 1
-            else:
-                if hasattr(buf, "resize_"):
-                    buf.resize_(0)
-        cls._cpu_buffers = kept_buffers
-        for buf in cls._cpu_buffers:
-            cls._cpu_free_buffers.setdefault(buf.dtype, []).append((buf, None, None))
-
-        for device_idx in cls._gpu_buffers:
-            if cls._gpu_buffers[device_idx] is not None and hasattr(cls._gpu_buffers[device_idx], "resize_"):
-                cls._gpu_buffers[device_idx].resize_(INITIAL_GPU_BUFFER_SIZE)
-        # Keep persistent GPU restore buffers allocated -- they'll be reused next training.
+        cls.ensure_metadata(cls._dtype)
 
     @classmethod
     def cleanup(cls):
-        if not cls._initialized:
-            return
-
-        for i in range(len(cls._cpu_buffers)):
-            if cls._cpu_buffers[i] is not None and hasattr(cls._cpu_buffers[i], "resize_"):
-                cls._cpu_buffers[i].resize_(0)
-            cls._cpu_buffers[i] = None
-        cls._cpu_buffers = []
-        cls._cpu_free_buffers = {}
-
-        for device_idx in list(cls._gpu_buffers.keys()):
-            if cls._gpu_buffers[device_idx] is not None and hasattr(cls._gpu_buffers[device_idx], "resize_"):
-                cls._gpu_buffers[device_idx].resize_(0)
-            cls._gpu_buffers[device_idx] = None
-        cls._gpu_buffers = {}
-        for key, buf in cls._gpu_restore_persistent.items():
-            if buf is not None and hasattr(buf, "resize_"):
-                buf.resize_(0)
-        cls._gpu_restore_persistent = {}
-        cls._main_streams = {}
-        cls._extra_streams = {}
-        cls._extra_streams_aux = {}
         cls._initialized = False
-
-    def __init__(self, is_last_layer: bool = False, checkpoint_index: Optional[int] = None):
-        self.is_last_layer = is_last_layer
-        self.checkpoint_index = checkpoint_index
 
     @classmethod
     def begin_checkpoint(cls, dtype=None):
-        """Per-call bookkeeping: initialize if needed, track layer index, return offloader."""
+        """Compatibility hook used by the checkpoint dispatcher."""
         if not cls._initialized:
             cls.initialize(dtype)
-        if cls._backward_pass:
-            # ─── CRITICAL: fresh-step transition (backward→forward) ────────────
-            # Clear step-local pending state only at the backward-to-forward
-            # transition. This is called once per checkpointed layer, but this
-            # branch fires only at the first layer of a new step.
-            # ───────────────────────────────────────────────────────────────────
-            cls._backward_pass = False
-            cls._current_gc_index = 0
-            cls._pending_unpacks = []
-            cls._next_pack_idx = 0
-        if cls._first_pass:
-            cls._last_gc_index += 1
-        cls._current_gc_index += 1
-        # `UNSLOTH_GC_SKIP_LAST_N` (default 1) — number of trailing layers whose
-        # activations are kept resident on GPU instead of offloaded. Skipping
-        # N=1 (default) keeps the *unchecked* final layer resident and is a
-        # no-op. Skipping N>=2 additionally keeps the last K-1 offloadable
-        # layers resident so their unpacks are no longer on the backward
-        # critical path. Closes the "first NOT-ready H2D per step" gap at the
-        # cost of ~activation_size × (N-1) extra peak GPU memory. For Qwen3-8B
-        # seq=8192 bsz=4, activation_size=256 MiB → N=2 adds 0.8% peak alloc.
-        try:
-            _skip_last_n = max(1, int(os.environ.get("UNSLOTH_GC_SKIP_LAST_N", "1")))
-        except ValueError:
-            _skip_last_n = 1
-        is_last_layer = (
-            (cls._current_gc_index > cls._last_gc_index - _skip_last_n)
-            and not cls._first_pass
-        )
-        return cls(is_last_layer=is_last_layer, checkpoint_index=cls._current_gc_index)
-
-    @classmethod
-    def _record_stream_event(cls, stream):
-        if cls._events_supported is False:
-            return None
-        try:
-            event = stream.record_event()
-            cls._events_supported = True
-            return event
-        except Exception:
-            cls._events_supported = False
-            return None
-
-    @classmethod
-    def _wait_event(cls, stream, event):
-        if event is None:
-            return False
-        try:
-            stream.wait_event(event)
-            return True
-        except Exception:
-            cls._events_supported = False
-            return False
-
-    def should_offload(self, tensor: torch.Tensor) -> bool:
-        cls = self.__class__
-        if _gc_disable_cpu_offload():
-            _gc_profile_record_skip("cpu_offload_disabled")
-            return False
-        # Skip parameter-like tensors (requires_grad=True leaf tensors).
-        # Under FSDP, all-gathered params lose nn.Parameter type, but
-        # they remain leaf tensors (no grad_fn). Activations always have grad_fn.
-        if tensor.requires_grad and tensor.grad_fn is None:
-            _gc_profile_record_skip("parameter_like_tensor")
-            return False
-        # Unwrap FSDP2 DTensors so .numel(), .is_contiguous(), etc.
-        # check the local shard, not the virtualized distributed shape.
-        tensor = _unwrap_dtensor(tensor)
-        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
-            if torch.compiler.is_compiling():
-                _gc_profile_record_skip("compiler_is_compiling")
-                return False
-        if tensor.numel() < cls._minimum_size:
-            _gc_profile_record_skip("below_minimum_size")
-            return False
-        if tensor.device.type == "cpu":
-            _gc_profile_record_skip("tensor_on_cpu")
-            return False
-        if self.is_last_layer:
-            _gc_profile_record_skip("last_layer")
-            return False
-        # Custom packed-buffer restore currently materializes contiguous tensors.
-        # Restrict offload to safe tensor layouts to preserve correctness.
-        if tensor.layout != torch.strided:
-            _gc_profile_record_skip("non_strided_layout")
-            return False
-        if (not tensor.is_contiguous()) or (tensor.storage_offset() != 0):
-            _gc_profile_record_skip("non_contiguous_or_offset")
-            return False
-        try:
-            if tensor._is_view():
-                _gc_profile_record_skip("tensor_view")
-                return False
-        except Exception:
-            pass
-        return True
-
-    @classmethod
-    def _acquire_cpu_buffer(cls, *, numel: int, dtype: torch.dtype, device_index: int):
-        # Diagnostic: UNSLOTH_GC_TARGET_GPU_DUMMY=1 allocates the "cpu_buffer"
-        # on GPU instead. Keeps the entire pack/unpack sync pattern identical
-        # but eliminates PCIe transfers (GPU→GPU copy is essentially free).
-        # Used to disambiguate whether the throughput gap is PCIe-on-critical-
-        # path vs caching-allocator/extra-stream overhead.
-        # WARNING: produces garbage backward (data is nonsense across pack→unpack
-        # because we're using fresh allocations). For timing only.
-        if os.environ.get("UNSLOTH_GC_TARGET_GPU_DUMMY", "") in ("1", "true", "True"):
-            if DEVICE_TYPE in ("cuda", "hip"):
-                dev = torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")
-            else:
-                dev = torch.device("cpu")
-            return torch.empty(numel, dtype=dtype, device=dev), False, True
-
-        pool = cls._cpu_free_buffers.setdefault(dtype, [])
-        if not pool:
-            cls._ensure_cpu_pool_for_dtype(dtype)
-            pool = cls._cpu_free_buffers.setdefault(dtype, [])
-        chosen_idx = None
-        chosen_buf = None
-        grow_idx = None
-        grow_buf = None
-        # ─── CRITICAL: pool picker MUST prefer size ≥ numel ───────────────────
-        # The previous implementation picked the first ready buffer regardless
-        # of size, then fell through to `torch.empty(pin_memory=True)` when the
-        # picked buffer was too small. `initialize()` pre-populates the pool
-        # with 200 × 128-KiB buffers; every 256-MiB activation pack would pick
-        # one of those, fail the size check, and incur a fresh synchronous
-        # cudaHostAlloc (~6 ms per 256 MiB). Subphase timing (phF_hooks_pack_
-        # subphases) attributed 97.5% of pack_wall to this path:
-        #   pack_acquire_ms=4572  pack_copy_ms=39  pack_waitstream_ms=13
-        # i.e. the D2H copy itself is truly async; the stall is entirely the
-        # pinned-alloc. Requiring size ≥ numel in the scan lets the scan skip
-        # too-small entries when a large buffer exists. If no large ready slot
-        # exists, we grow one ready small slot in-place, matching the reentrant
-        # path's "tiny slots grow once, then reuse" behavior without requiring
-        # a huge up-front pinned-memory pool.
-        # ──────────────────────────────────────────────────────────────────────
-        for i in range(len(pool) - 1, -1, -1):
-            buf, fence_device_index, fence_event = pool[i]
-            # Skip other devices FIRST (avoid device switch + query)
-            if fence_device_index is not None and fence_device_index != device_index:
-                continue
-
-            ready = True
-            if fence_event is not None:
-                try:
-                    if DEVICE_TYPE in ("cuda", "hip") and fence_device_index is not None:
-                        with torch.cuda.device(fence_device_index):
-                            ready = bool(fence_event.query())
-                    elif DEVICE_TYPE == "xpu" and fence_device_index is not None:
-                        with torch.xpu.device(fence_device_index):
-                            ready = bool(fence_event.query())
-                    else:
-                        ready = bool(fence_event.query())
-                except Exception:
-                    ready = False
-            if not ready:
-                continue
-            if buf.numel() >= numel:
-                chosen_idx = i
-                chosen_buf = buf
-                break
-            if grow_idx is None:
-                grow_idx = i
-                grow_buf = buf
-
-        _gc_count_on = os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True")
-        if chosen_idx is not None:
-            pool.pop(chosen_idx)
-            if _gc_count_on:
-                _UNSLOTH_PACK_POOL_HITS[0] += 1
-            return chosen_buf, True, False
-        if grow_idx is not None:
-            pool.pop(grow_idx)
-            old_numel = grow_buf.numel()
-            if _gc_count_on:
-                _UNSLOTH_PACK_POOL_GROWS[0] += 1
-                _t_pin = time.perf_counter_ns()
-            grow_buf.resize_(numel)
-            if _gc_count_on:
-                _UNSLOTH_PACK_PINRESIZE_NS[0] += time.perf_counter_ns() - _t_pin
-            if numel > old_numel:
-                _track_pinned_alloc(numel - old_numel, dtype)
-            return grow_buf, True, True
-
-        _track_pinned_alloc(numel, dtype)
-        if _gc_count_on:
-            _UNSLOTH_PACK_POOL_MISSES[0] += 1
-            _t_pin = time.perf_counter_ns()
-            buf = torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
-            _UNSLOTH_PACK_PINALLOC_NS[0] += time.perf_counter_ns() - _t_pin
-            return buf, False, True
-        return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True), False, True
-
-    @classmethod
-    def _release_cpu_buffer(
-        cls,
-        *,
-        cpu_buffer: torch.Tensor,
-        dtype: torch.dtype,
-        device_index: int,
-        restore_event,
-    ) -> None:
-        pool = cls._cpu_free_buffers.setdefault(dtype, [])
-        pool.append((cpu_buffer, device_index, restore_event))
-
-    @classmethod
-    def _get_gpu_restore_buffer(cls, *, numel: int, dtype: torch.dtype, device_index: int):
-        """Get persistent GPU restore buffer, matching reentrant's GPU_BUFFERS pattern.
-
-        One buffer per (dtype, device_index). Never freed, only grown via resize_().
-        Eliminates CUDA allocator fragmentation from repeated alloc/free during backward.
-        """
-        key = (dtype, device_index)
-        buf = cls._gpu_restore_persistent.get(key)
-        if buf is None:
-            buf = torch.empty(numel, dtype=dtype,
-                device=f"{DEVICE_TYPE_TORCH}:{device_index}")
-            cls._gpu_restore_persistent[key] = buf
-        elif buf.numel() < numel:
-            buf.resize_(numel)
-        return buf
-
-    @classmethod
-    def _get_gpu_restore_ring_slot(cls, *, numel: int, dtype: torch.dtype,
-                                   device_index: int, slot: int):
-        """Get one slot of a per-(dtype, device) ring of GPU restore buffers.
-        Used by the prefetch-capable unpack path so consecutive unpacks don't
-        alias into a single shared buffer.
-        """
-        key = (dtype, device_index, slot)
-        buf = cls._gpu_restore_ring.get(key)
-        if buf is None:
-            buf = torch.empty(numel, dtype=dtype,
-                device=f"{DEVICE_TYPE_TORCH}:{device_index}")
-            cls._gpu_restore_ring[key] = buf
-        elif buf.numel() < numel:
-            buf.resize_(numel)
-        return buf
-
-    @classmethod
-    def _get_gpu_pack_ring_slot(cls, *, numel: int, dtype: torch.dtype,
-                                device_index: int, slot: int):
-        """One slot of a persistent GPU bounce ring used by the bounce-buffer
-        pack path (UNSLOTH_GC_BOUNCE=1). D2D copies land here on main stream;
-        extra_stream reads the bounce for D2H. The source tensor's memory is
-        free to be reused immediately after the D2D — no record_stream tag,
-        no deferred-free queue pinning.
-        """
-        key = (dtype, device_index, slot)
-        buf = cls._gpu_pack_ring.get(key)
-        if buf is None:
-            buf = torch.empty(numel, dtype=dtype,
-                device=f"{DEVICE_TYPE_TORCH}:{device_index}")
-            cls._gpu_pack_ring[key] = buf
-        elif buf.numel() < numel:
-            buf.resize_(numel)
-        return buf
-
-    @classmethod
-    def _resolve_extra_stream(cls, device_index: int, stream_idx: int):
-        """Pick the extra stream for a pack. stream_idx=0 always returns the
-        primary extra stream; stream_idx=1 returns the aux stream when
-        UNSLOTH_GC_AUX_STREAM is enabled, else falls back to primary."""
-        if stream_idx == 1:
-            aux = cls._extra_streams_aux.get(device_index)
-            if aux is not None:
-                return aux
-        return cls._extra_streams[device_index]
-
-    @classmethod
-    def _issue_h2d_for_pack(cls, packed):
-        """Start the H2D copy for ``packed`` on its ring slot, idempotent.
-
-        No main_stream wait; that happens at the consumer (the unpack caller
-        that needs the data). Enables a prior unpack to prefetch the next.
-        """
-        state = packed._state
-        if state.get("h2d_issued"):
-            return
-        _nvtx_on = os.environ.get("UNSLOTH_GC_NVTX", "") in ("1", "true", "True")
-        if _nvtx_on:
-            torch.cuda.nvtx.range_push(f"h2d_issue_pack{getattr(packed,'pack_idx',-1)}")
-        original_dtype = packed.dtype
-        numel = packed.numel
-        device_index = packed.device_index
-        shape = packed.shape
-        original_stride = packed.stride
-        cpu_buffer = state["cpu_buffer"]
-        slot = packed.pack_idx % _GC_PREFETCH_RING_SIZE
-        ring_key = (original_dtype, device_index, slot)
-        gpu_buf = cls._get_gpu_restore_ring_slot(
-            numel=numel, dtype=original_dtype, device_index=device_index, slot=slot,
-        )
-        device = torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")
-        if DEVICE_TYPE in ("cuda", "hip"):
-            main_stream = torch.cuda.current_stream(device)
-        elif DEVICE_TYPE == "xpu":
-            main_stream = torch.xpu.current_stream(device)
         else:
-            main_stream = cls._main_streams[device_index]
-        stream_idx = getattr(packed, "stream_idx", 0) or 0
-        extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
-        # UNSLOTH_GC_NARROW_WAIT=1 is UNSAFE — do not enable.
-        # Rationale (Phase K3, SFT VL Qwen3-VL-8B, seq=4096, bsz=2):
-        # Narrow-wait replaces `extra_stream.wait_stream(main_stream)` with
-        # `extra_stream.wait_event(pack_event)` on the reasoning that the
-        # D2H-before-H2D ordering is the only dependency needed. That reasoning
-        # is wrong. `wait_stream(main_stream)` carries a second, silent
-        # dependency on main_stream that is NOT covered by pack_event alone.
-        # Removing it causes gradient corruption on SFT VL:
-        #   pd2_NW          → loss[2]=1.656, loss[-1]=1.887 (diverges)
-        #   pd2_NW, ring=128→ loss[2]=NaN (reads unwritten torch.empty slots)
-        #   pd2_NB (wait_event + wait_stream) → loss[2]=1.451 (correct)
-        # GPU_DUMMY (PCIe-free, GPU→GPU memcpy) still diverges with NW, so the
-        # missing dep is NOT D2H completion timing — it is some main_stream-
-        # side scheduling invariant (candidates: FSDP2 comm stream, torch.compile
-        # cudaGraph boundary, GPU scheduler order). The "win" of NW was ~2% on
-        # SFT text and zero on SFT VL; not worth the correctness hazard.
-        # UNSLOTH_GC_NARROW_BOTH=1 is the safe probe (keeps both waits). The
-        # default path below is correct; do not re-introduce event-only waits.
-        # NARROW_BOTH exists only as a diagnostic tool; prefer the default.
-        pack_event = state.get("pack_event")
-        _gc_narrow_both = os.environ.get("UNSLOTH_GC_NARROW_BOTH", "") in ("1", "true", "True")
-        if _gc_narrow_both and pack_event is not None:
-            cls._wait_event(extra_stream, pack_event)
-            extra_stream.wait_stream(main_stream)
-        elif _gc_narrow_wait() and pack_event is not None:
-            # UNSAFE — kept only for reproduction / diagnostics. See block comment above.
-            cls._wait_event(extra_stream, pack_event)
-        else:
-            extra_stream.wait_stream(main_stream)
-        with torch_gpu_stream(extra_stream):
-            gpu_buf[:numel].copy_(cpu_buffer[:numel], non_blocking=True)
-            result = gpu_buf[:numel].view(shape)
-            if tuple(result.stride()) != tuple(original_stride):
-                result = result.as_strided(shape, original_stride)
-            restore_event = cls._record_stream_event(extra_stream)
-        state["restore_event"] = restore_event
-        state["result_view"] = result
-        state["h2d_issued"] = True
-        # UNSLOTH_GC_PREFETCH_RING_EAGER_FREE=1 drops the persistent ring
-        # reference once `result_view` owns the tensor, letting the allocator
-        # reclaim the slot when the unpack consumer releases its handle.
-        # Reduces fragmentation overlap with FSDP2 unshard buffers on VL
-        # (~6-8 GiB reserved on torch 2.11+ in measurements), no throughput cost.
-        if _gc_env_flag("UNSLOTH_GC_PREFETCH_RING_EAGER_FREE") or state.get("prefetch_ring_eager_free"):
-            cls._gpu_restore_ring.pop(ring_key, None)
-        packed.set_restore_event(restore_event)
-        if _nvtx_on:
-            torch.cuda.nvtx.range_pop()
-
-    def pack_hook(self, tensor: torch.Tensor, *, force: bool = False):
-        cls = self.__class__
-        if not force and not self.should_offload(tensor):
-            return tensor
-        _gc_count_on = os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True")
-        if _gc_count_on:
-            _UNSLOTH_PACK_HIT_COUNT[0] += 1
-            _UNSLOTH_PACK_BYTES[0] += tensor.numel() * tensor.element_size()
-            _pack_t0 = time.perf_counter_ns()
-
-        # Unwrap DTensor to local shard for plain memcpy (avoids distributed dispatch)
-        tensor = _unwrap_dtensor(tensor)
-        device = tensor.device
-        device_index = device.index if device.index is not None else 0
-        numel = tensor.numel()
-        shape = tensor.shape
-        stride = tensor.stride()
-        dtype = tensor.dtype
-        requires_grad = tensor.requires_grad
-
-        if cls._use_unsloth_gc_message:
-            print("Unsloth: Will smartly offload gradients to save VRAM!")
-            cls._use_unsloth_gc_message = False
-
-        _t_acq = time.perf_counter_ns() if _gc_count_on else 0
-        cpu_buffer, pool_hit, extra_allocated = cls._acquire_cpu_buffer(
-            numel=numel,
-            dtype=dtype,
-            device_index=device_index,
-        )
-        if _gc_count_on:
-            _UNSLOTH_PACK_ACQUIRE_NS[0] += time.perf_counter_ns() - _t_acq
-
-        if DEVICE_TYPE in ("cuda", "hip"):
-            main_stream = torch.cuda.current_stream(device)
-        elif DEVICE_TYPE == "xpu":
-            main_stream = torch.xpu.current_stream(device)
-        else:
-            main_stream = cls._main_streams[device_index]
-        # Variant B: round-robin across primary + aux extra streams by pack index.
-        pack_idx = cls._next_pack_idx
-        single_stream = _gc_env_flag("UNSLOTH_GC_SINGLE_STREAM")
-        stream_idx = 0 if single_stream else ((pack_idx % 2) if _gc_aux_stream() else 0)
-        extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
-        # Correctness-critical: GPU source tensor must not be read before its
-        # main-stream producer compute completes. DO NOT remove this barrier.
-        _t_ws = time.perf_counter_ns() if _gc_count_on else 0
-        extra_stream.wait_stream(main_stream)
-        if _gc_count_on:
-            _UNSLOTH_PACK_WAITSTREAM_NS[0] += time.perf_counter_ns() - _t_ws
-        module_name = _gc_profile_module_name()
-        if module_name == "<unknown>" and self.checkpoint_index is not None:
-            module_name = f"checkpoint_{self.checkpoint_index:03d}"
-        start_time = time.perf_counter() if _gc_profile_enabled() else 0.0
-        # Ablations (Phase B2 of fsdp2 GC-offload investigation):
-        #   UNSLOTH_GC_NO_RECORD_STREAM=1 skips tensor.record_stream(extra_stream).
-        #     Empirical safety: loss parity within bf16 noise over 21-step SFT;
-        #     the theoretical race (allocator reusing segment before async D2H
-        #     completes) does not trigger in practice because (a) extra_stream
-        #     has wait_stream(main_stream) ordering, and (b) subsequent main
-        #     stream allocations are almost always larger than saved-tensor
-        #     segment sizes. Use with caution outside tested shapes.
-        #   UNSLOTH_GC_SYNC_PACK=1 forces extra_stream.synchronize() after
-        #     each pack so at most one D2H is inflight — crushes the pool.
-        _gc_no_rs = os.environ.get("UNSLOTH_GC_NO_RECORD_STREAM", "") in ("1", "true", "True")
-        _gc_sync_pack = os.environ.get("UNSLOTH_GC_SYNC_PACK", "") in ("1", "true", "True")
-        # Phase I T2: UNSLOTH_GC_PACK_WAIT_EVENT=1 replaces record_stream with an
-        # explicit main-stream wait_event on pack_event. Prevents both the
-        # fragmentation caused by record_stream's delayed-free accounting
-        # AND the theoretical race exposed by UNSLOTH_GC_NO_RECORD_STREAM=1,
-        # at the cost of serializing D2H with the next main-stream kernel.
-        _gc_pack_wait_event = os.environ.get("UNSLOTH_GC_PACK_WAIT_EVENT", "") in ("1", "true", "True")
-        # Bounce path: persistent GPU ring; main-stream D2D into bounce,
-        # extra_stream D2H from bounce. Source tensor freed immediately by
-        # main stream — no record_stream tag, no deferred-free, no leaking
-        # saved-activation blocks into CE-sized segments.
-        _gc_bounce = os.environ.get("UNSLOTH_GC_BOUNCE", "") in ("1", "true", "True")
-        if _gc_bounce:
-            slot = pack_idx % _GC_PREFETCH_RING_SIZE
-            bounce = cls._get_gpu_pack_ring_slot(
-                numel=numel, dtype=dtype, device_index=device_index, slot=slot,
-            )
-            slot_key = (dtype, device_index, slot)
-            prev_event = cls._gpu_pack_ring_last_event.get(slot_key)
-            # Main stream must wait for the prior D2H from this bounce slot
-            # so we don't overwrite data extra_stream is still reading.
-            if prev_event is not None:
-                try:
-                    main_stream.wait_event(prev_event)
-                except Exception:
-                    pass
-            _t_copy = time.perf_counter_ns() if _gc_count_on else 0
-            # D2D on main stream: bounce[:numel].view(shape).copy_(tensor)
-            with torch.no_grad():
-                bounce[:numel].view(shape).copy_(tensor, non_blocking=True)
-            if _gc_count_on:
-                _UNSLOTH_PACK_COPY_NS[0] += time.perf_counter_ns() - _t_copy
-            # Event on main_stream after the D2D completes
-            d2d_event = cls._record_stream_event(main_stream)
-            # extra_stream waits for D2D before starting D2H
-            cls._wait_event(extra_stream, d2d_event)
-            with torch_gpu_stream(extra_stream):
-                with torch.no_grad():
-                    cpu_buffer[:numel].view(shape).copy_(
-                        bounce[:numel].view(shape), non_blocking=True,
-                    )
-                pack_event = cls._record_stream_event(extra_stream)
-            cls._gpu_pack_ring_last_event[slot_key] = pack_event
-        else:
-            with torch_gpu_stream(extra_stream):
-                if not (_gc_no_rs or _gc_pack_wait_event):
-                    try:
-                        tensor.record_stream(extra_stream)
-                    except Exception:
-                        pass
-                _t_copy = time.perf_counter_ns() if _gc_count_on else 0
-                with torch.no_grad():
-                    cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
-                if _gc_count_on:
-                    _UNSLOTH_PACK_COPY_NS[0] += time.perf_counter_ns() - _t_copy
-                pack_event = cls._record_stream_event(extra_stream)
-            if _gc_pack_wait_event:
-                try:
-                    main_stream.wait_event(pack_event)
-                except Exception:
-                    pass
-        if _gc_sync_pack:
-            try:
-                extra_stream.synchronize()
-            except Exception:
-                pass
-        if _gc_profile_enabled():
-            _gc_profile_record(
-                mode = "nonreentrant_hooks",
-                module_name = module_name,
-                shape = shape,
-                dtype = dtype,
-                numel = numel,
-                kind = "pack",
-                duration_s = time.perf_counter() - start_time,
-                extra_allocated = extra_allocated,
-                pool_hit = pool_hit,
-            )
-        packed = PackedCPUBuffer(
-            shape,
-            stride,
-            dtype,
-            requires_grad,
-            device_index,
-            numel,
-            cpu_buffer,
-            cls,
-            module_name,
-        )
-        # Prefetch-mode bookkeeping: assign pack index and register as pending.
-        # Noop for single-slot (non-prefetch) unpack path.
-        packed.pack_idx = pack_idx
-        packed.stream_idx = stream_idx
-        cls._next_pack_idx += 1
-        packed._state["h2d_issued"] = False
-        packed._state["result_view"] = None
-        packed._state["pack_event"] = pack_event
-        packed._state["use_prefetch"] = False
-        cls._pending_unpacks.append(packed)
-        if _gc_count_on:
-            _UNSLOTH_PACK_WALL_NS[0] += time.perf_counter_ns() - _pack_t0
-        return packed
-
-    @classmethod
-    def unpack_packed_prefetch(cls, packed):
-        """Prefetch-capable unpack: issues H2D for ``packed`` if not already in
-        flight, and speculatively starts H2D for the next-N packs in reverse-
-        pack order so main_stream's backward compute can overlap the transfers.
-        Each pack uses its own ring slot so the copies don't alias.
-
-        Depth tunable via ``UNSLOTH_GC_PREFETCH_DEPTH`` (default 1). Depth must
-        be < ring size so prefetched packs don't collide with each other.
-        """
-        cls._backward_pass = True
-        cls._first_pass = False
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_UNPACK_PREFETCH_CALLS[0] += 1
-
-        # Remove self from pending list (O(n) scan but n≈36 per step).
-        try:
-            cls._pending_unpacks.remove(packed)
-        except ValueError:
-            pass
-
-        # Issue H2D for self if not yet done.
-        if not packed._state.get("h2d_issued"):
-            cls._issue_h2d_for_pack(packed)
-
-        # Prefetch the next-N unpacks (tail of pending list).
-        try:
-            depth = int(os.environ.get("UNSLOTH_GC_PREFETCH_DEPTH", "1"))
-        except ValueError:
-            depth = 1
-        depth = max(0, min(depth, _GC_PREFETCH_RING_SIZE - 1))
-        for k in range(1, depth + 1):
-            if k > len(cls._pending_unpacks):
-                break
-            next_packed = cls._pending_unpacks[-k]
-            if not next_packed._state.get("h2d_issued"):
-                cls._issue_h2d_for_pack(next_packed)
-
-        # Wait on self's restore event so main_stream sees consistent data.
-        device_index = packed.device_index
-        device = torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")
-        if DEVICE_TYPE in ("cuda", "hip"):
-            main_stream = torch.cuda.current_stream(device)
-        elif DEVICE_TYPE == "xpu":
-            main_stream = torch.xpu.current_stream(device)
-        else:
-            main_stream = cls._main_streams[device_index]
-        restore_event = packed._state["restore_event"]
-        _nvtx_on = os.environ.get("UNSLOTH_GC_NVTX", "") in ("1", "true", "True")
-        _count_on = os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True")
-        _profile_on = _gc_profile_enabled()
-        done_before_wait = None
-        # Debug one-shot: dump restore_event state on first call to see if
-        # the event was actually recorded (not None) and whether h2d_issued
-        # flag is set. If restore_event is None, prefetch fired but never
-        # actually recorded anything.
-        if _gc_env_flag("UNSLOTH_GC_TRACE_PREFETCH") and not hasattr(cls, "_prefetch_dbg_shown"):
-            cls._prefetch_dbg_shown = True
-            print(
-                f"[gc_trace] unpack_prefetch first call: pack_idx={getattr(packed,'pack_idx',-1)} "
-                f"h2d_issued={packed._state.get('h2d_issued')} "
-                f"restore_event={'present' if restore_event is not None else 'NONE'} "
-                f"pending_remaining={len(cls._pending_unpacks)}",
-                flush=True,
-            )
-        if _nvtx_on or _count_on or _profile_on:
-            # Query event status to see if H2D is already done (prefetch worked)
-            # or still in flight (prefetch didn't save the wait).
-            try:
-                done_before_wait = bool(restore_event.query()) if restore_event is not None else True
-            except Exception:
-                done_before_wait = False
-            if _count_on:
-                if done_before_wait:
-                    _UNSLOTH_PREFETCH_READY_AT_WAIT[0] += 1
-                else:
-                    _UNSLOTH_PREFETCH_NOTREADY_AT_WAIT[0] += 1
-            if _nvtx_on:
-                tag = "ready" if done_before_wait else "NOT_ready"
-                torch.cuda.nvtx.range_push(f"wait_pack{getattr(packed,'pack_idx',-1)}_{tag}")
-        profile_start_event = None
-        profile_end_event = None
-        if _profile_on and DEVICE_TYPE in ("cuda", "hip"):
-            try:
-                profile_start_event = torch.cuda.Event(enable_timing=True)
-                profile_end_event = torch.cuda.Event(enable_timing=True)
-                profile_start_event.record(main_stream)
-            except Exception:
-                profile_start_event = None
-                profile_end_event = None
-        wait_event_fallback = not cls._wait_event(main_stream, restore_event)
-        if wait_event_fallback:
-            stream_idx = getattr(packed, "stream_idx", 0) or 0
-            extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
-            main_stream.wait_stream(extra_stream)
-        if profile_end_event is not None:
-            try:
-                profile_end_event.record(main_stream)
-                _gc_profile_record_cuda_wait(
-                    mode = "nonreentrant_hooks",
-                    module_name = packed.module_name,
-                    shape = packed.shape,
-                    dtype = packed.dtype,
-                    numel = packed.numel,
-                    kind = "unpack",
-                    start_event = profile_start_event,
-                    end_event = profile_end_event,
-                    ready_at_wait = done_before_wait,
-                )
-            except Exception:
-                pass
-        elif _profile_on:
-            _gc_profile_record(
-                mode = "nonreentrant_hooks",
-                module_name = packed.module_name,
-                shape = packed.shape,
-                dtype = packed.dtype,
-                numel = packed.numel,
-                kind = "unpack",
-                ready_at_wait = done_before_wait,
-                wait_event_fallback = wait_event_fallback,
-            )
-        if _nvtx_on:
-            try:
-                torch.cuda.nvtx.range_pop()
-            except Exception:
-                pass
-
-        result = packed._state["result_view"]
-        if result.dtype != packed.dtype:
-            result = result.to(packed.dtype)
-        if result.requires_grad != packed.requires_grad:
-            result.requires_grad_(packed.requires_grad)
-        return result
-
-    @classmethod
-    def unpack_packed(cls, packed):
-        _gc_count_on = os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True")
-        _unpack_t0 = time.perf_counter_ns() if _gc_count_on else 0
-        cls._backward_pass = True
-        cls._first_pass = False
-
-        shape = packed.shape
-        original_stride = packed.stride
-        original_dtype = packed.dtype
-        original_requires_grad = packed.requires_grad
-        device_index = packed.device_index
-        numel = packed.numel
-        cpu_buffer = packed.cpu_buffer
-
-        device = torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")
-        if DEVICE_TYPE in ("cuda", "hip"):
-            main_stream = torch.cuda.current_stream(device)
-        elif DEVICE_TYPE == "xpu":
-            main_stream = torch.xpu.current_stream(device)
-        else:
-            main_stream = cls._main_streams[device_index]
-        extra_stream = cls._extra_streams[device_index]
-        module_name = packed.module_name
-        start_time = time.perf_counter() if _gc_profile_enabled() else 0.0
-        gpu_buf = cls._get_gpu_restore_buffer(
-            numel=numel, dtype=original_dtype, device_index=device_index,
-        )
-        extra_stream.wait_stream(main_stream)
-        with torch_gpu_stream(extra_stream):
-            gpu_buf[:numel].copy_(cpu_buffer[:numel], non_blocking=True)
-            result = gpu_buf[:numel].view(shape)
-            if tuple(result.stride()) != tuple(original_stride):
-                result = result.as_strided(shape, original_stride)
-            restore_event = cls._record_stream_event(extra_stream)
-            packed.set_restore_event(restore_event)
-        wait_start = time.perf_counter() if _gc_profile_enabled() else 0.0
-        wait_event_fallback = not cls._wait_event(main_stream, restore_event)
-        if wait_event_fallback:
-            main_stream.wait_stream(extra_stream)
-        wait_duration = (time.perf_counter() - wait_start) if _gc_profile_enabled() else 0.0
-
-        if result.dtype != original_dtype:
-            result = result.to(original_dtype)
-        if result.requires_grad != original_requires_grad:
-            result.requires_grad_(original_requires_grad)
-        # Restored tensor is a plain torch.Tensor (local shard).
-        # No DTensor rewrap needed: autograd uses local shard for
-        # backward, and FSDP2 handles gradient reduction separately.
-        # result = _rewrap_dtensor(result, original_dtensor)
-        if _gc_profile_enabled():
-            _gc_profile_record(
-                mode = "nonreentrant_hooks",
-                module_name = module_name,
-                shape = shape,
-                dtype = original_dtype,
-                numel = numel,
-                kind = "unpack",
-                duration_s = time.perf_counter() - start_time,
-                wait_s = wait_duration,
-                wait_event_fallback = wait_event_fallback,
-            )
-        if _gc_count_on:
-            _UNSLOTH_UNPACK_WALL_NS[0] += time.perf_counter_ns() - _unpack_t0
-        return result
-
-
-class PackedCPUBuffer:
-    """Packed representation for offloaded activations.
-
-    The backing pinned CPU buffer stays alive for as long as this object stays
-    alive, which matches saved_tensors_hooks lifetime requirements. Cleanup is
-    tied to object destruction instead of the start of a future forward pass.
-    """
-
-    __slots__ = (
-        "shape",
-        "stride",
-        "dtype",
-        "requires_grad",
-        "device_index",
-        "numel",
-        "module_name",
-        "pack_idx",
-        "stream_idx",
-        "_state",
-        "_finalizer",
-        "__weakref__",
-    )
-
-    def __init__(
-        self,
-        shape,
-        stride,
-        dtype,
-        requires_grad,
-        device_index,
-        numel,
-        cpu_buffer,
-        owner_cls,
-        module_name,
-    ):
-        self.shape = shape
-        self.stride = stride
-        self.dtype = dtype
-        self.requires_grad = requires_grad
-        self.device_index = device_index
-        self.numel = numel
-        self.module_name = module_name
-        self._state = {
-            "cpu_buffer": cpu_buffer,
-            "dtype": dtype,
-            "device_index": device_index,
-            "restore_event": None,
-            "pack_event": None,
-            "released": False,
-            "owner_cls": owner_cls,
-        }
-        self.stream_idx = 0
-        self._finalizer = weakref.finalize(self, PackedCPUBuffer._finalize, self._state)
-
-    @staticmethod
-    def _finalize(state):
-        if state["released"]:
-            return
-        state["released"] = True
-        state["owner_cls"]._release_cpu_buffer(
-            cpu_buffer=state["cpu_buffer"],
-            dtype=state["dtype"],
-            device_index=state["device_index"],
-            restore_event=state["restore_event"],
-        )
-
-    @property
-    def cpu_buffer(self):
-        return self._state["cpu_buffer"]
-
-    def set_restore_event(self, restore_event):
-        if not self._state["released"]:
-            self._state["restore_event"] = restore_event
+            cls.ensure_metadata(dtype)
+        return None
 
 
 class _UnslothActivationTicket:
@@ -2723,7 +1642,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
         # All Unsloth Zoo code licensed under LGPLv3
-        # check_backward_validity(args)
         # Check if no requires_grad in inputs
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
@@ -2990,7 +1908,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 device_type=ctx.device_type, **ctx.device_autocast_kwargs
             ) if torch.amp.is_autocast_available(ctx.device_type) else contextlib.nullcontext()
 
-            # detached_inputs = detach_variable(tuple(inputs))
             detached_inputs = []
             for inp in inputs:
                 if not isinstance(inp, torch.Tensor):
@@ -3008,10 +1925,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 wait_duration = (time.perf_counter() - wait_start) if _gc_profile_enabled() else 0.0
                 x = buffer.detach()
                 x.requires_grad_(True)
-                # Restored tensor is a plain torch.Tensor (local shard).
-                # No DTensor rewrap needed: autograd uses local shard for
-                # backward, and FSDP2 handles gradient reduction separately.
-                # x = _rewrap_dtensor(x, original_dtensor)
                 detached_inputs[0] = x
                 if _gc_profile_enabled():
                     _gc_profile_record(
@@ -3076,67 +1989,6 @@ pass
 @torch._disable_dynamo
 def _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=True):
     return UnslothCheckpointFunction.apply(function, preserve_rng_state, *args)
-
-
-def _find_first_grad_tensor(outputs):
-    """Walk an output pytree for the first tensor with requires_grad and a grad_fn.
-    Returns the tensor or None. Traverses tuples/lists/dicts; stops on first hit."""
-    if torch.is_tensor(outputs):
-        if outputs.requires_grad and outputs.grad_fn is not None:
-            return outputs
-        return None
-    if isinstance(outputs, (tuple, list)):
-        for item in outputs:
-            found = _find_first_grad_tensor(item)
-            if found is not None:
-                return found
-        return None
-    if isinstance(outputs, dict):
-        for item in outputs.values():
-            found = _find_first_grad_tensor(item)
-            if found is not None:
-                return found
-        return None
-    return None
-
-
-def _install_eager_prefetch_hook(outputs, cls):
-    """Variant A: on first backward gradient arriving at this checkpoint's
-    boundary, eagerly issue H2D copies for up to ring_size-1 pending packs
-    (tail of _pending_unpacks, i.e. reverse pack order = consume order).
-
-    Uses per-tensor register_hook (not register_multi_grad_hook) so the cb
-    fires as soon as one output's backward arrives; multi_grad_hook would
-    require ALL outputs to receive gradients which is fragile for models
-    with dropped return values."""
-    target = _find_first_grad_tensor(outputs)
-    if target is None:
-        return
-    fired = [False]
-
-    def _cb(grad):
-        if fired[0]:
-            return
-        fired[0] = True
-        try:
-            pending = cls._pending_unpacks
-            if not pending:
-                return
-            cap = max(0, _GC_PREFETCH_RING_SIZE - 1)
-            n = min(len(pending), cap)
-            # tail first -- matches LIFO backward consume order
-            for k in range(1, n + 1):
-                p = pending[-k]
-                if not p._state.get("h2d_issued"):
-                    cls._issue_h2d_for_pack(p)
-        except Exception:
-            pass
-
-    try:
-        target.register_hook(_cb)
-    except Exception:
-        pass
-
 
 def _resolve_unsloth_scheduler_from_checkpoint_function(function, attr_name):
     bound_module = getattr(function, "__self__", None)
@@ -3273,21 +2125,6 @@ def _unsloth_checkpoint_reentrant_offload(function, *args, preserve_rng_state=Tr
 
 
 _UNSLOTH_CHECKPOINT_HIT_COUNT = [0]
-_UNSLOTH_PACK_HIT_COUNT = [0]
-_UNSLOTH_PACK_BYTES = [0]
-_UNSLOTH_PACK_WALL_NS = [0]
-_UNSLOTH_PACK_ACQUIRE_NS = [0]
-_UNSLOTH_PACK_WAITSTREAM_NS = [0]
-_UNSLOTH_PACK_COPY_NS = [0]
-_UNSLOTH_PACK_POOL_HITS = [0]
-_UNSLOTH_PACK_POOL_MISSES = [0]
-_UNSLOTH_PACK_POOL_GROWS = [0]
-_UNSLOTH_PACK_PINALLOC_NS = [0]
-_UNSLOTH_PACK_PINRESIZE_NS = [0]
-_UNSLOTH_UNPACK_WALL_NS = [0]
-_UNSLOTH_UNPACK_PREFETCH_CALLS = [0]
-_UNSLOTH_PREFETCH_READY_AT_WAIT = [0]
-_UNSLOTH_PREFETCH_NOTREADY_AT_WAIT = [0]
 _UNSLOTH_STREAM_BOUNDARIES = [0]
 _UNSLOTH_STREAM_BACKWARD_BOUNDARIES = [0]
 _UNSLOTH_STREAM_PUSHES = [0]
@@ -3306,21 +2143,6 @@ def _report_checkpoint_hit_count():
     if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
         print(
             f"[gc_hit_count] unsloth_checkpoint entries={_UNSLOTH_CHECKPOINT_HIT_COUNT[0]} "
-            f"pack_calls={_UNSLOTH_PACK_HIT_COUNT[0]} "
-            f"pack_MiB={_UNSLOTH_PACK_BYTES[0]/1024/1024:.1f} "
-            f"pack_wall_ms={_UNSLOTH_PACK_WALL_NS[0]/1e6:.1f} "
-            f"pack_acquire_ms={_UNSLOTH_PACK_ACQUIRE_NS[0]/1e6:.1f} "
-            f"pack_waitstream_ms={_UNSLOTH_PACK_WAITSTREAM_NS[0]/1e6:.1f} "
-            f"pack_copy_ms={_UNSLOTH_PACK_COPY_NS[0]/1e6:.1f} "
-            f"pack_pool_hits={_UNSLOTH_PACK_POOL_HITS[0]} "
-            f"pack_pool_misses={_UNSLOTH_PACK_POOL_MISSES[0]} "
-            f"pack_pool_grows={_UNSLOTH_PACK_POOL_GROWS[0]} "
-            f"pack_pinalloc_ms={_UNSLOTH_PACK_PINALLOC_NS[0]/1e6:.1f} "
-            f"pack_pinresize_ms={_UNSLOTH_PACK_PINRESIZE_NS[0]/1e6:.1f} "
-            f"unpack_wall_ms={_UNSLOTH_UNPACK_WALL_NS[0]/1e6:.1f} "
-            f"unpack_prefetch_calls={_UNSLOTH_UNPACK_PREFETCH_CALLS[0]} "
-            f"prefetch_ready_at_wait={_UNSLOTH_PREFETCH_READY_AT_WAIT[0]} "
-            f"prefetch_NOTready_at_wait={_UNSLOTH_PREFETCH_NOTREADY_AT_WAIT[0]} "
             f"unsloth_stream_boundaries={_UNSLOTH_STREAM_BOUNDARIES[0]} "
             f"unsloth_stream_backward_boundaries={_UNSLOTH_STREAM_BACKWARD_BOUNDARIES[0]} "
             f"unsloth_stream_pushes={_UNSLOTH_STREAM_PUSHES[0]} "
@@ -3599,19 +2421,3 @@ pass
 def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     return unsloth_checkpoint(function, *args, use_reentrant = False, **kwargs)
 pass
-
-# Unsloth Zoo - Utilities for Unsloth
-# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
