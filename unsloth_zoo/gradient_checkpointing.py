@@ -67,7 +67,6 @@ __all__ = [
     "unpatch_unsloth_smart_gradient_checkpointing",
     "reset_unsloth_gradient_checkpointing_buffers",
     "UnslothGradientCheckpointer",
-    "UnslothOffloadActivations",
     "resolve_sac_context_fn",
     "set_sac_policy",
     "resolve_gc_offload_backend",
@@ -98,20 +97,12 @@ except ImportError:
 _SAC_ATTENTION_OPS = None
 _SAC_MATMUL_OPS = None
 _GC_OFFLOAD_BACKENDS = {
-    "noop",
-    "boundary",
-    "boundary_prefetch",
     "hooks",
-    "hooks_prefetch",
-    "unsloth_group",
-    "unsloth_async",
     "unsloth_stream",
 }
-# `boundary` is an alias for `noop`: both route via _NoopSaveInputs.setup_context
-# so only the checkpoint-region's input tensors get offloaded (skipping the
-# broad saved_tensors_hooks pack of every internal tensor). `boundary_prefetch`
-# keeps that narrow boundary-only selection, but restores through the reverse
-# checkpoint-order prefetch scheduler.
+# Release backend surface: `hooks` preserves the normal Unsloth reentrant
+# sentinel/default; `unsloth_stream` is the supported activation-offload backend
+# for both non-reentrant and reentrant stream checkpointing.
 # Ring slot count for prefetch-capable unpack. Must be strictly greater than
 # the max prefetch depth you intend to use; with depth D the prefetch of K+D
 # runs while main_stream is still consuming slot K, so we need at least D+1
@@ -540,9 +531,6 @@ def resolve_gc_offload_backend(backend = None):
             f"Unsloth: Unknown GC offload backend {backend!r}. "
             f"Available: {sorted(_GC_OFFLOAD_BACKENDS)}"
         )
-    # `boundary` is the documented alias; internal dispatch still uses `noop`.
-    if backend == "boundary":
-        backend = "noop"
     return backend
 
 
@@ -550,8 +538,8 @@ def _is_fsdp2_module(run_function) -> bool:
     """True iff ``run_function`` is bound to a module managed by FSDP2 fully_shard
     with real sharding (world_size > 1). Used by ``unsloth_checkpoint`` to auto-
     force ``use_reentrant=False`` under FSDP2 -- the reentrant path leaks memory
-    via retained unshard state across layers, while the non-reentrant path
-    (Mode A hooks / Mode B noop) composes cleanly with FSDP2.
+    via retained unshard state across layers, while the non-reentrant stream
+    activation offload path composes cleanly with FSDP2.
     """
     import functools as _ft
     try:
@@ -706,14 +694,14 @@ def _bind_gradient_checkpointing_func(
     partial_kwargs = {}
     if use_reentrant is not None:
         partial_kwargs["use_reentrant"] = use_reentrant
-    # context_fn is only valid for the non-reentrant path. The grouped Unsloth
-    # offload backends also have a reentrant dispatch path below, so keep their
-    # backend name bound in both modes.
+    # context_fn is only valid for the non-reentrant path. `unsloth_stream` also
+    # has a reentrant dispatch path below, so keep that backend bound in both
+    # modes.
     if (use_reentrant is False) and context_fn is not None:
         partial_kwargs["context_fn"] = context_fn
     if offload_backend is not None:
         resolved_backend = resolve_gc_offload_backend(offload_backend)
-        if (use_reentrant is False) or resolved_backend in ("unsloth_group", "unsloth_async", "unsloth_stream"):
+        if (use_reentrant is False) or resolved_backend == "unsloth_stream":
             partial_kwargs["offload_backend"] = resolved_backend
 
     if partial_kwargs:
@@ -787,17 +775,11 @@ def set_offload_backend(model, backend):
     )
     try:
         from .training_utils import (
-            _install_hook_based_offload_wrapper,
-            _install_unsloth_async_offload_wrapper,
             _install_unsloth_stream_offload_wrapper,
             _remove_hook_based_offload_wrapper,
         )
         dtype = getattr(getattr(model, "config", None), "torch_dtype", None)
-        if (not use_reentrant) and backend == "hooks":
-            _install_hook_based_offload_wrapper(model, dtype)
-        elif backend == "unsloth_async":
-            _install_unsloth_async_offload_wrapper(model, dtype)
-        elif backend == "unsloth_stream":
+        if backend == "unsloth_stream":
             _install_unsloth_stream_offload_wrapper(model, dtype)
         else:
             _remove_hook_based_offload_wrapper(model)
@@ -1064,98 +1046,11 @@ elif DEVICE_TYPE == "xpu":
 
 CPU_BUFFERS = []
 CPU_INDEX = None
-_noop_offload_state: ContextVar[Optional[dict]] = ContextVar("_noop_offload_state", default=None)
 _hooks_offload_state: ContextVar[Optional[dict]] = ContextVar("_hooks_offload_state", default=None)
 # Module-level default offload backend, set by set_offload_backend().
 # Used as fallback when HF's gradient_checkpointing_enable() overwrites the
 # per-module partial binding and drops the offload_backend kwarg.
 _default_offload_backend: Optional[str] = None
-pass
-
-
-def _patch_noop_save_inputs():
-    cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
-    if cls is None:
-        return
-    if UnslothGradientCheckpointer._original_noop_setup_context is not None:
-        return
-    UnslothGradientCheckpointer._original_noop_setup_context = cls.setup_context
-
-    def unsloth_setup_context(ctx: Any, inputs: Tuple[Any, ...], output: Any) -> None:
-        state = _noop_offload_state.get()
-        if state is None:
-            return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
-
-        offloader = state.get("offloader", None)
-        if offloader is None:
-            return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
-
-        boundary_requires_grad = not bool(state.get("offload_nongrad", False))
-        use_prefetch = bool(state.get("prefetch", False))
-        boundary_min_bytes = int(state.get("boundary_min_bytes", 0) or 0)
-        n_inputs = len(inputs)
-        # 0 = non-tensor, 1 = saved tensor, 2 = offloaded tensor
-        entry_kind = [0] * n_inputs
-        entry_index = [-1] * n_inputs
-        non_tensor_values = [None] * n_inputs
-        saved_tensors = []
-        offloaded = []
-
-        for i, o in enumerate(inputs):
-            if not isinstance(o, torch.Tensor):
-                non_tensor_values[i] = o
-                continue
-
-            if (
-                (not boundary_requires_grad or o.requires_grad)
-                and (boundary_min_bytes <= 0 or o.numel() * o.element_size() >= boundary_min_bytes)
-                and offloader.should_offload(o)
-            ):
-                packed = offloader.pack_hook(o)
-                if isinstance(packed, PackedCPUBuffer):
-                    off_idx = len(offloaded)
-                    offloaded.append(packed)
-                    entry_kind[i] = 2
-                    entry_index[i] = off_idx
-                    continue
-
-            saved_idx = len(saved_tensors)
-            saved_tensors.append(o)
-            entry_kind[i] = 1
-            entry_index[i] = saved_idx
-
-        def get_args(saved_tensors_runtime):
-            ret = [None] * (n_inputs - 1)
-            for i in range(1, n_inputs):
-                kind = entry_kind[i]
-                if kind == 0:
-                    ret[i - 1] = non_tensor_values[i]
-                elif kind == 1:
-                    ret[i - 1] = saved_tensors_runtime[entry_index[i]]
-                else:
-                    packed = offloaded[entry_index[i]]
-                    if use_prefetch:
-                        ret[i - 1] = UnslothGradientCheckpointer.unpack_packed_prefetch(packed)
-                    else:
-                        ret[i - 1] = UnslothGradientCheckpointer.unpack_packed(packed)
-            return ret
-
-        ctx.get_args = get_args
-        ctx.save_for_backward(*saved_tensors)
-
-    cls.setup_context = staticmethod(unsloth_setup_context)
-pass
-
-
-def _unpatch_noop_save_inputs():
-    cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
-    if cls is None:
-        return
-    if UnslothGradientCheckpointer._original_noop_setup_context is None:
-        return
-    cls.setup_context = UnslothGradientCheckpointer._original_noop_setup_context
-    UnslothGradientCheckpointer._original_noop_setup_context = None
-    _noop_offload_state.set(None)
 pass
 
 
@@ -1175,10 +1070,7 @@ def _gc_env_flag(name: str) -> bool:
 
 
 def _gc_active_offload_state() -> Optional[dict]:
-    state = _hooks_offload_state.get()
-    if state is not None:
-        return state
-    return _noop_offload_state.get()
+    return _hooks_offload_state.get()
 
 
 def _gc_eager_prefetch() -> bool:
@@ -1192,17 +1084,6 @@ def _gc_aux_stream() -> bool:
 def _gc_narrow_wait() -> bool:
     return _gc_env_flag("UNSLOTH_GC_NARROW_WAIT")
 pass
-
-
-def _gc_boundary_min_bytes() -> int:
-    # Boundary-prefetch is intentionally narrower than the broad hooks backend:
-    # by default it only offloads checkpoint-boundary tensors large enough to
-    # matter for peak activation memory. Override to tune smaller workloads.
-    try:
-        mib = float(os.environ.get("UNSLOTH_GC_BOUNDARY_MIN_OFFLOAD_MB", "64"))
-    except ValueError:
-        mib = 64.0
-    return max(0, int(mib * 1024 * 1024))
 
 
 _pinned_bytes_allocated: int = 0
@@ -1325,7 +1206,6 @@ class UnslothGradientCheckpointer:
     _dtype: torch.dtype = None
     _events_supported: Optional[bool] = None
     _meta_initialized: bool = False
-    _original_noop_setup_context: Optional[Any] = None
 
     @classmethod
     def ensure_metadata(cls, dtype: torch.dtype = None):
@@ -2503,324 +2383,11 @@ class _UnslothActivationBoundary(torch.autograd.Function):
         return grad_output, None
 
 
-class _UnslothRegionActivationStash:
-    """Checkpoint-region stash backed by Unsloth's pinned-buffer machinery."""
-
-    def __init__(self, offloader):
-        self.offloader = offloader
-        self._next_tag = 0
-        self._states = {}
-        self._sealed = False
-
-    def stash_tensor(self, tensor: torch.Tensor):
-        if not self.offloader.should_offload(tensor):
-            return ("gpu", tensor)
-        tag = self._next_tag
-        self._next_tag += 1
-        self._states[tag] = tensor
-        return _UnslothActivationTicket(self, tag)
-
-    def restore_tensor(self, token):
-        if not isinstance(token, _UnslothActivationTicket):
-            if isinstance(token, tuple) and token[0] == "gpu":
-                return token[1]
-            return token
-        state = self._states.pop(token.tag)
-        if isinstance(state, PackedCPUBuffer):
-            if bool(state._state.get("use_prefetch", False)):
-                return UnslothGradientCheckpointer.unpack_packed_prefetch(state)
-            return UnslothGradientCheckpointer.unpack_packed(state)
-        return state
-
-    def seal_forward_region(self):
-        if self._sealed:
-            return
-        self._sealed = True
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_REGION_BOUNDARIES[0] += 1
-            _UNSLOTH_GROUP_TENSORS[0] += len(self._states)
-        for tag, tensor in list(self._states.items()):
-            if torch.is_tensor(tensor):
-                self._states[tag] = self.offloader.pack_hook(tensor)
-
-    def rewind_for_backward_region(self):
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_REGION_BACKWARD_BOUNDARIES[0] += 1
-
-
 def _get_unique_tensor_key(tensor):
     try:
         return (tensor.untyped_storage().data_ptr() + tensor.storage_offset(), tensor.dtype)
     except Exception:
         return (id(tensor), getattr(tensor, "dtype", None))
-
-
-class UnslothActivationWindowScheduler:
-    """Layer-window scheduler for Unsloth async activation stashing.
-
-    Saved tensors are ticketed by checkpoint window. Forward boundaries stage
-    older windows to host memory, and backward boundaries restore the next
-    window before autograd asks saved_tensors_hooks to unpack it.
-    """
-
-    def __init__(self, offloader, num_host_windows, num_layer_windows):
-        self.offloader = offloader
-        self.num_host_windows = max(0, int(num_host_windows))
-        self.num_layer_windows = max(1, int(num_layer_windows))
-        self.parameter_storage = set()
-        self._parameter_storage_cache = {}
-        self.reset_step_windows()
-
-        self.forward_window_map = {}
-        constant = 0
-        for i in range(self.num_host_windows):
-            self.forward_window_map[i] = ((self.num_layer_windows // self.num_host_windows) * (i + 1)) - 1
-            if i < (self.num_layer_windows % self.num_host_windows):
-                self.forward_window_map[i] += i + 1
-                constant = i + 1
-            else:
-                self.forward_window_map[i] += constant
-
-    def update_model_parameters(self, module):
-        # The wrapped layer's parameter storage is stable after FSDP setup.
-        # Cache it so repeated checkpoint boundaries avoid a Python parameter scan.
-        cache_key = id(module)
-        cached = self._parameter_storage_cache.get(cache_key)
-        if cached is not None:
-            self.parameter_storage = cached
-            return
-
-        storage = set()
-        try:
-            params = module.parameters()
-        except Exception:
-            params = ()
-        for param in params:
-            try:
-                tensor = _unwrap_dtensor(param.data)
-                storage.add(tensor.untyped_storage().data_ptr())
-            except Exception:
-                pass
-        self.parameter_storage = storage
-        self._parameter_storage_cache[cache_key] = storage
-
-    def reset_step_windows(self):
-        self.current_window = 0
-        self.tensor_count_current_window = 0
-        self.ticket_state = {}
-        self.device_hold_refs = {}
-        self.host_windows = {}
-        self.active_windows = set()
-        self.staged_window_count = 0
-
-    def stash_tensor(self, tensor: torch.Tensor):
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_ASYNC_PUSHES[0] += 1
-        if not self.should_offload(tensor):
-            if (
-                os.environ.get("UNSLOTH_GC_TRACE_ASYNC", "") in ("1", "true", "True")
-                and not getattr(self, "_debug_reject_printed", False)
-            ):
-                self._debug_reject_printed = True
-                try:
-                    is_view = bool(tensor._is_view())
-                except Exception:
-                    is_view = None
-                print(
-                    f"[unsloth_async] first rejected saved tensor shape={tuple(tensor.shape)} "
-                    f"dtype={tensor.dtype} device={tensor.device} numel={tensor.numel()} "
-                    f"min_size={UnslothGradientCheckpointer._minimum_size} "
-                    f"requires_grad={tensor.requires_grad} grad_fn={type(tensor.grad_fn).__name__ if tensor.grad_fn is not None else None} "
-                    f"is_last_layer={getattr(self.offloader, 'is_last_layer', None)} "
-                    f"contiguous={tensor.is_contiguous()} storage_offset={tensor.storage_offset()} "
-                    f"is_view={is_view}",
-                    flush=True,
-                )
-            return tensor
-        # Keep the release default conservative; set to 0 to capture every
-        # eligible tensor in the group when chasing maximum memory reduction.
-        try:
-            max_tensors_per_group = int(os.environ.get("UNSLOTH_GC_ASYNC_MAX_TENSORS_PER_GROUP", "1"))
-        except ValueError:
-            max_tensors_per_group = 1
-        if max_tensors_per_group > 0 and self.tensor_count_current_window >= max_tensors_per_group:
-            return tensor
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_ASYNC_OFFLOADABLE_PUSHES[0] += 1
-        self.active_windows.add(self.current_window)
-        tensor_tag = (self.current_window, self.tensor_count_current_window)
-        self.tensor_count_current_window += 1
-        self.ticket_state[tensor_tag] = tensor
-        if self.current_window < self.num_host_windows:
-            self.device_hold_refs[tensor_tag] = tensor
-        return _UnslothActivationTicket(self, tensor_tag)
-
-    def should_offload(self, tensor: torch.Tensor) -> bool:
-        if _gc_disable_cpu_offload():
-            return False
-        tensor = _unwrap_dtensor(tensor)
-        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
-            if torch.compiler.is_compiling():
-                return False
-        if tensor.numel() < UnslothGradientCheckpointer._minimum_size:
-            return False
-        if tensor.device.type == "cpu":
-            return False
-        if getattr(self.offloader, "is_last_layer", False):
-            return False
-        try:
-            if tensor.untyped_storage().data_ptr() in self.parameter_storage:
-                return False
-        except Exception:
-            pass
-        if tensor.layout != torch.strided:
-            return False
-        if (not tensor.is_contiguous()) or (tensor.storage_offset() != 0):
-            return False
-        return True
-
-    def _restore_from_state(self, state):
-        if isinstance(state, PackedCPUBuffer):
-            return UnslothGradientCheckpointer.unpack_packed_prefetch(state)
-        if isinstance(state, tuple) and len(state) == 6 and state[0] == "alias":
-            _, packed, shape, stride, requires_grad, dtype = state
-            result = UnslothGradientCheckpointer.unpack_packed_prefetch(packed)
-            if tuple(result.shape) != tuple(shape):
-                result = result.view(shape)
-            if tuple(result.stride()) != tuple(stride):
-                result = result.as_strided(shape, stride)
-            if result.dtype != dtype:
-                result = result.to(dtype)
-            if result.requires_grad != requires_grad:
-                result.requires_grad_(requires_grad)
-            return result
-        return state
-
-    def restore_tensor(self, token):
-        if not isinstance(token, _UnslothActivationTicket):
-            if isinstance(token, tuple) and token[0] == "gpu":
-                return token[1]
-            return token
-        state = self.ticket_state.pop(token.tag)
-        self.device_hold_refs.pop(token.tag, None)
-        return self._restore_from_state(state)
-
-    def _wait_group_d2h_if_requested(self, group_id):
-        if os.environ.get("UNSLOTH_GC_ASYNC_WAIT_D2H", "1") not in ("1", "true", "True"):
-            return
-        if DEVICE_TYPE not in ("cuda", "hip"):
-            return
-        device = None
-        events = []
-        for packed in self.host_windows.get(group_id, {}).values():
-            if not isinstance(packed, PackedCPUBuffer):
-                continue
-            event = packed._state.get("pack_event")
-            if event is not None:
-                events.append(event)
-                if device is None:
-                    device = torch.device(f"{DEVICE_TYPE_TORCH}:{packed.device_index}")
-        if not events:
-            return
-        main_stream = torch.cuda.current_stream(device)
-        for event in events:
-            try:
-                main_stream.wait_event(event)
-            except Exception:
-                pass
-
-    def stage_window_to_host(self, group_to_offload):
-        if group_to_offload in self.host_windows:
-            return
-        offload_mapping = {}
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_ASYNC_OFFLOAD_GROUPS[0] += 1
-        for tensor_tag, state in list(self.ticket_state.items()):
-            group_id, _ = tensor_tag
-            if group_id != group_to_offload or not torch.is_tensor(state):
-                continue
-            key = _get_unique_tensor_key(state)
-            if key not in offload_mapping:
-                packed = self.offloader.pack_hook(state, force=True)
-                if isinstance(packed, PackedCPUBuffer):
-                    packed._state["use_prefetch"] = True
-                    packed._state["prefetch_ring_eager_free"] = True
-                offload_mapping[key] = packed
-            packed = offload_mapping[key]
-            if isinstance(packed, PackedCPUBuffer):
-                self.ticket_state[tensor_tag] = (
-                    "alias",
-                    packed,
-                    state.shape,
-                    state.stride(),
-                    state.requires_grad,
-                    state.dtype,
-                )
-            else:
-                self.ticket_state[tensor_tag] = packed
-        self.host_windows[group_to_offload] = offload_mapping
-
-    def advance_forward_window(self, current_window):
-        if self.num_host_windows <= 0 or self.staged_window_count >= self.num_host_windows:
-            return
-        if current_window == 0:
-            self.stage_window_to_host(current_window)
-        if self.forward_window_map.get(self.staged_window_count) == current_window:
-            self._wait_group_d2h_if_requested(self.staged_window_count)
-            for tensor_tag in list(self.device_hold_refs.keys()):
-                if tensor_tag[0] == self.staged_window_count:
-                    self.device_hold_refs[tensor_tag] = None
-            if self.staged_window_count < (self.num_host_windows - 1):
-                self.stage_window_to_host(self.staged_window_count + 1)
-            self.staged_window_count += 1
-
-    def restore_window_to_device(self, group_to_reload):
-        mapping = self.host_windows.pop(group_to_reload, None)
-        if not mapping:
-            return
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_ASYNC_RELOAD_GROUPS[0] += 1
-        if os.environ.get("UNSLOTH_GC_ASYNC_BULK_H2D", "") not in ("1", "true", "True"):
-            return
-        restore_tensors = 0
-        with torch.no_grad():
-            for packed in mapping.values():
-                if isinstance(packed, PackedCPUBuffer) and not packed._state.get("h2d_issued"):
-                    UnslothGradientCheckpointer._issue_h2d_for_pack(packed)
-                    restore_tensors += 1
-        if restore_tensors and os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_ASYNC_RESTORE_TENSORS[0] += restore_tensors
-
-    def seal_forward_region(self):
-        if self.current_window not in self.active_windows:
-            # GRPO generation/reference passes can execute checkpoint-wrapped
-            # layer forwards without saving any tensors for backward. Advancing
-            # the Unsloth async group schedule for those empty regions exhausts the
-            # offload window before the real training forward arrives.
-            return
-        self.active_windows.discard(self.current_window)
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_ASYNC_BOUNDARIES[0] += 1
-        self.advance_forward_window(self.current_window)
-        self.current_window += 1
-        self.tensor_count_current_window = 0
-
-    def rewind_for_backward_region(self):
-        self.current_window -= 1
-        if self.current_window < 0:
-            self.current_window = 0
-            return
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_ASYNC_BACKWARD_BOUNDARIES[0] += 1
-        if self.num_host_windows <= 0 or self.staged_window_count <= 0:
-            return
-        idx = self.staged_window_count - 1
-        if self.forward_window_map.get(idx) == self.current_window:
-            self.restore_window_to_device(idx)
-            self.staged_window_count -= 1 if self.staged_window_count > 1 else 0
-        if self.current_window == 0:
-            self.host_windows.clear()
-            self.staged_window_count = 0
 
 
 class _UnslothHostActivation:
@@ -2876,9 +2443,6 @@ class UnslothStreamActivationScheduler:
         self.staged_window_count = 0
 
     def update_model_parameters(self, module):
-        if os.environ.get("UNSLOTH_GC_STREAM_SKIP_PARAMETER_FILTER", "") in ("1", "true", "True"):
-            self.parameter_storage = set()
-            return
         cache_key = id(module)
         cached = self._parameter_storage_cache.get(cache_key)
         if cached is not None:
@@ -2924,15 +2488,6 @@ class UnslothStreamActivationScheduler:
         return self._cuda_stream(self._h2d_streams, device)
 
     def should_stage(self, tensor: torch.Tensor) -> bool:
-        _profile_stream = os.environ.get("UNSLOTH_GC_STREAM_PROFILE", "") in ("1", "true", "True")
-        _start_ns = time.perf_counter_ns() if _profile_stream else 0
-        try:
-            return self._should_stage_impl(tensor)
-        finally:
-            if _profile_stream:
-                _UNSLOTH_STREAM_SHOULD_STAGE_NS[0] += time.perf_counter_ns() - _start_ns
-
-    def _should_stage_impl(self, tensor: torch.Tensor) -> bool:
         if _gc_disable_cpu_offload():
             return False
         tensor = _unwrap_dtensor(tensor)
@@ -2949,15 +2504,13 @@ class UnslothStreamActivationScheduler:
             return False
         if tensor.layout != torch.strided:
             return False
-        if os.environ.get("UNSLOTH_GC_STREAM_ALLOW_VIEWS", "") not in ("1", "true", "True"):
-            if (not tensor.is_contiguous()) or (tensor.storage_offset() != 0):
+        if (not tensor.is_contiguous()) or (tensor.storage_offset() != 0):
+            return False
+        try:
+            if tensor.untyped_storage().data_ptr() in self.parameter_storage:
                 return False
-        if os.environ.get("UNSLOTH_GC_STREAM_SKIP_PARAMETER_FILTER", "") not in ("1", "true", "True"):
-            try:
-                if tensor.untyped_storage().data_ptr() in self.parameter_storage:
-                    return False
-            except Exception:
-                pass
+        except Exception:
+            pass
         return True
 
     def stash_tensor(self, tensor: torch.Tensor):
@@ -3005,83 +2558,65 @@ class UnslothStreamActivationScheduler:
             return host.pin_memory()
 
     def _copy_to_host(self, tensor):
-        _profile_stream = os.environ.get("UNSLOTH_GC_STREAM_PROFILE", "") in ("1", "true", "True")
-        _start_ns = time.perf_counter_ns() if _profile_stream else 0
         device = tensor.device
         stream = self._d2h_stream(device)
         event = None
-        try:
-            with torch.no_grad():
-                host = self._new_host_tensor(tensor)
-                if stream is None:
-                    host.copy_(tensor, non_blocking=False)
-                else:
-                    current_stream = torch.cuda.current_stream(device)
-                    stream.wait_stream(current_stream)
-                    with torch.cuda.stream(stream):
-                        host.copy_(tensor, non_blocking=True)
-                        event = torch.cuda.Event()
-                        event.record(stream)
-            return _UnslothHostActivation(host, device, event)
-        finally:
-            if _profile_stream:
-                _UNSLOTH_STREAM_D2H_ISSUE_NS[0] += time.perf_counter_ns() - _start_ns
+        with torch.no_grad():
+            host = self._new_host_tensor(tensor)
+            if stream is None:
+                host.copy_(tensor, non_blocking=False)
+            else:
+                current_stream = torch.cuda.current_stream(device)
+                stream.wait_stream(current_stream)
+                with torch.cuda.stream(stream):
+                    host.copy_(tensor, non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(stream)
+        return _UnslothHostActivation(host, device, event)
 
     def _wait_host_ready(self, slot):
-        _profile_stream = os.environ.get("UNSLOTH_GC_STREAM_PROFILE", "") in ("1", "true", "True")
-        _start_ns = time.perf_counter_ns() if _profile_stream else 0
         event = getattr(slot, "host_ready_event", None)
+        if event is None:
+            return
+        if DEVICE_TYPE not in ("cuda", "hip"):
+            return
         try:
-            if event is None:
-                return
-            if DEVICE_TYPE not in ("cuda", "hip"):
-                return
-            try:
-                torch.cuda.current_stream(slot.device).wait_event(event)
-            except Exception:
-                pass
-        finally:
-            if _profile_stream:
-                _UNSLOTH_STREAM_HOST_WAIT_NS[0] += time.perf_counter_ns() - _start_ns
+            torch.cuda.current_stream(slot.device).wait_event(event)
+        except Exception:
+            pass
 
     def _restore_slot_to_device(self, slot):
-        _profile_stream = os.environ.get("UNSLOTH_GC_STREAM_PROFILE", "") in ("1", "true", "True")
-        _start_ns = time.perf_counter_ns() if _profile_stream else 0
         if slot.device_tensor is not None:
             return False
         stream = self._h2d_stream(slot.device)
-        try:
-            with torch.no_grad():
-                if stream is None:
-                    if slot.host_tensor is None:
-                        return False
-                    slot.device_tensor = slot.host_tensor.to(slot.device, non_blocking=False)
-                    return True
-                current_stream = torch.cuda.current_stream(slot.device)
-                stream.wait_stream(current_stream)
-                if slot.host_ready_event is not None:
-                    try:
-                        stream.wait_event(slot.host_ready_event)
-                    except Exception:
-                        pass
-                with torch.cuda.stream(stream):
-                    if slot.host_tensor is None:
-                        return False
-                    restored = torch.empty_strided(
-                        tuple(slot.host_tensor.size()),
-                        tuple(slot.host_tensor.stride()),
-                        dtype=slot.host_tensor.dtype,
-                        layout=slot.host_tensor.layout,
-                        device=slot.device,
-                    )
-                    restored.copy_(slot.host_tensor, non_blocking=True)
-                    slot.device_tensor = restored
-                    slot.device_ready_event = torch.cuda.Event()
-                    slot.device_ready_event.record(stream)
-            return True
-        finally:
-            if _profile_stream:
-                _UNSLOTH_STREAM_H2D_ISSUE_NS[0] += time.perf_counter_ns() - _start_ns
+        with torch.no_grad():
+            if stream is None:
+                if slot.host_tensor is None:
+                    return False
+                slot.device_tensor = slot.host_tensor.to(slot.device, non_blocking=False)
+                return True
+            current_stream = torch.cuda.current_stream(slot.device)
+            stream.wait_stream(current_stream)
+            if slot.host_ready_event is not None:
+                try:
+                    stream.wait_event(slot.host_ready_event)
+                except Exception:
+                    pass
+            with torch.cuda.stream(stream):
+                if slot.host_tensor is None:
+                    return False
+                restored = torch.empty_strided(
+                    tuple(slot.host_tensor.size()),
+                    tuple(slot.host_tensor.stride()),
+                    dtype=slot.host_tensor.dtype,
+                    layout=slot.host_tensor.layout,
+                    device=slot.device,
+                )
+                restored.copy_(slot.host_tensor, non_blocking=True)
+                slot.device_tensor = restored
+                slot.device_ready_event = torch.cuda.Event()
+                slot.device_ready_event.record(stream)
+        return True
 
     def _wait_device_ready(self, slot):
         event = getattr(slot, "device_ready_event", None)
@@ -3678,10 +3213,6 @@ def _resolve_unsloth_scheduler_from_checkpoint_function(function, attr_name):
     return None, bound_module
 
 
-def _resolve_unsloth_async_scheduler_from_checkpoint_function(function):
-    return _resolve_unsloth_scheduler_from_checkpoint_function(function, "_unsloth_async_scheduler")
-
-
 def _resolve_unsloth_stream_scheduler_from_checkpoint_function(function):
     return _resolve_unsloth_scheduler_from_checkpoint_function(function, "_unsloth_stream_scheduler")
 
@@ -3690,9 +3221,13 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
     """Non-reentrant checkpoint using native PyTorch checkpoint plus scoped input offload."""
     preserve = kwargs.pop("preserve_rng_state", True)
     context_fn = kwargs.pop("context_fn", noop_context_fn)
-    offload_backend = resolve_gc_offload_backend(
-        kwargs.pop("offload_backend", None) or _default_offload_backend
-    )
+    offload_backend_arg = kwargs.pop("offload_backend", None)
+    if offload_backend_arg is None:
+        offload_backend_arg = (
+            _default_offload_backend
+            or os.environ.get("UNSLOTH_GC_OFFLOAD_BACKEND", "unsloth_stream")
+        )
+    offload_backend = resolve_gc_offload_backend(offload_backend_arg)
     determinism_check = kwargs.pop("determinism_check", _DEFAULT_DETERMINISM_MODE)
     debug = kwargs.pop("debug", False)
 
@@ -3703,100 +3238,22 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
     if torch.is_tensor(first_arg):
         dtype = first_arg.dtype
 
-    offloader = cls.begin_checkpoint(dtype)
+    cls.begin_checkpoint(dtype)
     old_checkpoint = getattr(torch.utils.checkpoint, "_old_checkpoint", None)
     original_checkpoint = old_checkpoint or torch.utils.checkpoint.checkpoint
 
-    if _gc_disable_cpu_offload() or offload_backend in ("hooks", "hooks_prefetch", "unsloth_group", "unsloth_async", "unsloth_stream"):
-        token = None
-        is_hooks = offload_backend in ("hooks", "hooks_prefetch")
-        is_unsloth_group = offload_backend == "unsloth_group"
-        is_unsloth_async = offload_backend == "unsloth_async"
-        is_unsloth_stream = offload_backend == "unsloth_stream"
-        # Opt-in: when UNSLOTH_GC_BOUNCE=1 is set on the `hooks` backend AND
-        # prefetch is explicitly requested via UNSLOTH_GC_PREFETCH_DEPTH>0 or
-        # UNSLOTH_GC_EAGER_PREFETCH=1, route bounce through the prefetch
-        # restore scheduler. Bounce pack semantics are unchanged; only the
-        # consumer-side unpack switches to overlap-friendly dispatch. This
-        # path is not engaged by default; users who want it must set both
-        # env vars. See research_v2_B1_bounce_text.md for the analysis.
-        bounce_prefetch = (
-            offload_backend == "hooks"
-            and os.environ.get("UNSLOTH_GC_BOUNCE", "") in ("1", "true", "True")
-            and (
-                _gc_eager_prefetch()
-                or int(os.environ.get("UNSLOTH_GC_PREFETCH_DEPTH", "0") or "0") > 0
-            )
-        )
-        use_prefetch = offload_backend == "hooks_prefetch" or bounce_prefetch
-        eager = use_prefetch and _gc_eager_prefetch() and not _gc_disable_cpu_offload()
-        if (not _gc_disable_cpu_offload()) and is_hooks:
-            token = _hooks_offload_state.set({
-                "offloader": offloader,
-                "prefetch": use_prefetch,
-            })
-        try:
-            # Enter saved_tensors_hooks locally so activation offload is scoped to
-            # the checkpoint region instead of the entire model forward.
-            if is_unsloth_group and not _gc_disable_cpu_offload():
-                scheduler = _UnslothRegionActivationStash(offloader)
-                with _UnslothActivationSaveScope(scheduler):
-                    outputs = original_checkpoint(
-                        function, *args,
-                        use_reentrant=False,
-                        preserve_rng_state=preserve,
-                        context_fn=context_fn,
-                        determinism_check=determinism_check,
-                        debug=debug,
-                        **kwargs
-                    )
-                if scheduler._states:
-                    return _attach_activation_boundary(outputs, scheduler)
-                return outputs
-            if is_unsloth_async and not _gc_disable_cpu_offload():
-                scheduler, bound_module = _resolve_unsloth_async_scheduler_from_checkpoint_function(function)
-                if (
-                    os.environ.get("UNSLOTH_GC_TRACE_ASYNC", "") in ("1", "true", "True")
-                    and not getattr(_unsloth_checkpoint_nonreentrant, "_unsloth_async_dbg", False)
-                ):
-                    _unsloth_checkpoint_nonreentrant._unsloth_async_dbg = True
-                    print(
-                        f"[unsloth_async] checkpoint boundary function={type(function)} "
-                        f"bound_module={type(bound_module)} scheduler={'yes' if scheduler is not None else 'no'} "
-                        f"has_func={hasattr(function, 'func')} has_args={hasattr(function, 'args')} "
-                        f"func_type={type(getattr(function, 'func', None))}",
-                        flush=True,
-                    )
-                if scheduler is not None:
-                    scheduler.offloader = offloader
-                    if bound_module is not None:
-                        scheduler.update_model_parameters(bound_module)
-                        scheduler.clone_boundary_output = (
-                            getattr(bound_module, "_unsloth_async_layer_idx", -1)
-                            in getattr(scheduler, "clone_boundary_layers", set())
-                        )
-                    checkpoint_group = scheduler.current_window
-                    inner_token = _hooks_offload_state.set({
-                        "offloader": offloader,
-                        "prefetch": True,
-                    })
-                    try:
-                        with _UnslothActivationSaveScope(scheduler):
-                            outputs = original_checkpoint(
-                                function, *args,
-                                use_reentrant=False,
-                                preserve_rng_state=preserve,
-                                context_fn=context_fn,
-                                determinism_check=determinism_check,
-                                debug=debug,
-                                **kwargs
-                            )
-                        if checkpoint_group in scheduler.active_windows:
-                            return _attach_activation_boundary(outputs, scheduler)
-                        return outputs
-                    finally:
-                        _hooks_offload_state.reset(inner_token)
-                return original_checkpoint(
+    if (not _gc_disable_cpu_offload()) and offload_backend == "unsloth_stream":
+        scheduler, bound_module = _resolve_unsloth_stream_scheduler_from_checkpoint_function(function)
+        if scheduler is not None:
+            if bound_module is not None:
+                scheduler.update_model_parameters(bound_module)
+                scheduler.clone_boundary_output = (
+                    getattr(bound_module, "_unsloth_stream_layer_idx", -1)
+                    in getattr(scheduler, "clone_boundary_layers", set())
+                )
+            checkpoint_group = scheduler.current_window
+            with _UnslothActivationSaveScope(scheduler):
+                outputs = original_checkpoint(
                     function, *args,
                     use_reentrant=False,
                     preserve_rng_state=preserve,
@@ -3805,102 +3262,23 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
                     debug=debug,
                     **kwargs
                 )
-            if is_unsloth_stream and not _gc_disable_cpu_offload():
-                scheduler, bound_module = _resolve_unsloth_stream_scheduler_from_checkpoint_function(function)
-                if (
-                    os.environ.get("UNSLOTH_GC_TRACE_STREAM", "") in ("1", "true", "True")
-                    and not getattr(_unsloth_checkpoint_nonreentrant, "_unsloth_stream_dbg", False)
-                ):
-                    _unsloth_checkpoint_nonreentrant._unsloth_stream_dbg = True
-                    print(
-                        f"[unsloth_stream] checkpoint boundary function={type(function)} "
-                        f"bound_module={type(bound_module)} scheduler={'yes' if scheduler is not None else 'no'}",
-                        flush=True,
-                    )
-                if scheduler is not None:
-                    if bound_module is not None:
-                        scheduler.update_model_parameters(bound_module)
-                        scheduler.clone_boundary_output = (
-                            getattr(bound_module, "_unsloth_stream_layer_idx", -1)
-                            in getattr(scheduler, "clone_boundary_layers", set())
-                        )
-                    checkpoint_group = scheduler.current_window
-                    with _UnslothActivationSaveScope(scheduler):
-                        outputs = original_checkpoint(
-                            function, *args,
-                            use_reentrant=False,
-                            preserve_rng_state=preserve,
-                            context_fn=context_fn,
-                            determinism_check=determinism_check,
-                            debug=debug,
-                            **kwargs
-                        )
-                    if checkpoint_group in scheduler.active_windows:
-                        return _attach_activation_boundary(outputs, scheduler)
-                    return outputs
-                return original_checkpoint(
-                    function, *args,
-                    use_reentrant=False,
-                    preserve_rng_state=preserve,
-                    context_fn=context_fn,
-                    determinism_check=determinism_check,
-                    debug=debug,
-                    **kwargs
-                )
-            if is_hooks and not _gc_disable_cpu_offload():
-                with UnslothOffloadActivations(dtype=dtype):
-                    outputs = original_checkpoint(
-                        function, *args,
-                        use_reentrant=False,
-                        preserve_rng_state=preserve,
-                        context_fn=context_fn,
-                        determinism_check=determinism_check,
-                        debug=debug,
-                        **kwargs
-                    )
-                if eager:
-                    _install_eager_prefetch_hook(outputs, cls)
-                return outputs
-            return original_checkpoint(
-                function, *args,
-                use_reentrant=False,
-                preserve_rng_state=preserve,
-                context_fn=context_fn,
-                determinism_check=determinism_check,
-                debug=debug,
-                **kwargs
-            )
-        finally:
-            if token is not None:
-                _hooks_offload_state.reset(token)
+            if checkpoint_group in scheduler.active_windows:
+                return _attach_activation_boundary(outputs, scheduler)
+            return outputs
 
-    boundary_prefetch = offload_backend == "boundary_prefetch"
-    token = _noop_offload_state.set({
-        "offloader": offloader,
-        "prefetch": boundary_prefetch,
-        "single_stream": boundary_prefetch,
-        "offload_nongrad": _gc_env_flag("UNSLOTH_GC_BOUNDARY_OFFLOAD_NONGRAD"),
-        "boundary_min_bytes": _gc_boundary_min_bytes() if boundary_prefetch else 0,
-    })
-    try:
-        outputs = original_checkpoint(
-            function, *args,
-            use_reentrant=False,
-            preserve_rng_state=preserve,
-            context_fn=context_fn,
-            determinism_check=determinism_check,
-            debug=debug,
-            **kwargs
-        )
-        if boundary_prefetch and _gc_eager_prefetch() and not _gc_disable_cpu_offload():
-            _install_eager_prefetch_hook(outputs, cls)
-        return outputs
-    finally:
-        _noop_offload_state.reset(token)
+    return original_checkpoint(
+        function, *args,
+        use_reentrant=False,
+        preserve_rng_state=preserve,
+        context_fn=context_fn,
+        determinism_check=determinism_check,
+        debug=debug,
+        **kwargs
+    )
 
 
 def _unsloth_checkpoint_reentrant_offload(function, *args, preserve_rng_state=True, offload_backend=None, **kwargs):
-    """Reentrant PyTorch checkpoint with Unsloth grouped offload backends."""
+    """Reentrant PyTorch checkpoint with Unsloth stream activation offload."""
     offload_backend = resolve_gc_offload_backend(offload_backend or _default_offload_backend)
     if kwargs:
         raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
@@ -3919,72 +3297,31 @@ def _unsloth_checkpoint_reentrant_offload(function, *args, preserve_rng_state=Tr
     old_checkpoint = getattr(torch.utils.checkpoint, "_old_checkpoint", None)
     original_checkpoint = old_checkpoint or torch.utils.checkpoint.checkpoint
 
-    if _gc_disable_cpu_offload() or offload_backend not in ("unsloth_group", "unsloth_async", "unsloth_stream"):
+    if _gc_disable_cpu_offload() or offload_backend != "unsloth_stream":
         return original_checkpoint(
             function, *args,
             use_reentrant=True,
             preserve_rng_state=preserve_rng_state,
         )
 
-    if offload_backend == "unsloth_group":
-        scheduler = _UnslothRegionActivationStash(offloader)
+    scheduler, bound_module = _resolve_unsloth_stream_scheduler_from_checkpoint_function(function)
+    if scheduler is not None:
+        if bound_module is not None:
+            scheduler.update_model_parameters(bound_module)
+            scheduler.clone_boundary_output = (
+                getattr(bound_module, "_unsloth_stream_layer_idx", -1)
+                in getattr(scheduler, "clone_boundary_layers", set())
+            )
+        checkpoint_group = scheduler.current_window
         with _UnslothActivationSaveScope(scheduler):
             outputs = original_checkpoint(
                 function, *args,
                 use_reentrant=True,
                 preserve_rng_state=preserve_rng_state,
             )
-        if scheduler._states:
+        if checkpoint_group in scheduler.active_windows:
             return _attach_activation_boundary(outputs, scheduler)
         return outputs
-
-    if offload_backend == "unsloth_async":
-        scheduler, bound_module = _resolve_unsloth_async_scheduler_from_checkpoint_function(function)
-        if scheduler is not None:
-            scheduler.offloader = offloader
-            if bound_module is not None:
-                scheduler.update_model_parameters(bound_module)
-                scheduler.clone_boundary_output = (
-                    getattr(bound_module, "_unsloth_async_layer_idx", -1)
-                    in getattr(scheduler, "clone_boundary_layers", set())
-                )
-            checkpoint_group = scheduler.current_window
-            inner_token = _hooks_offload_state.set({
-                "offloader": offloader,
-                "prefetch": True,
-            })
-            try:
-                with _UnslothActivationSaveScope(scheduler):
-                    outputs = original_checkpoint(
-                        function, *args,
-                        use_reentrant=True,
-                        preserve_rng_state=preserve_rng_state,
-                    )
-                if checkpoint_group in scheduler.active_windows:
-                    return _attach_activation_boundary(outputs, scheduler)
-                return outputs
-            finally:
-                _hooks_offload_state.reset(inner_token)
-
-    if offload_backend == "unsloth_stream":
-        scheduler, bound_module = _resolve_unsloth_stream_scheduler_from_checkpoint_function(function)
-        if scheduler is not None:
-            if bound_module is not None:
-                scheduler.update_model_parameters(bound_module)
-                scheduler.clone_boundary_output = (
-                    getattr(bound_module, "_unsloth_stream_layer_idx", -1)
-                    in getattr(scheduler, "clone_boundary_layers", set())
-                )
-            checkpoint_group = scheduler.current_window
-            with _UnslothActivationSaveScope(scheduler):
-                outputs = original_checkpoint(
-                    function, *args,
-                    use_reentrant=True,
-                    preserve_rng_state=preserve_rng_state,
-                )
-            if checkpoint_group in scheduler.active_windows:
-                return _attach_activation_boundary(outputs, scheduler)
-            return outputs
 
     return original_checkpoint(
         function, *args,
@@ -4009,16 +3346,6 @@ _UNSLOTH_UNPACK_WALL_NS = [0]
 _UNSLOTH_UNPACK_PREFETCH_CALLS = [0]
 _UNSLOTH_PREFETCH_READY_AT_WAIT = [0]
 _UNSLOTH_PREFETCH_NOTREADY_AT_WAIT = [0]
-_UNSLOTH_REGION_BOUNDARIES = [0]
-_UNSLOTH_REGION_BACKWARD_BOUNDARIES = [0]
-_UNSLOTH_GROUP_TENSORS = [0]
-_UNSLOTH_ASYNC_BOUNDARIES = [0]
-_UNSLOTH_ASYNC_BACKWARD_BOUNDARIES = [0]
-_UNSLOTH_ASYNC_OFFLOAD_GROUPS = [0]
-_UNSLOTH_ASYNC_RELOAD_GROUPS = [0]
-_UNSLOTH_ASYNC_RESTORE_TENSORS = [0]
-_UNSLOTH_ASYNC_PUSHES = [0]
-_UNSLOTH_ASYNC_OFFLOADABLE_PUSHES = [0]
 _UNSLOTH_STREAM_BOUNDARIES = [0]
 _UNSLOTH_STREAM_BACKWARD_BOUNDARIES = [0]
 _UNSLOTH_STREAM_PUSHES = [0]
@@ -4028,10 +3355,6 @@ _UNSLOTH_STREAM_RESTORED_WINDOWS = [0]
 _UNSLOTH_STREAM_STAGED_TENSORS = [0]
 _UNSLOTH_STREAM_RESTORED_TENSORS = [0]
 _UNSLOTH_STREAM_STAGED_BYTES = [0]
-_UNSLOTH_STREAM_SHOULD_STAGE_NS = [0]
-_UNSLOTH_STREAM_D2H_ISSUE_NS = [0]
-_UNSLOTH_STREAM_HOST_WAIT_NS = [0]
-_UNSLOTH_STREAM_H2D_ISSUE_NS = [0]
 _UNSLOTH_CHECKPOINT_HIT_REPORTED = [False]
 
 def _report_checkpoint_hit_count():
@@ -4056,16 +3379,6 @@ def _report_checkpoint_hit_count():
             f"unpack_prefetch_calls={_UNSLOTH_UNPACK_PREFETCH_CALLS[0]} "
             f"prefetch_ready_at_wait={_UNSLOTH_PREFETCH_READY_AT_WAIT[0]} "
             f"prefetch_NOTready_at_wait={_UNSLOTH_PREFETCH_NOTREADY_AT_WAIT[0]} "
-            f"unsloth_group_boundaries={_UNSLOTH_REGION_BOUNDARIES[0]} "
-            f"unsloth_group_backward_boundaries={_UNSLOTH_REGION_BACKWARD_BOUNDARIES[0]} "
-            f"unsloth_group_tensors={_UNSLOTH_GROUP_TENSORS[0]} "
-            f"unsloth_async_boundaries={_UNSLOTH_ASYNC_BOUNDARIES[0]} "
-            f"unsloth_async_backward_boundaries={_UNSLOTH_ASYNC_BACKWARD_BOUNDARIES[0]} "
-            f"unsloth_async_offload_groups={_UNSLOTH_ASYNC_OFFLOAD_GROUPS[0]} "
-            f"unsloth_async_reload_groups={_UNSLOTH_ASYNC_RELOAD_GROUPS[0]} "
-            f"unsloth_async_restore_tensors={_UNSLOTH_ASYNC_RESTORE_TENSORS[0]} "
-            f"unsloth_async_pushes={_UNSLOTH_ASYNC_PUSHES[0]} "
-            f"unsloth_async_offloadable_pushes={_UNSLOTH_ASYNC_OFFLOADABLE_PUSHES[0]} "
             f"unsloth_stream_boundaries={_UNSLOTH_STREAM_BOUNDARIES[0]} "
             f"unsloth_stream_backward_boundaries={_UNSLOTH_STREAM_BACKWARD_BOUNDARIES[0]} "
             f"unsloth_stream_pushes={_UNSLOTH_STREAM_PUSHES[0]} "
@@ -4074,11 +3387,7 @@ def _report_checkpoint_hit_count():
             f"unsloth_stream_restored_windows={_UNSLOTH_STREAM_RESTORED_WINDOWS[0]} "
             f"unsloth_stream_staged_tensors={_UNSLOTH_STREAM_STAGED_TENSORS[0]} "
             f"unsloth_stream_restored_tensors={_UNSLOTH_STREAM_RESTORED_TENSORS[0]} "
-            f"unsloth_stream_staged_MiB={_UNSLOTH_STREAM_STAGED_BYTES[0]/1024/1024:.1f} "
-            f"unsloth_stream_should_stage_ms={_UNSLOTH_STREAM_SHOULD_STAGE_NS[0]/1e6:.1f} "
-            f"unsloth_stream_d2h_issue_ms={_UNSLOTH_STREAM_D2H_ISSUE_NS[0]/1e6:.1f} "
-            f"unsloth_stream_host_wait_ms={_UNSLOTH_STREAM_HOST_WAIT_NS[0]/1e6:.1f} "
-            f"unsloth_stream_h2d_issue_ms={_UNSLOTH_STREAM_H2D_ISSUE_NS[0]/1e6:.1f}",
+            f"unsloth_stream_staged_MiB={_UNSLOTH_STREAM_STAGED_BYTES[0]/1024/1024:.1f}",
             flush=True,
         )
 
@@ -4102,8 +3411,8 @@ def unsloth_checkpoint(
 
     # Auto-force non-reentrant when FSDP2 is the underlying module with real
     # sharding (ws>1). Reentrant UnslothCheckpointFunction holds unshard state
-    # across layers and defeats FSDP2 param sharding at backward; the non-
-    # reentrant Mode A/B paths recover sharding AND keep CPU offload.
+    # across layers and defeats FSDP2 param sharding at backward; the stream
+    # non-reentrant path recovers sharding and keeps CPU offload.
     # Override with UNSLOTH_SMART_GC_FSDP2 = "off" / "disable" to keep the
     # auto-override OFF (i.e. stay on whatever use_reentrant was passed).
     if use_reentrant:
@@ -4124,7 +3433,7 @@ def unsloth_checkpoint(
             offload_backend = resolve_gc_offload_backend(
                 kwargs.pop("offload_backend", None) or _default_offload_backend
             )
-            if offload_backend in ("unsloth_group", "unsloth_async", "unsloth_stream"):
+            if offload_backend == "unsloth_stream":
                 return _unsloth_checkpoint_reentrant_offload(
                     function, *args,
                     preserve_rng_state=preserve,
@@ -4151,7 +3460,7 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = Non
         reentrant_backend = "hooks"
     use_reentrant_offload_backend = (
         effective_use_reentrant
-        and reentrant_backend in ("unsloth_group", "unsloth_async", "unsloth_stream")
+        and reentrant_backend == "unsloth_stream"
     )
 
     if effective_use_reentrant and not use_reentrant_offload_backend:
@@ -4179,7 +3488,6 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = Non
             transformers.modeling_utils.checkpoint = unsloth_checkpoint
     except Exception:
         pass
-    _patch_noop_save_inputs()
 pass
 
 
@@ -4220,7 +3528,6 @@ def unpatch_unsloth_smart_gradient_checkpointing():
             del transformers.modeling_utils._old_checkpoint
     except Exception:
         pass
-    _unpatch_noop_save_inputs()
 pass
 
 

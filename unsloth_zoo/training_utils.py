@@ -16,7 +16,6 @@
 
 import torch
 import math
-import functools
 import datasets
 from transformers import set_seed as transformers_set_seed
 from transformers import get_scheduler as transformers_get_scheduler
@@ -32,11 +31,8 @@ from .gradient_checkpointing import (
     unpatch_unsloth_smart_gradient_checkpointing,
     patch_unsloth_smart_gradient_checkpointing,
     _bind_gradient_checkpointing_func,
-    UnslothOffloadActivations,
-    UnslothActivationWindowScheduler,
     UnslothStreamActivationScheduler,
     UnslothGradientCheckpointer,
-    _hooks_offload_state,
     resolve_gc_offload_backend,
 )
 import os
@@ -52,9 +48,9 @@ __all__ = [
 
 
 # Backward-compat no-op shims for callers that import the old TRL
-# activation-offloading entry points. The non-reentrant Mode A / Mode B
-# backends supersede them; these remain so `unsloth.models.rl` imports don't
-# break for installations that haven't picked up the companion unsloth-side PR.
+# activation-offloading entry points. The stream checkpoint backend supersedes
+# them; these remain so `unsloth.models.rl` imports don't break for
+# installations that haven't picked up the companion unsloth-side PR.
 def maybe_enable_trl_activation_offloading(trainer = None, *args, **kwargs):
     return None
 
@@ -71,27 +67,6 @@ def _resolve_offload_wrapper_target(model):
 
 
 def _remove_hook_based_offload_wrapper(model):
-    for layer in getattr(model, "_unsloth_async_layers", []):
-        try:
-            if hasattr(layer, "_unsloth_async_scheduler"):
-                delattr(layer, "_unsloth_async_scheduler")
-            if hasattr(layer, "_unsloth_async_layer_idx"):
-                delattr(layer, "_unsloth_async_layer_idx")
-        except Exception:
-            pass
-    if hasattr(model, "_unsloth_async_layers"):
-        delattr(model, "_unsloth_async_layers")
-    for layer, original_forward in getattr(model, "_unsloth_async_wrapped_layers", []):
-        try:
-            layer.forward = original_forward
-            if hasattr(layer, "_unsloth_async_scheduler"):
-                delattr(layer, "_unsloth_async_scheduler")
-        except Exception:
-            pass
-    if hasattr(model, "_unsloth_async_wrapped_layers"):
-        delattr(model, "_unsloth_async_wrapped_layers")
-    if hasattr(model, "_unsloth_async_scheduler"):
-        delattr(model, "_unsloth_async_scheduler")
     for layer in getattr(model, "_unsloth_stream_layers", []):
         try:
             if hasattr(layer, "_unsloth_stream_scheduler"):
@@ -135,81 +110,6 @@ def _find_transformer_layers(model):
     if candidates:
         return list(max(candidates, key=len))
     return []
-
-
-def _install_hook_based_offload_wrapper(model, dtype):
-    _remove_hook_based_offload_wrapper(model)
-    target = _resolve_offload_wrapper_target(model)
-    current_target = getattr(model, "_unsloth_offload_wrapper_target", None)
-    if current_target is not None and current_target is not target:
-        _remove_hook_based_offload_wrapper(model)
-
-    if getattr(model, "_unsloth_offload_forward_installed", False):
-        return
-
-    offload_ctx = UnslothOffloadActivations(dtype=dtype)
-    original_forward = target.forward
-
-    @functools.wraps(original_forward)
-    def _offloading_forward(*args, **kwargs):
-        if target.training:
-            with offload_ctx:
-                return original_forward(*args, **kwargs)
-        return original_forward(*args, **kwargs)
-
-    target.forward = _offloading_forward
-    model._unsloth_offload_ctx = offload_ctx
-    model._unsloth_offload_original_forward = original_forward
-    model._unsloth_offload_wrapper_target = target
-    model._unsloth_offload_forward_installed = True
-
-
-def _install_unsloth_async_offload_wrapper(model, dtype):
-    _remove_hook_based_offload_wrapper(model)
-    layers = _find_transformer_layers(model)
-    if not layers:
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            print("[unsloth_async] no transformer layers found; falling back to no wrapper", flush=True)
-        return
-    cls = UnslothGradientCheckpointer
-    if not cls._initialized:
-        cls.initialize(dtype)
-    offloader = cls.begin_checkpoint(dtype)
-    try:
-        skip_last_groups = max(1, int(os.environ.get("UNSLOTH_GC_ASYNC_SKIP_LAST_GROUPS", "2")))
-    except ValueError:
-        skip_last_groups = 2
-    scheduler = UnslothActivationWindowScheduler(
-        offloader,
-        num_host_windows=max(0, len(layers) - skip_last_groups),
-        num_layer_windows=len(layers),
-    )
-    config = getattr(model, "config", None)
-    is_vlm = bool(
-        getattr(config, "vision_config", None) is not None
-        or "vl" in str(getattr(config, "model_type", "") or "").lower()
-        or "vision" in type(model).__name__.lower()
-    )
-    deepstack_indexes = getattr(getattr(config, "vision_config", None), "deepstack_visual_indexes", None)
-    deepstack_count = len(deepstack_indexes or []) if is_vlm else 0
-    scheduler.clone_boundary_layers = set(range(deepstack_count))
-    scheduler.clone_boundary_output = False
-    if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-        print(
-            f"[unsloth_async] installing layer-level async wrapper layers={len(layers)} "
-            f"offload_groups={max(0, len(layers) - skip_last_groups)}",
-            flush=True,
-        )
-
-    async_layers = []
-    for layer_idx, layer in enumerate(layers):
-        layer._unsloth_async_scheduler = scheduler
-        layer._unsloth_async_layer_idx = layer_idx
-        async_layers.append(layer)
-
-    model._unsloth_async_scheduler = scheduler
-    model._unsloth_async_layers = async_layers
-    model._unsloth_offload_forward_installed = False
 
 
 def _install_unsloth_stream_offload_wrapper(model, dtype):
@@ -462,15 +362,11 @@ def prepare_model_for_training(
     # leave the per-module function alone and strip any prior unsloth offload
     # wrapper / attribute so benchmarks isolate the native path.
     if use_gradient_checkpointing == "unsloth":
-        # Activate the smart-checkpoint dispatcher so torch.utils.checkpoint.checkpoint
-        # routes through `_unsloth_checkpoint_nonreentrant`. Without this, HF Trainer's
-        # `_activate_gradient_checkpointing` rebinds module-level _gradient_checkpointing_func
-        # to vanilla `functools.partial(torch.utils.checkpoint.checkpoint, ...)` and the
-        # `_hooks_offload_state` ContextVar that gates `UnslothOffloadActivations._pack_hook`
-        # never gets set, so CPU offload silently no-ops. Historically only
-        # `FastLanguageModel.from_pretrained` activated this; consumers of
-        # `prepare_model_for_training` directly (custom AutoModelForCausalLM flows,
-        # the FSDP2 backend matrix benches) silently lost the offload mechanism.
+        # Activate the smart-checkpoint dispatcher so HF Trainer's cached
+        # checkpoint partials route through the selected Unsloth checkpoint path.
+        # Historically only `FastLanguageModel.from_pretrained` activated this;
+        # direct `prepare_model_for_training` consumers otherwise kept stale
+        # vanilla checkpoint functions.
         try:
             patch_unsloth_smart_gradient_checkpointing(
                 dtype=dtype,
@@ -485,17 +381,15 @@ def prepare_model_for_training(
         if type(effective_reentrant) is not bool:
             effective_reentrant = bool(use_reentrant)
         offload_backend = getattr(model, "_unsloth_gc_offload_backend", None)
+        if offload_backend is None and not effective_reentrant:
+            offload_backend = os.environ.get("UNSLOTH_GC_OFFLOAD_BACKEND", "unsloth_stream")
         offload_backend = resolve_gc_offload_backend(offload_backend)
         model._unsloth_gc_offload_backend = offload_backend
         _bind_gradient_checkpointing_func(
             model, checkpoint_fn, effective_reentrant, context_fn, offload_backend,
         )
 
-        if (not effective_reentrant) and offload_backend == "hooks":
-            _install_hook_based_offload_wrapper(model, dtype)
-        elif offload_backend == "unsloth_async":
-            _install_unsloth_async_offload_wrapper(model, dtype)
-        elif offload_backend == "unsloth_stream":
+        if offload_backend == "unsloth_stream":
             _install_unsloth_stream_offload_wrapper(model, dtype)
         else:
             _remove_hook_based_offload_wrapper(model)
