@@ -75,6 +75,8 @@ def _remove_hook_based_offload_wrapper(model):
         try:
             if hasattr(layer, "_unsloth_async_scheduler"):
                 delattr(layer, "_unsloth_async_scheduler")
+            if hasattr(layer, "_unsloth_async_layer_idx"):
+                delattr(layer, "_unsloth_async_layer_idx")
         except Exception:
             pass
     if hasattr(model, "_unsloth_async_layers"):
@@ -220,7 +222,7 @@ def _install_unsloth_stream_offload_wrapper(model, dtype):
     if not UnslothGradientCheckpointer._initialized:
         UnslothGradientCheckpointer.initialize(dtype)
     try:
-        skip_last_groups = max(1, int(os.environ.get("UNSLOTH_GC_STREAM_SKIP_LAST_WINDOWS", "2")))
+        skip_last_groups = max(0, int(os.environ.get("UNSLOTH_GC_STREAM_SKIP_LAST_WINDOWS", "2")))
     except ValueError:
         skip_last_groups = 2
     scheduler = UnslothStreamActivationScheduler(
@@ -491,9 +493,9 @@ def prepare_model_for_training(
 
         if (not effective_reentrant) and offload_backend == "hooks":
             _install_hook_based_offload_wrapper(model, dtype)
-        elif (not effective_reentrant) and offload_backend == "unsloth_async":
+        elif offload_backend == "unsloth_async":
             _install_unsloth_async_offload_wrapper(model, dtype)
-        elif (not effective_reentrant) and offload_backend == "unsloth_stream":
+        elif offload_backend == "unsloth_stream":
             _install_unsloth_stream_offload_wrapper(model, dtype)
         else:
             _remove_hook_based_offload_wrapper(model)
