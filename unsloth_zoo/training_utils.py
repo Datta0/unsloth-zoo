@@ -42,24 +42,10 @@ __all__ = [
     "fix_zero_training_loss",
     "unsloth_train",
     "prepare_model_for_training",
-    "maybe_enable_trl_activation_offloading",
-    "configure_activation_offloading_checkpointing",
 ]
 
 
-# Backward-compat no-op shims for callers that import the old TRL
-# activation-offloading entry points. The stream checkpoint backend supersedes
-# them; these remain so `unsloth.models.rl` imports don't break for
-# installations that haven't picked up the companion unsloth-side PR.
-def maybe_enable_trl_activation_offloading(trainer = None, *args, **kwargs):
-    return None
-
-
-def configure_activation_offloading_checkpointing(*args, **kwargs):
-    return None
-
-
-def _resolve_offload_wrapper_target(model):
+def _resolve_stream_wrapper_target(model):
     inner_model = model
     while hasattr(inner_model, "model"):
         inner_model = inner_model.model
@@ -79,21 +65,10 @@ def _remove_unsloth_stream_offload_wrapper(model):
         delattr(model, "_unsloth_stream_layers")
     if hasattr(model, "_unsloth_stream_scheduler"):
         delattr(model, "_unsloth_stream_scheduler")
-    target = getattr(model, "_unsloth_offload_wrapper_target", None)
-    original_forward = getattr(model, "_unsloth_offload_original_forward", None)
-    if target is not None and original_forward is not None:
-        target.forward = original_forward
-    if hasattr(model, "_unsloth_offload_wrapper_target"):
-        delattr(model, "_unsloth_offload_wrapper_target")
-    if hasattr(model, "_unsloth_offload_original_forward"):
-        delattr(model, "_unsloth_offload_original_forward")
-    if hasattr(model, "_unsloth_offload_ctx"):
-        delattr(model, "_unsloth_offload_ctx")
-    model._unsloth_offload_forward_installed = False
 
 
 def _find_transformer_layers(model):
-    target = _resolve_offload_wrapper_target(model)
+    target = _resolve_stream_wrapper_target(model)
     candidates = []
     stack = [target]
     seen = set()
@@ -154,7 +129,6 @@ def _install_unsloth_stream_offload_wrapper(model, dtype):
 
     model._unsloth_stream_scheduler = scheduler
     model._unsloth_stream_layers = stream_layers
-    model._unsloth_offload_forward_installed = False
 
 
 @torch.inference_mode

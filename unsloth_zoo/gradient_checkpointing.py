@@ -1041,7 +1041,6 @@ elif DEVICE_TYPE == "xpu":
 
 CPU_BUFFERS = []
 CPU_INDEX = None
-_hooks_offload_state: ContextVar[Optional[dict]] = ContextVar("_hooks_offload_state", default=None)
 # Module-level default offload backend, set by set_offload_backend().
 # Used as fallback when HF's gradient_checkpointing_enable() overwrites the
 # per-module partial binding and drops the offload_backend kwarg.
@@ -1062,14 +1061,6 @@ def _gc_env_flag(name: str) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() not in ("0", "false", "no", "off", "")
-
-
-def _gc_active_offload_state() -> Optional[dict]:
-    return _hooks_offload_state.get()
-
-
-def _gc_eager_prefetch() -> bool:
-    return _gc_env_flag("UNSLOTH_GC_EAGER_PREFETCH")
 
 
 def _gc_aux_stream() -> bool:
@@ -1399,14 +1390,9 @@ class UnslothGradientCheckpointer:
             cls.initialize(dtype)
         if cls._backward_pass:
             # ─── CRITICAL: fresh-step transition (backward→forward) ────────────
-            # Clear `_pending_unpacks` ONLY here, not in UnslothOffloadActivations.
-            # __enter__ (which fires per-layer and would wipe prior layers' packs
-            # within the same forward, leaving prefetch with ~1 item to speculate
-            # on — defeating the whole mechanism). `begin_checkpoint` is called
-            # once per decoder layer from `_unsloth_checkpoint_nonreentrant`, and
-            # `_backward_pass` is only True at the first layer of a new step
-            # (set by unpack paths, reset here). So this branch fires exactly
-            # once per step. DO NOT move this clear back into __enter__.
+            # Clear step-local pending state only at the backward-to-forward
+            # transition. This is called once per checkpointed layer, but this
+            # branch fires only at the first layer of a new step.
             # ───────────────────────────────────────────────────────────────────
             cls._backward_pass = False
             cls._current_gc_index = 0
@@ -1793,13 +1779,9 @@ class UnslothGradientCheckpointer:
             main_stream = torch.xpu.current_stream(device)
         else:
             main_stream = cls._main_streams[device_index]
-        active_state = _gc_active_offload_state()
         # Variant B: round-robin across primary + aux extra streams by pack index.
         pack_idx = cls._next_pack_idx
-        single_stream = bool(
-            _gc_env_flag("UNSLOTH_GC_SINGLE_STREAM")
-            or (active_state is not None and active_state.get("single_stream", False))
-        )
+        single_stream = _gc_env_flag("UNSLOTH_GC_SINGLE_STREAM")
         stream_idx = 0 if single_stream else ((pack_idx % 2) if _gc_aux_stream() else 0)
         extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
         # Correctness-critical: GPU source tensor must not be read before its
@@ -1920,23 +1902,7 @@ class UnslothGradientCheckpointer:
         packed._state["h2d_issued"] = False
         packed._state["result_view"] = None
         packed._state["pack_event"] = pack_event
-        # ─── CRITICAL: capture prefetch flag at pack time ─────────────────
-        # The _hooks_offload_state ContextVar is set inside
-        # `_unsloth_checkpoint_nonreentrant` and reset in its `finally` block
-        # BEFORE the backward pass runs. If we read the ContextVar at unpack
-        # time, it's always None and use_prefetch is always False — meaning
-        # prefetch_d1/d2/d3_eager silently fell back to the non-prefetch
-        # unpack_packed path. This was the root cause of "prefetch doesn't
-        # help throughput" — it was never being dispatched. Store the flag
-        # on the PackedCPUBuffer at pack time (when the ContextVar is still
-        # set) so _unpack_hook can read it from the packed itself during
-        # backward. DO NOT revert to reading the ContextVar in _unpack_hook.
-        # See also: _unpack_hook in UnslothOffloadActivations.
-        # ──────────────────────────────────────────────────────────────────
-        _hstate = _gc_active_offload_state()
-        packed._state["use_prefetch"] = bool(
-            _hstate is not None and _hstate.get("prefetch", False)
-        )
+        packed._state["use_prefetch"] = False
         cls._pending_unpacks.append(packed)
         if _gc_count_on:
             _UNSLOTH_PACK_WALL_NS[0] += time.perf_counter_ns() - _pack_t0
@@ -2217,138 +2183,6 @@ class PackedCPUBuffer:
     def set_restore_event(self, restore_event):
         if not self._state["released"]:
             self._state["restore_event"] = restore_event
-
-
-class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
-    """
-    All Unsloth Zoo code licensed under LGPLv3
-
-    Compile-compatible CPU activation offloading via saved_tensors_hooks.
-
-    This operates at the autograd runtime level, AFTER compiled graphs
-    produce tensors. saved_tensors_hooks are invisible to torch.compile,
-    so this avoids graph breaks entirely.
-
-    Reuses all existing UnslothGradientCheckpointer infrastructure:
-    buffer pooling, event-fenced reuse, async stream coordination.
-    """
-
-    def __init__(self, *, dtype=None, enabled=True):
-        self._enabled = enabled and not _gc_disable_cpu_offload()
-        self._dtype = dtype
-        self._offloader = None
-        self._first_pass = True
-        super().__init__(self._pack_hook, self._unpack_hook)
-
-    def __enter__(self):
-        if not self._enabled:
-            return self
-        cls = UnslothGradientCheckpointer
-        if not cls._initialized:
-            cls.initialize(self._dtype)
-        # ─── IMPORTANT: no state resets here ──────────────────────────────
-        # __enter__ fires once per DECODER LAYER (torch.utils.checkpoint
-        # opens a fresh UnslothOffloadActivations ctx for every layer).
-        # Resetting `_current_gc_index` / `_last_gc_index` / `_pending_unpacks`
-        # here wipes prior layers' state within the same forward. All those
-        # counters are managed by `UnslothGradientCheckpointer.begin_checkpoint`
-        # which also fires per-layer but knows the backward→forward transition
-        # (via `cls._backward_pass`) and only resets on a true fresh step. In
-        # particular: `_last_gc_index` is only valid once step 1 has learned
-        # it — resetting it to 0 on every layer (as the old code did via
-        # `self._first_pass`) makes `is_last_layer` fire on every layer from
-        # step 2 onwards when skip_last_n ≥ 2. DO NOT restore state resets
-        # here.
-        # ──────────────────────────────────────────────────────────────────
-        # Create a fresh offloader instance for this forward pass
-        self._offloader = cls(is_last_layer=False)
-        return super().__enter__()
-
-    def __exit__(self, *args):
-        if not self._enabled:
-            return
-        super().__exit__(*args)
-        self._first_pass = False
-
-    @staticmethod
-    def _should_offload(tensor):
-        """Mirrors UnslothGradientCheckpointer.should_offload() checks."""
-        cls = UnslothGradientCheckpointer
-        if not cls._meta_initialized:
-            cls.ensure_metadata()
-        # To restore the broader experimental behavior where hooks offload every
-        # large saved tensor in the checkpointed region, remove the
-        # `_hooks_offload_state` / `offloader.is_last_layer` gates below and let
-        # `_pack_hook()` use `self._offloader` directly again. That widens
-        # offload back to things like large saved weights, which increased
-        # Qwen3-VL traffic substantially in benchmarking.
-        state = _hooks_offload_state.get()
-        if state is None:
-            return False
-        offloader = state.get("offloader", None)
-        if offloader is None:
-            return False
-        if _gc_disable_cpu_offload():
-            return False
-        if tensor.requires_grad and tensor.grad_fn is None:
-            return False
-        # Unwrap FSDP2 DTensors so checks see the local shard
-        tensor = _unwrap_dtensor(tensor)
-        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
-            if torch.compiler.is_compiling():
-                return False
-        if tensor.numel() < cls._minimum_size:
-            return False
-        if tensor.device.type == "cpu":
-            return False
-        if offloader.is_last_layer:
-            return False
-        if tensor.layout != torch.strided:
-            return False
-        if (not tensor.is_contiguous()) or (tensor.storage_offset() != 0):
-            return False
-        return True
-
-    def _pack_hook(self, tensor):
-        if not self._enabled or self._offloader is None:
-            return tensor
-        state = _hooks_offload_state.get()
-        if state is None:
-            return tensor
-        offloader = state.get("offloader", None)
-        if offloader is None or not self._should_offload(tensor):
-            return tensor
-        return offloader.pack_hook(tensor)
-
-    def _unpack_hook(self, packed):
-        if not self._enabled:
-            return packed
-        if isinstance(packed, PackedCPUBuffer):
-            # ─── Read prefetch flag from PackedCPUBuffer, NOT ContextVar ───
-            # The `_hooks_offload_state` ContextVar is reset in the `finally`
-            # block of `_unsloth_checkpoint_nonreentrant` BEFORE backward
-            # runs. If we read it here the ContextVar is always None →
-            # use_prefetch always False → prefetch silently disabled.
-            # This bug hid the prefetch path entirely, and the observed
-            # "prefetch doesn't improve throughput" came from prefetch never
-            # actually running. Do NOT revert to reading the ContextVar;
-            # pack_hook captures the flag on packed._state at pack time.
-            # ───────────────────────────────────────────────────────────────
-            use_prefetch = bool(packed._state.get("use_prefetch", False))
-            if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-                if not hasattr(self.__class__, "_unpack_hook_trace_shown"):
-                    self.__class__._unpack_hook_trace_shown = True
-                    print(
-                        "[gc_trace] _unpack_hook first call: "
-                        f"use_prefetch={use_prefetch} (from PackedCPUBuffer)",
-                        flush=True,
-                    )
-            if use_prefetch:
-                return UnslothGradientCheckpointer.unpack_packed_prefetch(packed)
-            return UnslothGradientCheckpointer.unpack_packed(packed)
-        if isinstance(packed, tuple) and packed[0] == "gpu":
-            return packed[1]
-        return packed
 
 
 class _UnslothActivationTicket:
@@ -3400,7 +3234,7 @@ def _unsloth_checkpoint_reentrant_offload(function, *args, preserve_rng_state=Tr
         cls.initialize(dtype)
     else:
         cls.ensure_metadata(dtype)
-    offloader = cls.begin_checkpoint(dtype)
+    cls.begin_checkpoint(dtype)
 
     old_checkpoint = getattr(torch.utils.checkpoint, "_old_checkpoint", None)
     original_checkpoint = old_checkpoint or torch.utils.checkpoint.checkpoint
