@@ -23,7 +23,7 @@ from transformers import Trainer
 from transformers.trainer_utils import seed_worker as trainer_utils_seed_worker
 from tqdm import tqdm as ProgressBar
 import time
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict, Tuple
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
 from .gradient_checkpointing import (
@@ -66,7 +66,7 @@ def _resolve_offload_wrapper_target(model):
     return inner_model
 
 
-def _remove_hook_based_offload_wrapper(model):
+def _remove_unsloth_stream_offload_wrapper(model):
     for layer in getattr(model, "_unsloth_stream_layers", []):
         try:
             if hasattr(layer, "_unsloth_stream_scheduler"):
@@ -113,7 +113,7 @@ def _find_transformer_layers(model):
 
 
 def _install_unsloth_stream_offload_wrapper(model, dtype):
-    _remove_hook_based_offload_wrapper(model)
+    _remove_unsloth_stream_offload_wrapper(model)
     layers = _find_transformer_layers(model)
     if not layers:
         if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
@@ -392,9 +392,9 @@ def prepare_model_for_training(
         if offload_backend == "unsloth_stream":
             _install_unsloth_stream_offload_wrapper(model, dtype)
         else:
-            _remove_hook_based_offload_wrapper(model)
+            _remove_unsloth_stream_offload_wrapper(model)
     else:
-        _remove_hook_based_offload_wrapper(model)
+        _remove_unsloth_stream_offload_wrapper(model)
         if use_gradient_checkpointing is True and hasattr(model, "_unsloth_gc_offload_backend"):
             # Native path: drop the unsloth offload attribute so downstream
             # fallbacks (e.g. `_default_offload_backend`, env-var lookup in
