@@ -3078,15 +3078,24 @@ class UnslothStreamActivationScheduler:
                     slot.device_tensor = restored
                     slot.device_ready_event = torch.cuda.Event()
                     slot.device_ready_event.record(stream)
-                current_stream.wait_event(slot.device_ready_event)
             return True
         finally:
             if _profile_stream:
                 _UNSLOTH_STREAM_H2D_ISSUE_NS[0] += time.perf_counter_ns() - _start_ns
 
+    def _wait_device_ready(self, slot):
+        event = getattr(slot, "device_ready_event", None)
+        if event is None or DEVICE_TYPE not in ("cuda", "hip"):
+            return
+        try:
+            torch.cuda.current_stream(slot.device).wait_event(event)
+        except Exception:
+            pass
+
     def _view_slot(self, slot, shape, stride, requires_grad, dtype):
         if slot.device_tensor is None:
             self._restore_slot_to_device(slot)
+        self._wait_device_ready(slot)
         result = slot.device_tensor
         if result is None:
             raise RuntimeError("Unsloth: staged activation was requested before device restore completed")
