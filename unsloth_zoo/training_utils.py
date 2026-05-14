@@ -52,8 +52,34 @@ def _resolve_stream_wrapper_target(model):
     return inner_model
 
 
+def _stream_wrapper_owner_chain(model):
+    owners = []
+    seen = set()
+    current = model
+    while current is not None and id(current) not in seen:
+        owners.append(current)
+        seen.add(id(current))
+        current = getattr(current, "model", None)
+    return owners
+
+
+def _delete_local_attr(obj, name):
+    if name not in getattr(obj, "__dict__", {}):
+        return
+    try:
+        delattr(obj, name)
+    except AttributeError:
+        pass
+
+
 def _remove_unsloth_stream_offload_wrapper(model):
-    for layer in getattr(model, "_unsloth_stream_layers", []):
+    owners = _stream_wrapper_owner_chain(model)
+    stream_layers = []
+    for owner in owners:
+        local_layers = getattr(owner, "__dict__", {}).get("_unsloth_stream_layers", None)
+        if local_layers is not None:
+            stream_layers.extend(local_layers)
+    for layer in stream_layers:
         try:
             if hasattr(layer, "_unsloth_stream_scheduler"):
                 delattr(layer, "_unsloth_stream_scheduler")
@@ -61,10 +87,9 @@ def _remove_unsloth_stream_offload_wrapper(model):
                 delattr(layer, "_unsloth_stream_layer_idx")
         except Exception:
             pass
-    if hasattr(model, "_unsloth_stream_layers"):
-        delattr(model, "_unsloth_stream_layers")
-    if hasattr(model, "_unsloth_stream_scheduler"):
-        delattr(model, "_unsloth_stream_scheduler")
+    for owner in owners:
+        _delete_local_attr(owner, "_unsloth_stream_layers")
+        _delete_local_attr(owner, "_unsloth_stream_scheduler")
 
 
 def _find_transformer_layers(model):

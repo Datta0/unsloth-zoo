@@ -17,14 +17,10 @@
 import torch
 import numpy as np
 import functools
-from typing import Union, Optional, List, Any, Tuple
+from typing import Union, Optional, List, Any
 import os
 import warnings
 import gc
-import time
-import atexit
-from collections import defaultdict
-from contextvars import ContextVar
 from .utils import _get_dtype, Version
 from .device_type import (
     DEVICE_TYPE,
@@ -84,348 +80,24 @@ _GC_OFFLOAD_BACKENDS = {
 # Release backend surface: `unsloth_original` preserves the normal Unsloth
 # checkpointing path; `unsloth_stream` is the supported activation-offload
 # backend for both non-reentrant and reentrant stream checkpointing.
-_gc_profile_module: ContextVar[Optional[str]] = ContextVar("_gc_profile_module", default=None)
-_gc_profile_enabled_cache: Optional[bool] = None
-_gc_profile_registered = False
-_gc_profile_state = {
-    "mode": None,
-    "totals": defaultdict(float),
-    "module_stats": defaultdict(lambda: defaultdict(float)),
-    "shape_stats": defaultdict(lambda: defaultdict(float)),
-    "bucket_stats": defaultdict(lambda: defaultdict(float)),
-}
+_gc_profile_patched = False
 
 
-def _gc_profile_enabled() -> bool:
-    global _gc_profile_enabled_cache
-    if _gc_profile_enabled_cache is None:
-        value = os.environ.get("UNSLOTH_GC_PROFILE", "0")
-        _gc_profile_enabled_cache = str(value).strip().lower() not in ("0", "false", "no", "off", "")
-    return bool(_gc_profile_enabled_cache)
-
-
-def _gc_profile_module_name() -> str:
-    name = _gc_profile_module.get()
-    if name:
-        return name
-    return "<unknown>"
-
-
-def _gc_profile_resolve_function_module_name(function) -> Optional[str]:
-    module = getattr(function, "__self__", None)
-    if isinstance(module, torch.nn.Module):
-        return getattr(module, "_unsloth_gc_profile_module_name", None) or module.__class__.__name__
-
-    closure = getattr(function, "__closure__", None)
-    if closure:
-        for cell in closure:
-            try:
-                value = cell.cell_contents
-            except ValueError:
-                continue
-            if isinstance(value, torch.nn.Module):
-                return getattr(value, "_unsloth_gc_profile_module_name", None) or value.__class__.__name__
-            maybe_module = getattr(value, "__self__", None)
-            if isinstance(maybe_module, torch.nn.Module):
-                return getattr(maybe_module, "_unsloth_gc_profile_module_name", None) or maybe_module.__class__.__name__
-    return None
-
-
-def _gc_profile_shape_key(shape, dtype) -> str:
-    dims = "x".join(str(int(x)) for x in shape)
-    return f"{dims}:{dtype}"
-
-
-def _gc_profile_size_bucket(numel: int, dtype) -> str:
-    n_bytes = int(numel) * torch.tensor([], dtype=dtype).element_size()
-    mib = n_bytes / (1024 * 1024)
-    try:
-        medium_max_mib = float(os.environ.get("UNSLOTH_GC_PROFILE_MEDIUM_MAX_MB", "64"))
-    except ValueError:
-        medium_max_mib = 64.0
-    try:
-        large_min_mib = float(os.environ.get("UNSLOTH_GC_PROFILE_LARGE_MIN_MB", "128"))
-    except ValueError:
-        large_min_mib = 128.0
-    if mib < medium_max_mib:
-        return "medium"
-    if mib >= large_min_mib:
-        return "large"
-    return "midlarge"
-
-
-def _gc_profile_ensure(mode: str) -> bool:
-    global _gc_profile_registered
-    if not _gc_profile_enabled():
-        return False
-    if _gc_profile_state["mode"] is None:
-        _gc_profile_state["mode"] = mode
-    if not _gc_profile_registered:
-        atexit.register(_gc_profile_dump_summary)
-        _gc_profile_registered = True
-    return True
-
-
-def _gc_profile_record(
-    *,
-    mode: str,
-    module_name: str,
-    shape,
-    dtype,
-    numel: int,
-    kind: str,
-    duration_s: float = 0.0,
-    wait_s: float = 0.0,
-    count: int = 1,
-    extra_allocated: bool = False,
-    pool_hit: bool = False,
-    wait_event_fallback: bool = False,
-    ready_at_wait: Optional[bool] = None,
-    cuda_wait_s: float = 0.0,
-) -> None:
-    if not _gc_profile_ensure(mode):
+def _maybe_patch_gc_profile():
+    """Install opt-in GC profiling outside the production hot path."""
+    global _gc_profile_patched
+    if _gc_profile_patched:
         return
-
-    n_bytes = int(numel) * torch.tensor([], dtype=dtype).element_size()
-    totals = _gc_profile_state["totals"]
-    totals[f"{kind}_count"] += count
-    totals[f"{kind}_bytes"] += n_bytes
-    totals[f"{kind}_cpu_s"] += duration_s
-    totals[f"{kind}_wait_s"] += wait_s
-    totals[f"{kind}_cuda_wait_s"] += cuda_wait_s
-    if extra_allocated:
-        totals["cpu_buffer_allocs"] += 1
-    if pool_hit:
-        totals["cpu_buffer_pool_hits"] += 1
-    if wait_event_fallback:
-        totals["wait_stream_fallbacks"] += 1
-    if ready_at_wait is True:
-        totals[f"{kind}_ready_count"] += 1
-    elif ready_at_wait is False:
-        totals[f"{kind}_not_ready_count"] += 1
-
-    module_stats = _gc_profile_state["module_stats"][module_name]
-    module_stats[f"{kind}_count"] += count
-    module_stats[f"{kind}_bytes"] += n_bytes
-    module_stats[f"{kind}_cpu_s"] += duration_s
-    module_stats[f"{kind}_wait_s"] += wait_s
-    module_stats[f"{kind}_cuda_wait_s"] += cuda_wait_s
-    if ready_at_wait is True:
-        module_stats[f"{kind}_ready_count"] += 1
-    elif ready_at_wait is False:
-        module_stats[f"{kind}_not_ready_count"] += 1
-
-    shape_key = _gc_profile_shape_key(shape, dtype)
-    shape_stats = _gc_profile_state["shape_stats"][shape_key]
-    shape_stats[f"{kind}_count"] += count
-    shape_stats[f"{kind}_bytes"] += n_bytes
-    shape_stats[f"{kind}_cpu_s"] += duration_s
-    shape_stats[f"{kind}_wait_s"] += wait_s
-    shape_stats[f"{kind}_cuda_wait_s"] += cuda_wait_s
-    shape_stats[f"{kind}_item_bytes"] = max(shape_stats.get(f"{kind}_item_bytes", 0), n_bytes)
-    if ready_at_wait is True:
-        shape_stats[f"{kind}_ready_count"] += 1
-    elif ready_at_wait is False:
-        shape_stats[f"{kind}_not_ready_count"] += 1
-
-    bucket_key = _gc_profile_size_bucket(numel, dtype)
-    bucket_stats = _gc_profile_state["bucket_stats"][bucket_key]
-    bucket_stats[f"{kind}_count"] += count
-    bucket_stats[f"{kind}_bytes"] += n_bytes
-    bucket_stats[f"{kind}_cpu_s"] += duration_s
-    bucket_stats[f"{kind}_wait_s"] += wait_s
-    bucket_stats[f"{kind}_cuda_wait_s"] += cuda_wait_s
-    if ready_at_wait is True:
-        bucket_stats[f"{kind}_ready_count"] += 1
-    elif ready_at_wait is False:
-        bucket_stats[f"{kind}_not_ready_count"] += 1
-
-
-def _gc_profile_top_lines(stats_dict, primary_key: str, extra_keys: Tuple[str, ...], limit: int = 10):
-    items = [
-        (name, values)
-        for name, values in stats_dict.items()
-        if values.get(primary_key, 0.0) > 0
-    ]
-    items.sort(key = lambda item: item[1].get(primary_key, 0.0), reverse = True)
-    lines = []
-    for name, values in items[:limit]:
-        parts = [f"{primary_key}={values.get(primary_key, 0.0):.0f}" if "bytes" in primary_key or "count" in primary_key else f"{primary_key}={values.get(primary_key, 0.0):.6f}s"]
-        for key in extra_keys:
-            value = values.get(key, 0.0)
-            if "bytes" in key or "count" in key:
-                parts.append(f"{key}={value:.0f}")
-            else:
-                parts.append(f"{key}={value:.6f}s")
-        lines.append(f"  - {name}: " + ", ".join(parts))
-    return lines
-
-
-def _gc_profile_medium_shape_lines(primary_key: str, extra_keys: Tuple[str, ...], limit: int = 10):
-    items = []
-    try:
-        medium_max_mib = float(os.environ.get("UNSLOTH_GC_PROFILE_MEDIUM_MAX_MB", "64"))
-    except ValueError:
-        medium_max_mib = 64.0
-    for name, values in _gc_profile_state["shape_stats"].items():
-        item_bytes = values.get("pack_item_bytes", values.get("unpack_item_bytes", 0.0))
-        if item_bytes <= 0:
-            continue
-        item_mib = float(item_bytes) / (1024 * 1024)
-        if item_mib >= medium_max_mib:
-            continue
-        if values.get(primary_key, 0.0) <= 0:
-            continue
-        items.append((name, values, item_mib))
-    items.sort(key = lambda item: item[1].get(primary_key, 0.0), reverse = True)
-    lines = []
-    for name, values, item_mib in items[:limit]:
-        parts = [f"item_MiB={item_mib:.3f}"]
-        value = values.get(primary_key, 0.0)
-        if "bytes" in primary_key or "count" in primary_key:
-            parts.append(f"{primary_key}={value:.0f}")
-        else:
-            parts.append(f"{primary_key}={value:.6f}s")
-        for key in extra_keys:
-            value = values.get(key, 0.0)
-            if "bytes" in key or "count" in key:
-                parts.append(f"{key}={value:.0f}")
-            else:
-                parts.append(f"{key}={value:.6f}s")
-        lines.append(f"  - {name}: " + ", ".join(parts))
-    return lines
-
-
-def _gc_profile_dump_summary() -> None:
-    if not _gc_profile_enabled():
+    profile_value = os.environ.get("UNSLOTH_GC_PROFILE", "0")
+    hit_count_value = os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "0")
+    if (
+        str(profile_value).strip().lower() in ("0", "false", "no", "off", "")
+        and str(hit_count_value).strip().lower() in ("0", "false", "no", "off", "")
+    ):
         return
-    totals = _gc_profile_state["totals"]
-    mode = _gc_profile_state["mode"] or "unknown"
-    print(f"Unsloth GC profile summary ({mode}):")
-    print(
-        "  totals: "
-        f"pack_count={totals.get('pack_count', 0):.0f}, "
-        f"pack_bytes={totals.get('pack_bytes', 0):.0f}, "
-        f"pack_cpu_s={totals.get('pack_cpu_s', 0.0):.6f}, "
-        f"unpack_count={totals.get('unpack_count', 0):.0f}, "
-        f"unpack_bytes={totals.get('unpack_bytes', 0):.0f}, "
-        f"unpack_cpu_s={totals.get('unpack_cpu_s', 0.0):.6f}, "
-        f"unpack_wait_s={totals.get('unpack_wait_s', 0.0):.6f}, "
-        f"unpack_cuda_wait_s={totals.get('unpack_cuda_wait_s', 0.0):.6f}, "
-        f"unpack_ready_count={totals.get('unpack_ready_count', 0):.0f}, "
-        f"unpack_not_ready_count={totals.get('unpack_not_ready_count', 0):.0f}, "
-        f"cpu_buffer_pool_hits={totals.get('cpu_buffer_pool_hits', 0):.0f}, "
-        f"cpu_buffer_allocs={totals.get('cpu_buffer_allocs', 0):.0f}, "
-        f"wait_stream_fallbacks={totals.get('wait_stream_fallbacks', 0):.0f}"
-    )
-    bucket_lines = _gc_profile_top_lines(
-        _gc_profile_state["bucket_stats"],
-        "pack_count",
-        ("pack_bytes", "unpack_count", "unpack_not_ready_count", "unpack_cuda_wait_s"),
-    )
-    if bucket_lines:
-        print("  size buckets:")
-        for line in bucket_lines:
-            print(line)
-
-    module_lines = _gc_profile_top_lines(
-        _gc_profile_state["module_stats"],
-        "unpack_not_ready_count",
-        ("unpack_ready_count", "unpack_cuda_wait_s", "unpack_bytes"),
-    )
-    if module_lines:
-        print("  top modules by unpack_not_ready_count:")
-        for line in module_lines:
-            print(line)
-
-    module_lines = _gc_profile_top_lines(
-        _gc_profile_state["module_stats"],
-        "unpack_cuda_wait_s",
-        ("unpack_not_ready_count", "unpack_bytes", "unpack_count"),
-    )
-    if module_lines:
-        print("  top modules by unpack_cuda_wait_s:")
-        for line in module_lines:
-            print(line)
-
-    module_lines = _gc_profile_top_lines(
-        _gc_profile_state["module_stats"],
-        "unpack_bytes",
-        ("unpack_count", "unpack_cpu_s"),
-    )
-    if module_lines:
-        print("  top modules by unpack_bytes:")
-        for line in module_lines:
-            print(line)
-
-    module_lines = _gc_profile_top_lines(
-        _gc_profile_state["module_stats"],
-        "unpack_cpu_s",
-        ("unpack_bytes", "unpack_count"),
-    )
-    if module_lines:
-        print("  top modules by unpack_cpu_s:")
-        for line in module_lines:
-            print(line)
-
-    module_lines = _gc_profile_top_lines(
-        _gc_profile_state["module_stats"],
-        "pack_bytes",
-        ("pack_count", "pack_cpu_s"),
-    )
-    if module_lines:
-        print("  top modules by pack_bytes:")
-        for line in module_lines:
-            print(line)
-
-    shape_lines = _gc_profile_top_lines(
-        _gc_profile_state["shape_stats"],
-        "unpack_bytes",
-        ("unpack_count", "unpack_cpu_s"),
-    )
-    if shape_lines:
-        print("  top tensor shapes by unpack_bytes:")
-        for line in shape_lines:
-            print(line)
-
-    shape_lines = _gc_profile_top_lines(
-        _gc_profile_state["shape_stats"],
-        "unpack_cpu_s",
-        ("unpack_bytes", "unpack_count"),
-    )
-    if shape_lines:
-        print("  top tensor shapes by unpack_cpu_s:")
-        for line in shape_lines:
-            print(line)
-
-    shape_lines = _gc_profile_top_lines(
-        _gc_profile_state["shape_stats"],
-        "unpack_not_ready_count",
-        ("unpack_ready_count", "unpack_cuda_wait_s", "unpack_bytes"),
-    )
-    if shape_lines:
-        print("  top tensor shapes by unpack_not_ready_count:")
-        for line in shape_lines:
-            print(line)
-
-    shape_lines = _gc_profile_top_lines(
-        _gc_profile_state["shape_stats"],
-        "unpack_cuda_wait_s",
-        ("unpack_not_ready_count", "unpack_bytes", "unpack_count"),
-    )
-    if shape_lines:
-        print("  top tensor shapes by unpack_cuda_wait_s:")
-        for line in shape_lines:
-            print(line)
-
-    shape_lines = _gc_profile_medium_shape_lines(
-        "pack_count",
-        ("pack_bytes", "unpack_not_ready_count", "unpack_cuda_wait_s"),
-    )
-    if shape_lines:
-        print("  medium tensor shapes by pack_count:")
-        for line in shape_lines:
-            print(line)
+    from ._profile.gradient_checkpointing import patch_unsloth_gc_profile
+    patch_unsloth_gc_profile()
+    _gc_profile_patched = True
 
 
 def resolve_gc_offload_backend(backend = None):
@@ -615,30 +287,10 @@ def _bind_gradient_checkpointing_func(
     else:
         bound = checkpoint_fn
 
-    named_modules = {
-        id(candidate): (name or candidate.__class__.__name__)
-        for name, candidate in model.named_modules()
-    }
     for module in model.modules():
         if not hasattr(module, "_gradient_checkpointing_func"):
             continue
-        if _gc_profile_enabled():
-            module._unsloth_gc_profile_module_name = named_modules.get(id(module), module.__class__.__name__)
-        if not _gc_profile_enabled():
-            module._gradient_checkpointing_func = bound
-            continue
-
-        module_name = named_modules.get(id(module), module.__class__.__name__)
-
-        @functools.wraps(bound)
-        def profiled_checkpoint_call(function, *args, __bound = bound, __module_name = module_name, **kwargs):
-            token = _gc_profile_module.set(__module_name)
-            try:
-                return __bound(function, *args, **kwargs)
-            finally:
-                _gc_profile_module.reset(token)
-
-        module._gradient_checkpointing_func = profiled_checkpoint_call
+        module._gradient_checkpointing_func = bound
 
 
 def set_sac_policy(model, policy):
@@ -651,6 +303,7 @@ def set_sac_policy(model, policy):
     Raises:
         ValueError: If the model uses reentrant checkpointing.
     """
+    _maybe_patch_gc_profile()
     use_reentrant = getattr(model, "_unsloth_use_reentrant", True)
     if use_reentrant and policy is not None:
         raise ValueError(
@@ -670,6 +323,7 @@ def set_sac_policy(model, policy):
 
 def set_offload_backend(model, backend):
     global _default_offload_backend
+    _maybe_patch_gc_profile()
     backend = resolve_gc_offload_backend(backend)
     model._unsloth_gc_offload_backend = backend
     _default_offload_backend = backend
@@ -961,7 +615,6 @@ CPU_INDEX = None
 # Used as fallback when HF's gradient_checkpointing_enable() overwrites the
 # per-module partial binding and drops the offload_backend kwarg.
 _default_offload_backend: Optional[str] = None
-pass
 
 
 def _gc_disable_cpu_offload():
@@ -969,7 +622,6 @@ def _gc_disable_cpu_offload():
     if value is None:
         return False
     return str(value).strip().lower() not in ("0", "false", "no", "off", "")
-pass
 
 
 _pinned_bytes_allocated: int = 0
@@ -1009,6 +661,7 @@ def _check_cpu_ram_before_pin(alloc_bytes: int):
         f"({avail / 2**30:.1f}GB free / {total / 2**30:.1f}GB total). "
         f"Pinned memory allocated by Unsloth so far: {_pinned_bytes_allocated / 2**30:.2f}GB. "
         f"Next allocation: {alloc_bytes / 2**20:.0f}MB. "
+        f"Projected pinned memory after this allocation: {new_total_pinned / 2**30:.2f}GB. "
         "Pinned memory cannot be swapped and exhaustion causes cryptic CUDA errors. "
         "To disable CPU offloading: set UNSLOTH_GC_DISABLE_CPU_OFFLOAD=1",
         stacklevel=4,
@@ -1262,8 +915,6 @@ class UnslothStreamActivationScheduler:
         return True
 
     def stash_tensor(self, tensor: torch.Tensor):
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_STREAM_PUSHES[0] += 1
         if not self.should_stage(tensor):
             return tensor
         try:
@@ -1272,9 +923,6 @@ class UnslothStreamActivationScheduler:
             max_tensors_per_window = 1
         if max_tensors_per_window > 0 and self.tensor_count_current_window >= max_tensors_per_window:
             return tensor
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_STREAM_STASHED_TENSORS[0] += 1
-            _UNSLOTH_STREAM_STAGED_BYTES[0] += int(tensor.numel()) * int(tensor.element_size())
         self.active_windows.add(self.current_window)
         tensor_tag = (self.current_window, self.tensor_count_current_window)
         self.tensor_count_current_window += 1
@@ -1391,7 +1039,7 @@ class UnslothStreamActivationScheduler:
         return result
 
     def restore_tensor(self, token):
-        if not isinstance(token, _UnslothActivationTicket):
+        if not isinstance(token, _UnslothActivationTicket) or token.scheduler is not self:
             return token
         state = self.ticket_state.pop(token.tag)
         self.device_hold_refs.pop(token.tag, None)
@@ -1422,9 +1070,6 @@ class UnslothStreamActivationScheduler:
                 state.dtype,
             )
         self.host_windows[window_index] = staged
-        if staged and os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_STREAM_STAGED_WINDOWS[0] += 1
-            _UNSLOTH_STREAM_STAGED_TENSORS[0] += len(staged)
 
     def advance_forward_window(self, current_window):
         if self.num_host_windows <= 0 or self.staged_window_count >= self.num_host_windows:
@@ -1445,20 +1090,13 @@ class UnslothStreamActivationScheduler:
         mapping = self.host_windows.pop(window_index, None)
         if not mapping:
             return
-        restored = 0
         for slot in mapping.values():
-            if self._restore_slot_to_device(slot):
-                restored += 1
-        if restored and os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_STREAM_RESTORED_WINDOWS[0] += 1
-            _UNSLOTH_STREAM_RESTORED_TENSORS[0] += restored
+            self._restore_slot_to_device(slot)
 
     def seal_forward_region(self):
         if self.current_window not in self.active_windows:
             return
         self.active_windows.discard(self.current_window)
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_STREAM_BOUNDARIES[0] += 1
         self.advance_forward_window(self.current_window)
         self.current_window += 1
         self.tensor_count_current_window = 0
@@ -1468,8 +1106,6 @@ class UnslothStreamActivationScheduler:
         if self.current_window < 0:
             self.current_window = 0
             return
-        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-            _UNSLOTH_STREAM_BACKWARD_BOUNDARIES[0] += 1
         if self.num_host_windows <= 0 or self.staged_window_count <= 0:
             return
         idx = self.staged_window_count - 1
@@ -1645,7 +1281,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         # Check if no requires_grad in inputs
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
-        ctx._gc_profile_module = _gc_profile_module_name()
         # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
         ctx.device_type = _infer_device_type(*args)
         ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(
@@ -1777,7 +1412,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         x = x[:new_size].view(shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
-                        pack_start = time.perf_counter() if _gc_profile_enabled() else 0.0
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
                         with torch_gpu_stream(EXTRA_STREAM):
                             x.copy_(_arg, non_blocking = True)
@@ -1786,19 +1420,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         buffer_slot = NEXT_BUFFER_SLOT[device_index]
                         NEXT_BUFFER_SLOT[device_index] ^= 1
                         ctx._saved_metadata = (new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM, buffer_slot,)
-                        if _gc_profile_enabled():
-                            ctx._gc_profile_shape = shape
-                            ctx._gc_profile_numel = new_size
-                            ctx._gc_profile_dtype = _arg.dtype
-                            _gc_profile_record(
-                                mode = "reentrant",
-                                module_name = ctx._gc_profile_module,
-                                shape = shape,
-                                dtype = arg.dtype,
-                                numel = new_size,
-                                kind = "pack",
-                                duration_s = time.perf_counter() - pack_start,
-                            )
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
@@ -1862,7 +1483,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             x = CPU_BUFFERS[CPU_INDEX][:new_size].view(shape)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
-            unpack_start = time.perf_counter() if _gc_profile_enabled() else 0.0
             if USE_DOUBLE_BUFFER:
                 # Wait for the last compute on THIS SPECIFIC buffer to finish
                 event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
@@ -1920,23 +1540,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # Wait for GPU buffer to finish
             if CPU_INDEX is not None:
-                wait_start = time.perf_counter() if _gc_profile_enabled() else 0.0
                 MAIN_STREAM.wait_stream(EXTRA_STREAM)
-                wait_duration = (time.perf_counter() - wait_start) if _gc_profile_enabled() else 0.0
                 x = buffer.detach()
                 x.requires_grad_(True)
                 detached_inputs[0] = x
-                if _gc_profile_enabled():
-                    _gc_profile_record(
-                        mode = "reentrant",
-                        module_name = ctx._gc_profile_module,
-                        shape = getattr(ctx, "_gc_profile_shape", shape),
-                        dtype = getattr(ctx, "_gc_profile_dtype", x.dtype),
-                        numel = getattr(ctx, "_gc_profile_numel", new_size),
-                        kind = "unpack",
-                        duration_s = time.perf_counter() - unpack_start,
-                        wait_s = wait_duration,
-                    )
             pass
 
             with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
@@ -2124,39 +1731,6 @@ def _unsloth_checkpoint_reentrant_offload(function, *args, preserve_rng_state=Tr
     )
 
 
-_UNSLOTH_CHECKPOINT_HIT_COUNT = [0]
-_UNSLOTH_STREAM_BOUNDARIES = [0]
-_UNSLOTH_STREAM_BACKWARD_BOUNDARIES = [0]
-_UNSLOTH_STREAM_PUSHES = [0]
-_UNSLOTH_STREAM_STASHED_TENSORS = [0]
-_UNSLOTH_STREAM_STAGED_WINDOWS = [0]
-_UNSLOTH_STREAM_RESTORED_WINDOWS = [0]
-_UNSLOTH_STREAM_STAGED_TENSORS = [0]
-_UNSLOTH_STREAM_RESTORED_TENSORS = [0]
-_UNSLOTH_STREAM_STAGED_BYTES = [0]
-_UNSLOTH_CHECKPOINT_HIT_REPORTED = [False]
-
-def _report_checkpoint_hit_count():
-    if _UNSLOTH_CHECKPOINT_HIT_REPORTED[0]:
-        return
-    _UNSLOTH_CHECKPOINT_HIT_REPORTED[0] = True
-    if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-        print(
-            f"[gc_hit_count] unsloth_checkpoint entries={_UNSLOTH_CHECKPOINT_HIT_COUNT[0]} "
-            f"unsloth_stream_boundaries={_UNSLOTH_STREAM_BOUNDARIES[0]} "
-            f"unsloth_stream_backward_boundaries={_UNSLOTH_STREAM_BACKWARD_BOUNDARIES[0]} "
-            f"unsloth_stream_pushes={_UNSLOTH_STREAM_PUSHES[0]} "
-            f"unsloth_stream_stashed_tensors={_UNSLOTH_STREAM_STASHED_TENSORS[0]} "
-            f"unsloth_stream_staged_windows={_UNSLOTH_STREAM_STAGED_WINDOWS[0]} "
-            f"unsloth_stream_restored_windows={_UNSLOTH_STREAM_RESTORED_WINDOWS[0]} "
-            f"unsloth_stream_staged_tensors={_UNSLOTH_STREAM_STAGED_TENSORS[0]} "
-            f"unsloth_stream_restored_tensors={_UNSLOTH_STREAM_RESTORED_TENSORS[0]} "
-            f"unsloth_stream_staged_MiB={_UNSLOTH_STREAM_STAGED_BYTES[0]/1024/1024:.1f}",
-            flush=True,
-        )
-
-atexit.register(_report_checkpoint_hit_count)
-
 def unsloth_checkpoint(
     function,
     *args,
@@ -2168,8 +1742,6 @@ def unsloth_checkpoint(
     No @torch._disable_dynamo -- this is a pure dispatcher so it does not
     create graph breaks for the non-reentrant path.
     """
-    if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-        _UNSLOTH_CHECKPOINT_HIT_COUNT[0] += 1
     if use_reentrant is None:
         use_reentrant = True
 
@@ -2185,38 +1757,29 @@ def unsloth_checkpoint(
             if _is_fsdp2_module(function):
                 use_reentrant = False
 
-    token = None
-    if _gc_profile_enabled():
-        module_name = _gc_profile_resolve_function_module_name(function)
-        if module_name is not None:
-            token = _gc_profile_module.set(module_name)
-
-    try:
-        if use_reentrant:
-            preserve = kwargs.pop("preserve_rng_state", True)
-            offload_backend = resolve_gc_offload_backend(
-                kwargs.pop("offload_backend", None) or _default_offload_backend
+    if use_reentrant:
+        preserve = kwargs.pop("preserve_rng_state", True)
+        offload_backend = resolve_gc_offload_backend(
+            kwargs.pop("offload_backend", None) or _default_offload_backend
+        )
+        if offload_backend == "unsloth_stream":
+            return _unsloth_checkpoint_reentrant_offload(
+                function, *args,
+                preserve_rng_state=preserve,
+                offload_backend=offload_backend,
+                **kwargs,
             )
-            if offload_backend == "unsloth_stream":
-                return _unsloth_checkpoint_reentrant_offload(
-                    function, *args,
-                    preserve_rng_state=preserve,
-                    offload_backend=offload_backend,
-                    **kwargs,
-                )
-            if kwargs:
-                raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
-            return _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=preserve)
+        if kwargs:
+            raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
+        return _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=preserve)
 
-        return _unsloth_checkpoint_nonreentrant(function, *args, **kwargs)
-    finally:
-        if token is not None:
-            _gc_profile_module.reset(token)
+    return _unsloth_checkpoint_nonreentrant(function, *args, **kwargs)
 pass
 
 
 def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = None):
     # All Unsloth Zoo code licensed under LGPLv3
+    _maybe_patch_gc_profile()
     effective_use_reentrant = bool(use_reentrant) if use_reentrant is not None else True
     try:
         reentrant_backend = resolve_gc_offload_backend()
