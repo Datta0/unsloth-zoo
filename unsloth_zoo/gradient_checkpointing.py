@@ -829,6 +829,7 @@ class UnslothStreamActivationScheduler:
         self._parameter_storage_cache = {}
         self._d2h_streams = {}
         self._h2d_streams = {}
+        self.prefetch_targets = ()
         self.clone_boundary_layers = set()
         self.clone_boundary_output = False
         self.reset_step_windows()
@@ -851,6 +852,7 @@ class UnslothStreamActivationScheduler:
         self.host_windows = {}
         self.active_windows = set()
         self.staged_window_count = 0
+        self.prefetch_targets_started = False
 
     def update_model_parameters(self, module):
         cache_key = id(module)
@@ -1102,6 +1104,21 @@ class UnslothStreamActivationScheduler:
         for slot in mapping.values():
             self._restore_slot_to_device(slot)
 
+    def prefetch_host_windows_to_device(self):
+        if self.num_host_windows <= 0:
+            return
+        for mapping in list(self.host_windows.values()):
+            for slot in mapping.values():
+                self._restore_slot_to_device(slot)
+
+    def prefetch_linked_stacks(self):
+        if self.prefetch_targets_started:
+            return
+        self.prefetch_targets_started = True
+        for scheduler in self.prefetch_targets:
+            if scheduler is not self:
+                scheduler.prefetch_host_windows_to_device()
+
     def seal_forward_region(self):
         if self.current_window not in self.active_windows:
             return
@@ -1111,6 +1128,7 @@ class UnslothStreamActivationScheduler:
         self.tensor_count_current_window = 0
 
     def rewind_for_backward_region(self):
+        self.prefetch_linked_stacks()
         self.current_window -= 1
         if self.current_window < 0:
             self.current_window = 0
