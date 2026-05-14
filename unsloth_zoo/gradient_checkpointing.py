@@ -49,6 +49,7 @@ __all__ = [
     "resolve_gc_offload_backend",
     "set_offload_backend",
     "_bind_gradient_checkpointing_func",
+    "_set_unsloth_checkpoint_state",
 ]
 
 # ── Selective Activation Checkpointing (SAC) ──────────────────────────
@@ -278,9 +279,7 @@ def _bind_gradient_checkpointing_func(
     if (use_reentrant is False) and context_fn is not None:
         partial_kwargs["context_fn"] = context_fn
     if offload_backend is not None:
-        resolved_backend = resolve_gc_offload_backend(offload_backend)
-        if (use_reentrant is False) or resolved_backend == "unsloth_stream":
-            partial_kwargs["offload_backend"] = resolved_backend
+        partial_kwargs["offload_backend"] = resolve_gc_offload_backend(offload_backend)
 
     if partial_kwargs:
         bound = functools.partial(checkpoint_fn, **partial_kwargs)
@@ -291,6 +290,19 @@ def _bind_gradient_checkpointing_func(
         if not hasattr(module, "_gradient_checkpointing_func"):
             continue
         module._gradient_checkpointing_func = bound
+
+
+def _set_unsloth_checkpoint_state(model, use_reentrant, offload_backend):
+    use_reentrant = bool(use_reentrant)
+    offload_backend = resolve_gc_offload_backend(offload_backend)
+    seen = set()
+    current = model
+    while current is not None and id(current) not in seen:
+        current._unsloth_use_reentrant = use_reentrant
+        current._unsloth_gc_offload_backend = offload_backend
+        seen.add(id(current))
+        current = getattr(current, "model", None)
+    return use_reentrant, offload_backend
 
 
 def set_sac_policy(model, policy):
@@ -322,29 +334,30 @@ def set_sac_policy(model, policy):
 
 
 def set_offload_backend(model, backend):
-    global _default_offload_backend
     _maybe_patch_gc_profile()
     backend = resolve_gc_offload_backend(backend)
-    model._unsloth_gc_offload_backend = backend
-    _default_offload_backend = backend
     use_reentrant = getattr(model, "_unsloth_use_reentrant", True)
-    context_fn = getattr(model, "_unsloth_sac_context_fn", None)
-    checkpoint_fn = torch.utils.checkpoint.checkpoint
-    _bind_gradient_checkpointing_func(
-        model, checkpoint_fn, use_reentrant, context_fn, backend,
+    use_reentrant, backend = _set_unsloth_checkpoint_state(
+        model, use_reentrant, backend,
     )
-    try:
-        from .training_utils import (
-            _install_unsloth_stream_offload_wrapper,
-            _remove_unsloth_stream_offload_wrapper,
-        )
-        dtype = getattr(getattr(model, "config", None), "torch_dtype", None)
-        if backend == "unsloth_stream":
-            _install_unsloth_stream_offload_wrapper(model, dtype)
-        else:
-            _remove_unsloth_stream_offload_wrapper(model)
-    except Exception:
-        pass
+    context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+    dtype = getattr(getattr(model, "config", None), "torch_dtype", None)
+    patch_unsloth_smart_gradient_checkpointing(
+        dtype=dtype,
+        use_reentrant=use_reentrant,
+        offload_backend=backend,
+    )
+    _bind_gradient_checkpointing_func(
+        model, unsloth_checkpoint, use_reentrant, context_fn, backend,
+    )
+    from .training_utils import (
+        _install_unsloth_stream_offload_wrapper,
+        _remove_unsloth_stream_offload_wrapper,
+    )
+    if backend == "unsloth_stream":
+        _install_unsloth_stream_offload_wrapper(model, dtype)
+    else:
+        _remove_unsloth_stream_offload_wrapper(model)
     return backend
 
 
@@ -611,10 +624,6 @@ elif DEVICE_TYPE == "xpu":
 
 CPU_BUFFERS = []
 CPU_INDEX = None
-# Module-level default offload backend, set by set_offload_backend().
-# Used as fallback when HF's gradient_checkpointing_enable() overwrites the
-# per-module partial binding and drops the offload_backend kwarg.
-_default_offload_backend: Optional[str] = None
 
 
 def _gc_disable_cpu_offload():
@@ -1624,16 +1633,12 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
     context_fn = kwargs.pop("context_fn", noop_context_fn)
     offload_backend_arg = kwargs.pop("offload_backend", None)
     if offload_backend_arg is None:
-        offload_backend_arg = (
-            _default_offload_backend
-            or os.environ.get("UNSLOTH_GC_OFFLOAD_BACKEND", "unsloth_stream")
-        )
+        offload_backend_arg = os.environ.get("UNSLOTH_GC_OFFLOAD_BACKEND", "unsloth_stream")
     offload_backend = resolve_gc_offload_backend(offload_backend_arg)
     determinism_check = kwargs.pop("determinism_check", _DEFAULT_DETERMINISM_MODE)
     debug = kwargs.pop("debug", False)
 
     cls = UnslothGradientCheckpointer
-    determinism_check = "none"
     dtype = None
     first_arg = args[0] if args else None
     if torch.is_tensor(first_arg):
@@ -1645,7 +1650,7 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
 
     if (not _gc_disable_cpu_offload()) and offload_backend == "unsloth_stream":
         scheduler, bound_module = _resolve_unsloth_stream_scheduler_from_checkpoint_function(function)
-        if scheduler is not None:
+        if scheduler is not None and not getattr(scheduler, "disable_nonreentrant_cpu_offload", False):
             if bound_module is not None:
                 scheduler.update_model_parameters(bound_module)
                 scheduler.clone_boundary_output = (
@@ -1680,7 +1685,7 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
 
 def _unsloth_checkpoint_reentrant_offload(function, *args, preserve_rng_state=True, offload_backend=None, **kwargs):
     """Reentrant PyTorch checkpoint with Unsloth stream activation offload."""
-    offload_backend = resolve_gc_offload_backend(offload_backend or _default_offload_backend)
+    offload_backend = resolve_gc_offload_backend(offload_backend)
     if kwargs:
         raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
 
@@ -1760,7 +1765,7 @@ def unsloth_checkpoint(
     if use_reentrant:
         preserve = kwargs.pop("preserve_rng_state", True)
         offload_backend = resolve_gc_offload_backend(
-            kwargs.pop("offload_backend", None) or _default_offload_backend
+            kwargs.pop("offload_backend", None)
         )
         if offload_backend == "unsloth_stream":
             return _unsloth_checkpoint_reentrant_offload(
@@ -1774,15 +1779,14 @@ def unsloth_checkpoint(
         return _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=preserve)
 
     return _unsloth_checkpoint_nonreentrant(function, *args, **kwargs)
-pass
 
 
-def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = None):
+def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = None, offload_backend = None):
     # All Unsloth Zoo code licensed under LGPLv3
     _maybe_patch_gc_profile()
     effective_use_reentrant = bool(use_reentrant) if use_reentrant is not None else True
     try:
-        reentrant_backend = resolve_gc_offload_backend()
+        reentrant_backend = resolve_gc_offload_backend(offload_backend)
     except Exception:
         reentrant_backend = "unsloth_original"
     use_reentrant_offload_backend = (

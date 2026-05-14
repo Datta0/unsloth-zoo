@@ -31,6 +31,8 @@ from .gradient_checkpointing import (
     unpatch_unsloth_smart_gradient_checkpointing,
     patch_unsloth_smart_gradient_checkpointing,
     _bind_gradient_checkpointing_func,
+    _set_unsloth_checkpoint_state,
+    unsloth_checkpoint,
     UnslothStreamActivationScheduler,
     UnslothGradientCheckpointer,
     resolve_gc_offload_backend,
@@ -95,21 +97,60 @@ def _remove_unsloth_stream_offload_wrapper(model):
 def _find_transformer_layers(model):
     target = _resolve_stream_wrapper_target(model)
     candidates = []
-    stack = [target]
+    config = getattr(model, "config", None)
+    is_vlm = bool(
+        getattr(config, "vision_config", None) is not None
+        or "vl" in str(getattr(config, "model_type", "") or "").lower()
+        or "vision" in type(model).__name__.lower()
+    )
+
+    def add_candidate(name, layers):
+        if not isinstance(layers, torch.nn.ModuleList) or len(layers) < 2:
+            return
+        lowered = str(name).lower()
+        has_checkpoint = any(hasattr(layer, "_gradient_checkpointing_func") for layer in layers)
+        score = 0
+        if has_checkpoint:
+            score += 1000
+        if any(token in lowered for token in ("language_model", "text_model", "decoder")):
+            score += 100
+        if lowered in ("", "model", "base_model", "model.model"):
+            score += 50
+        if any(token in lowered for token in ("vision", "visual", "image", "tower")):
+            score += 300 if is_vlm else -100
+        score += min(len(layers), 99)
+        candidates.append((score, has_checkpoint, list(layers)))
+
+    for owner_index, owner in enumerate(_stream_wrapper_owner_chain(model)):
+        add_candidate(f"owner_{owner_index}", getattr(owner, "layers", None))
+    add_candidate("", getattr(target, "layers", None))
+
+    stack = [("", target)]
     seen = set()
     while stack:
-        module = stack.pop()
+        name, module = stack.pop()
         if id(module) in seen:
             continue
         seen.add(id(module))
-        layers = getattr(module, "layers", None)
-        if isinstance(layers, torch.nn.ModuleList) and len(layers) >= 2:
-            candidates.append(layers)
-        for child in module.children():
-            stack.append(child)
+        add_candidate(name, getattr(module, "layers", None))
+        for child_name, child in module.named_children():
+            child_path = child_name if not name else f"{name}.{child_name}"
+            stack.append((child_path, child))
     if candidates:
-        return list(max(candidates, key=len))
+        return max(candidates, key=lambda item: item[0])[2]
     return []
+
+
+def _find_layers_owner_name(model, layers):
+    target = _resolve_stream_wrapper_target(model)
+    layer_ids = tuple(id(layer) for layer in layers)
+    for name, module in target.named_modules():
+        module_layers = getattr(module, "layers", None)
+        if not isinstance(module_layers, torch.nn.ModuleList):
+            continue
+        if tuple(id(layer) for layer in module_layers) == layer_ids:
+            return name
+    return ""
 
 
 def _install_unsloth_stream_offload_wrapper(model, dtype):
@@ -139,10 +180,21 @@ def _install_unsloth_stream_offload_wrapper(model, dtype):
     deepstack_count = len(deepstack_indexes or []) if is_vlm else 0
     scheduler.clone_boundary_layers = set(range(deepstack_count))
     scheduler.clone_boundary_output = False
+    selected_owner = _find_layers_owner_name(model, layers)
+    selected_owner_lower = selected_owner.lower()
+    selected_visual_stack = any(
+        token in selected_owner_lower
+        for token in ("vision", "visual", "image", "tower")
+    )
+    scheduler.disable_nonreentrant_cpu_offload = False
     if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
         print(
             f"[unsloth_stream] installing layer-level stream wrapper layers={len(layers)} "
-            f"host_windows={max(0, len(layers) - skip_last_groups)}",
+            f"host_windows={max(0, len(layers) - skip_last_groups)} "
+            f"owner={selected_owner or '<unknown>'} "
+            f"vlm={is_vlm} visual_stack={selected_visual_stack} "
+            f"disable_nonreentrant_cpu_offload={scheduler.disable_nonreentrant_cpu_offload} "
+            f"deepstack_count={deepstack_count}",
             flush=True,
         )
 
@@ -366,15 +418,6 @@ def prepare_model_for_training(
         # Historically only `FastLanguageModel.from_pretrained` activated this;
         # direct `prepare_model_for_training` consumers otherwise kept stale
         # vanilla checkpoint functions.
-        try:
-            patch_unsloth_smart_gradient_checkpointing(
-                dtype=dtype,
-                use_reentrant=use_reentrant,
-            )
-        except Exception:
-            pass
-
-        checkpoint_fn = torch.utils.checkpoint.checkpoint
         context_fn = getattr(model, "_unsloth_sac_context_fn", None)
         effective_reentrant = getattr(model, "_unsloth_use_reentrant", None)
         if type(effective_reentrant) is not bool:
@@ -383,9 +426,22 @@ def prepare_model_for_training(
         if offload_backend is None and not effective_reentrant:
             offload_backend = os.environ.get("UNSLOTH_GC_OFFLOAD_BACKEND", "unsloth_stream")
         offload_backend = resolve_gc_offload_backend(offload_backend)
-        model._unsloth_gc_offload_backend = offload_backend
+        effective_reentrant, offload_backend = _set_unsloth_checkpoint_state(
+            model, effective_reentrant, offload_backend,
+        )
+        try:
+            patch_unsloth_smart_gradient_checkpointing(
+                dtype=dtype,
+                use_reentrant=effective_reentrant,
+                offload_backend=offload_backend,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Unsloth: failed to install smart gradient checkpointing."
+            ) from exc
+
         _bind_gradient_checkpointing_func(
-            model, checkpoint_fn, effective_reentrant, context_fn, offload_backend,
+            model, unsloth_checkpoint, effective_reentrant, context_fn, offload_backend,
         )
 
         if offload_backend == "unsloth_stream":
@@ -396,8 +452,8 @@ def prepare_model_for_training(
         _remove_unsloth_stream_offload_wrapper(model)
         if use_gradient_checkpointing is True and hasattr(model, "_unsloth_gc_offload_backend"):
             # Native path: drop the unsloth offload attribute so downstream
-            # fallbacks (e.g. `_default_offload_backend`, env-var lookup in
-            # `_unsloth_checkpoint_nonreentrant`) don't accidentally apply an
+            # fallbacks (e.g. env-var lookup in `_unsloth_checkpoint_nonreentrant`)
+            # don't accidentally apply an
             # unsloth offload backend to a user requesting vanilla GC.
             try:
                 delattr(model, "_unsloth_gc_offload_backend")
