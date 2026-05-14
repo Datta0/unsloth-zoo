@@ -455,7 +455,7 @@ def _install_unsloth_stream_offload_wrapper(model, dtype):
     installed_groups = []
     for group in groups:
         layers = group["layers"]
-        skip_default = "16" if is_vlm and group["role"] == "text" else "2"
+        skip_default = "2"
         try:
             skip_last_groups = max(0, int(os.environ.get("UNSLOTH_GC_STREAM_SKIP_LAST_WINDOWS", skip_default)))
         except ValueError:
