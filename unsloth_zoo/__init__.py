@@ -90,27 +90,31 @@ if (os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"):
 
 
 from importlib.util import find_spec
-import platform as _check_platform
+from .mlx.runtime import is_mlx_available
+
+# Import-time fixes live in ``unsloth/import_fixes.py`` and run at
+# ``import unsloth`` time. Zoo cannot be imported standalone (the GPU
+# init below requires ``find_spec("unsloth")``), so the patches are
+# always already in place here -- we do not re-host or re-apply them.
 
 # Detect Apple Silicon MLX mode:
 # Either torch is absent (pure MLX), or unsloth already detected MLX
-_is_mlx_only = (
-    os.environ.get("UNSLOTH_FORCE_GPU_PATH", "0") != "1"
-    and _check_platform.system() == "Darwin"
-    and _check_platform.machine() == "arm64"
-    and find_spec("mlx") is not None
-)
+_is_mlx_only = is_mlx_available()
 
 if _is_mlx_only:
     # MLX mode: skip all CUDA/torch-specific initialization.
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
     UNSLOTH_ZOO_IS_PRESENT = True
-    del _is_mlx_only, _check_platform, find_spec
+    DEVICE_TYPE = "mlx"
+    DEVICE_TYPE_TORCH = "mps"
+    DEVICE_COUNT = 1
+    ALLOW_PREQUANTIZED_MODELS = True
+    del _is_mlx_only, is_mlx_available, find_spec
     # Everything below this point is GPU-only. Use a flag to gate it.
     _SKIP_GPU_INIT = True
 else:
     _SKIP_GPU_INIT = False
-    del _is_mlx_only, _check_platform
+    del _is_mlx_only, is_mlx_available
 
 # Inject triton & bitsandbytes stubs on Apple Silicon with MLX so unsloth's
 # CUDA-only imports don't error at startup. _SKIP_GPU_INIT=True is set only
@@ -122,6 +126,49 @@ if _SKIP_GPU_INIT:
     from .stubs.bitsandbytes_stub import inject_into_sys_modules as _inject_bnb
     _inject_bnb()
     del _inject_triton, _inject_bnb
+
+# Lazy bridge for downstream code that still imports the old flat MLX module
+# names. Installed on every host so external scripts don't get a hard
+# ModuleNotFoundError at import time; the real import (which pulls in mlx)
+# is deferred to first attribute access. On non-MLX hosts that access
+# surfaces the same ModuleNotFoundError("mlx") users got pre-refactor.
+import importlib as _importlib
+import sys as _sys
+import types as _types
+
+class _LazyMLXAlias(_types.ModuleType):
+    __slots__ = ()
+    _LEGACY_TO_NEW = {
+        "unsloth_zoo.mlx_loader": "unsloth_zoo.mlx.loader",
+        "unsloth_zoo.mlx_trainer": "unsloth_zoo.mlx.trainer",
+        "unsloth_zoo.mlx_utils": "unsloth_zoo.mlx.utils",
+        "unsloth_zoo.mlx_compile": "unsloth_zoo.mlx.compile",
+        "unsloth_zoo.mlx_cce": "unsloth_zoo.mlx.cce",
+        "unsloth_zoo.mlx_cce.runtime_cce": "unsloth_zoo.mlx.cce.runtime_cce",
+    }
+
+    def _resolve(self):
+        import importlib, sys
+        target = self._LEGACY_TO_NEW[self.__name__]
+        real = importlib.import_module(target)
+        sys.modules[self.__name__] = real
+        return real
+
+    def __getattr__(self, name):
+        # Skip dunder probes (inspect.getmodule, hasattr(..., '__file__'),
+        # etc.) so we do not trigger an mlx import during torch's own
+        # init when it walks sys.modules. Real user attribute access
+        # (e.g. FastMLXModel) still resolves through to the new submodule.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(self._resolve(), name)
+
+for _old_name in _LazyMLXAlias._LEGACY_TO_NEW:
+    if _old_name in _sys.modules:
+        continue
+    _sys.modules[_old_name] = _LazyMLXAlias(_old_name)
+
+del _old_name, _importlib, _sys, _types
 
 if not _SKIP_GPU_INIT:
     if find_spec("unsloth") is None:

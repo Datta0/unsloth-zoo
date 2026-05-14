@@ -76,7 +76,10 @@ def _preload_real_device_type() -> bool:
     """Pre-load the REAL ``unsloth_zoo.device_type`` module under a
     temporarily-mocked ``torch.cuda.is_available()`` so its
     ``DEVICE_TYPE = get_device_type()`` initialization succeeds without
-    a real accelerator. Returns True on success.
+    a real accelerator. Returns True on success; returns False if
+    torch is not importable at all (the security-audit CI job runs
+    tests/security/ without installing torch, and those tests don't
+    need the preload).
     """
     if "unsloth_zoo.device_type" in sys.modules:
         return True
@@ -103,7 +106,20 @@ def _preload_real_device_type() -> bool:
             )
             utils_mod = importlib.util.module_from_spec(utils_spec)
             sys.modules["unsloth_zoo.utils"] = utils_mod
-            utils_spec.loader.exec_module(utils_mod)
+            try:
+                utils_spec.loader.exec_module(utils_mod)
+            except ModuleNotFoundError as exc:
+                # Tests that don't need torch (e.g. the tests/security
+                # subtree which only exercises scanner regex tables and
+                # subprocess invocations) shouldn't be blocked by the
+                # device-type preload when torch isn't installed. Pop
+                # the half-built modules and bail out gracefully.
+                if "torch" in str(exc):
+                    sys.modules.pop("unsloth_zoo.utils", None)
+                    if not skeleton_already:
+                        sys.modules.pop("unsloth_zoo", None)
+                    return False
+                raise
 
         device_type_path = os.path.join(pkg_path, "device_type.py")
         dt_spec = importlib.util.spec_from_file_location(
@@ -127,12 +143,31 @@ def _preload_real_device_type() -> bool:
 
 
 def _patch_torch_cuda_for_import() -> None:
-    """Guard concrete ``torch.cuda.*`` calls that
-    ``unsloth_zoo.temporary_patches.*`` modules make at IMPORT time.
+    """Stub torch.cuda.* calls made at IMPORT time on CPU-only CI runners.
+
+    Covers mem_get_info (used by temporary_patches/*), get_device_capability
+    (compiler.py:87, loss_utils.py:39 -- gates cut_cross_entropy on Ampere+),
+    and get_device_properties. Return (8, 0) so Ampere-gated imports proceed;
+    the cut_cross_entropy import itself is try/except wrapped.
     """
     try:
+        import torch  # type: ignore
         import torch.cuda.memory as _cuda_memory  # type: ignore
         _cuda_memory.mem_get_info = lambda *a, **k: (0, 80 * 1024 ** 3)
+    except Exception:
+        return
+    try:
+        torch.cuda.get_device_capability = lambda *a, **k: (8, 0)  # type: ignore[assignment]
+    except Exception:
+        pass
+    try:
+        class _StubDeviceProps:
+            major = 8
+            minor = 0
+            total_memory = 80 * 1024 ** 3
+            multi_processor_count = 108
+            name = "stub"
+        torch.cuda.get_device_properties = lambda *a, **k: _StubDeviceProps()  # type: ignore[assignment]
     except Exception:
         pass
 
@@ -162,3 +197,24 @@ if not _has_real_accelerator():
 _TESTS_DIR = pathlib.Path(__file__).resolve().parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
+
+
+# ---------------------------------------------------------------------------
+# 3. Apply upstream-drift fixes (triton CompiledKernel attrs, vLLM rename,
+#    peft transformers_weight_conversion shim, etc.) by triggering
+#    ``import unsloth``. Fixes live on ``unsloth/import_fixes.py`` and run
+#    at unsloth import time; zoo no longer carries a copy. Security-only
+#    test suites without unsloth installed keep passing -- ImportError is
+#    swallowed below.
+# ---------------------------------------------------------------------------
+
+def _apply_upstream_import_fixes_for_tests() -> None:
+    try:
+        import unsloth  # noqa: F401  # runs unsloth/import_fixes.py
+    except Exception:
+        # unsloth missing (security-only suites) or import failed; drift
+        # detectors will surface any pathology the patches would mask.
+        pass
+
+
+_apply_upstream_import_fixes_for_tests()
