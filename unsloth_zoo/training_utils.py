@@ -79,6 +79,24 @@ _STREAM_TEXT_TOKENS = ("language_model", "text_model", "decoder", "transformer",
 _STREAM_VISION_TOKENS = ("vision", "visual", "image", "tower")
 _STREAM_AUDIO_TOKENS = ("audio", "speech", "whisper", "sound")
 _STREAM_BLOCK_TOKENS = ("layer", "block", "decoder", "encoder")
+_STREAM_ROLE_NAMES = ("text", "vision", "audio", "other")
+
+
+def _env_enabled(name):
+    return os.environ.get(name, "") in ("1", "true", "True", "yes", "YES")
+
+
+def _stream_debug_enabled():
+    return (
+        _env_enabled("UNSLOTH_GC_STREAM_DEBUG")
+        or _env_enabled("UNSLOTH_GC_PROFILE")
+        or _env_enabled("UNSLOTH_GC_CHECKPOINT_HIT_COUNT")
+    )
+
+
+def _stream_model_type(model):
+    config = getattr(model, "config", None)
+    return str(getattr(config, "model_type", "") or "").lower()
 
 
 def _remove_unsloth_stream_offload_wrapper(model):
@@ -105,15 +123,33 @@ def _remove_unsloth_stream_offload_wrapper(model):
 
 def _is_multimodal_model(model):
     config = getattr(model, "config", None)
-    model_type = str(getattr(config, "model_type", "") or "").lower()
-    if any(token in model_type for token in ("vl", "vision", "audio", "speech", "multi")):
+    model_type = _stream_model_type(model)
+    if any(token in model_type for token in ("vl", "vision", "audio", "speech", "multi", "whisper", "csm")):
         return True
     if any(
         getattr(config, attr, None) is not None
         for attr in ("vision_config", "audio_config", "text_config")
     ):
         return True
-    return "vision" in type(model).__name__.lower()
+    model_name = type(model).__name__.lower()
+    return any(token in model_name for token in ("vision", "whisper", "audio", "speech"))
+
+
+def _stream_role_from_model_family(model, name):
+    model_type = _stream_model_type(model)
+    lowered = str(name).lower()
+    parts = tuple(part for part in lowered.split(".") if part)
+    if model_type == "whisper":
+        if "encoder" in parts:
+            return "audio"
+        if "decoder" in parts:
+            return "text"
+    if model_type == "csm":
+        if parts and parts[0] == "codec_model":
+            return "audio"
+        if parts and parts[0] in ("backbone_model", "depth_decoder"):
+            return "text"
+    return "other"
 
 
 def _stream_group_role(name):
@@ -185,6 +221,9 @@ def _stream_role_from_layer_type(layers):
 
 
 def _infer_stream_group_role(model, name, layers):
+    role = _stream_role_from_model_family(model, name)
+    if role != "other":
+        return role
     role = _stream_group_role(name)
     if role != "other":
         return role
@@ -230,6 +269,53 @@ def _stream_stack_filter(model):
         "modal": "modalities",
     }
     return {aliases.get(item, item) for item in requested}
+
+
+def _stream_stack_path_overrides():
+    raw = os.environ.get("UNSLOTH_GC_STREAM_STACK_PATHS", "").strip()
+    if not raw:
+        return []
+    overrides = []
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        role = None
+        path = item
+        if ":" in item:
+            maybe_role, maybe_path = item.split(":", 1)
+            maybe_role = maybe_role.strip().lower()
+            maybe_path = maybe_path.strip()
+            if maybe_role in _STREAM_ROLE_NAMES and maybe_path:
+                role = maybe_role
+                path = maybe_path
+        overrides.append((role, path.strip()))
+    return overrides
+
+
+def _stream_path_matches(candidate_name, requested_path):
+    candidate_name = str(candidate_name).strip(".")
+    requested_path = str(requested_path).strip(".")
+    if not candidate_name or not requested_path:
+        return False
+    return (
+        candidate_name == requested_path
+        or candidate_name.endswith("." + requested_path)
+        or requested_path.endswith("." + candidate_name)
+    )
+
+
+def _log_stream_layer_groups(label, groups):
+    if not _env_enabled("UNSLOTH_GC_STREAM_DEBUG"):
+        return
+    print(f"[unsloth_stream] {label}={len(groups)}", flush=True)
+    for group in groups:
+        print(
+            f"[unsloth_stream] candidate role={group['role']} layers={len(group['layers'])} "
+            f"order={group['order']} name={group['name'] or '<root>'} "
+            f"has_checkpoint={group['has_checkpoint']}",
+            flush=True,
+        )
 
 
 def _find_stream_layer_groups(model):
@@ -286,20 +372,50 @@ def _find_stream_layer_groups(model):
     candidates = list(unique.values())
     if not candidates:
         return []
+    _log_stream_layer_groups("candidate_groups", candidates)
 
-    selected_roles = _stream_stack_filter(model)
-    if "all" not in selected_roles:
-        filtered = []
-        for candidate in candidates:
-            role = candidate["role"]
-            include = role in selected_roles
-            include = include or ("modalities" in selected_roles and role in ("vision", "audio"))
-            if include:
-                filtered.append(candidate)
-        candidates = filtered
+    path_overrides = _stream_stack_path_overrides()
+    preserve_override_order = False
+    if path_overrides:
+        selected = []
+        used_paths = set()
+        preserve_override_order = True
+        for override_order, (role_override, requested_path) in enumerate(path_overrides):
+            for candidate in candidates:
+                if not _stream_path_matches(candidate["name"], requested_path):
+                    continue
+                candidate = dict(candidate)
+                candidate["order"] = override_order
+                if role_override is not None and candidate["role"] != role_override:
+                    candidate["role"] = role_override
+                selected.append(candidate)
+                used_paths.add(requested_path)
+                break
+        if _stream_debug_enabled():
+            missing = [path for _, path in path_overrides if path not in used_paths]
+            if missing:
+                print(
+                    f"[unsloth_stream] stack path override did not match: {', '.join(missing)}",
+                    flush=True,
+                )
+        candidates = selected
+    else:
+        selected_roles = _stream_stack_filter(model)
+        if "all" not in selected_roles:
+            filtered = []
+            for candidate in candidates:
+                role = candidate["role"]
+                include = role in selected_roles
+                include = include or ("modalities" in selected_roles and role in ("vision", "audio"))
+                if include:
+                    filtered.append(candidate)
+            candidates = filtered
 
     if not candidates:
         return []
+    _log_stream_layer_groups("selected_groups", candidates)
+    if preserve_override_order:
+        return candidates
     return sorted(candidates, key=lambda item: (item["role"] != "text", item["order"]))
 
 
