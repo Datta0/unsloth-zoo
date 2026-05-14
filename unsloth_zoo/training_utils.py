@@ -74,6 +74,13 @@ def _delete_local_attr(obj, name):
         pass
 
 
+_STREAM_LAYER_ATTRS = ("layers", "blocks")
+_STREAM_TEXT_TOKENS = ("language_model", "text_model", "decoder")
+_STREAM_VISION_TOKENS = ("vision", "visual", "image", "tower")
+_STREAM_AUDIO_TOKENS = ("audio", "speech", "whisper", "sound")
+_STREAM_BLOCK_TOKENS = ("layer", "block", "decoder", "encoder")
+
+
 def _remove_unsloth_stream_offload_wrapper(model):
     owners = _stream_wrapper_owner_chain(model)
     stream_layers = []
@@ -92,38 +99,101 @@ def _remove_unsloth_stream_offload_wrapper(model):
     for owner in owners:
         _delete_local_attr(owner, "_unsloth_stream_layers")
         _delete_local_attr(owner, "_unsloth_stream_scheduler")
+        _delete_local_attr(owner, "_unsloth_stream_schedulers")
+        _delete_local_attr(owner, "_unsloth_stream_groups")
 
 
-def _find_transformer_layers(model):
+def _is_multimodal_model(model):
+    config = getattr(model, "config", None)
+    model_type = str(getattr(config, "model_type", "") or "").lower()
+    if any(token in model_type for token in ("vl", "vision", "audio", "speech", "multi")):
+        return True
+    if any(
+        getattr(config, attr, None) is not None
+        for attr in ("vision_config", "audio_config", "text_config")
+    ):
+        return True
+    return "vision" in type(model).__name__.lower()
+
+
+def _stream_group_role(name):
+    lowered = str(name).lower()
+    if any(token in lowered for token in _STREAM_TEXT_TOKENS):
+        return "text"
+    if any(token in lowered for token in _STREAM_VISION_TOKENS):
+        return "vision"
+    if any(token in lowered for token in _STREAM_AUDIO_TOKENS):
+        return "audio"
+    return "other"
+
+
+def _is_transformer_layer_list(layers):
+    if not isinstance(layers, torch.nn.ModuleList) or len(layers) < 2:
+        return False
+    for layer in layers:
+        class_name = type(layer).__name__.lower()
+        if any(token in class_name for token in _STREAM_BLOCK_TOKENS):
+            return True
+    return False
+
+
+def _stream_stack_filter(model):
+    raw = os.environ.get("UNSLOTH_GC_STREAM_STACKS", "auto").strip().lower()
+    if raw in ("", "1", "true", "yes"):
+        raw = "auto"
+    requested = {part.strip() for part in raw.replace(";", ",").split(",") if part.strip()}
+    if not requested or "auto" in requested or "default" in requested:
+        return {"text", "modalities"} if _is_multimodal_model(model) else {"text"}
+    if "all" in requested:
+        return {"all"}
+    aliases = {
+        "language": "text",
+        "language_model": "text",
+        "decoder": "text",
+        "visual": "vision",
+        "image": "vision",
+        "tower": "vision",
+        "modality": "modalities",
+        "multimodal": "modalities",
+        "modal": "modalities",
+    }
+    return {aliases.get(item, item) for item in requested}
+
+
+def _find_stream_layer_groups(model):
     target = _resolve_stream_wrapper_target(model)
     candidates = []
-    config = getattr(model, "config", None)
-    is_vlm = bool(
-        getattr(config, "vision_config", None) is not None
-        or "vl" in str(getattr(config, "model_type", "") or "").lower()
-        or "vision" in type(model).__name__.lower()
-    )
 
     def add_candidate(name, layers):
-        if not isinstance(layers, torch.nn.ModuleList) or len(layers) < 2:
+        if not _is_transformer_layer_list(layers):
             return
-        lowered = str(name).lower()
         has_checkpoint = any(hasattr(layer, "_gradient_checkpointing_func") for layer in layers)
+        role = _stream_group_role(name)
+        if role == "other" and not _is_multimodal_model(model):
+            role = "text"
         score = 0
         if has_checkpoint:
             score += 1000
-        if any(token in lowered for token in ("language_model", "text_model", "decoder")):
+        if role == "text":
             score += 100
-        if lowered in ("", "model", "base_model", "model.model"):
+        if str(name).lower() in ("", "model", "base_model", "model.model"):
             score += 50
-        if any(token in lowered for token in ("vision", "visual", "image", "tower")):
-            score += 300 if is_vlm else -100
+        if role in ("vision", "audio"):
+            score += 300 if _is_multimodal_model(model) else -100
         score += min(len(layers), 99)
-        candidates.append((score, has_checkpoint, list(layers)))
+        candidates.append({
+            "name": str(name),
+            "role": role,
+            "score": score,
+            "has_checkpoint": has_checkpoint,
+            "layers": list(layers),
+        })
 
     for owner_index, owner in enumerate(_stream_wrapper_owner_chain(model)):
-        add_candidate(f"owner_{owner_index}", getattr(owner, "layers", None))
-    add_candidate("", getattr(target, "layers", None))
+        for attr in _STREAM_LAYER_ATTRS:
+            add_candidate(f"owner_{owner_index}.{attr}", getattr(owner, attr, None))
+    for attr in _STREAM_LAYER_ATTRS:
+        add_candidate(attr if attr != "layers" else "", getattr(target, attr, None))
 
     stack = [("", target)]
     seen = set()
@@ -132,31 +202,56 @@ def _find_transformer_layers(model):
         if id(module) in seen:
             continue
         seen.add(id(module))
-        add_candidate(name, getattr(module, "layers", None))
+        for attr in _STREAM_LAYER_ATTRS:
+            child_path = attr if not name else f"{name}.{attr}"
+            add_candidate(child_path, getattr(module, attr, None))
         for child_name, child in module.named_children():
             child_path = child_name if not name else f"{name}.{child_name}"
             stack.append((child_path, child))
-    if candidates:
-        return max(candidates, key=lambda item: item[0])[2]
-    return []
+
+    unique = {}
+    for candidate in candidates:
+        layer_ids = tuple(id(layer) for layer in candidate["layers"])
+        prev = unique.get(layer_ids)
+        if prev is None or candidate["score"] > prev["score"]:
+            unique[layer_ids] = candidate
+    candidates = list(unique.values())
+    if not candidates:
+        return []
+
+    selected_roles = _stream_stack_filter(model)
+    if "all" not in selected_roles:
+        filtered = []
+        for candidate in candidates:
+            role = candidate["role"]
+            include = role in selected_roles
+            include = include or ("modalities" in selected_roles and role in ("vision", "audio"))
+            if include:
+                filtered.append(candidate)
+        candidates = filtered
+
+    if not candidates:
+        return []
+    return sorted(candidates, key=lambda item: (item["role"] != "text", -item["score"], item["name"]))
 
 
 def _find_layers_owner_name(model, layers):
     target = _resolve_stream_wrapper_target(model)
     layer_ids = tuple(id(layer) for layer in layers)
     for name, module in target.named_modules():
-        module_layers = getattr(module, "layers", None)
-        if not isinstance(module_layers, torch.nn.ModuleList):
-            continue
-        if tuple(id(layer) for layer in module_layers) == layer_ids:
-            return name
+        for attr in _STREAM_LAYER_ATTRS:
+            module_layers = getattr(module, attr, None)
+            if not isinstance(module_layers, torch.nn.ModuleList):
+                continue
+            if tuple(id(layer) for layer in module_layers) == layer_ids:
+                return name if attr == "layers" else f"{name}.{attr}" if name else attr
     return ""
 
 
 def _install_unsloth_stream_offload_wrapper(model, dtype):
     _remove_unsloth_stream_offload_wrapper(model)
-    layers = _find_transformer_layers(model)
-    if not layers:
+    groups = _find_stream_layer_groups(model)
+    if not groups:
         if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
             print("[unsloth_stream] no transformer layers found; falling back to no wrapper", flush=True)
         return
@@ -166,10 +261,6 @@ def _install_unsloth_stream_offload_wrapper(model, dtype):
         skip_last_groups = max(0, int(os.environ.get("UNSLOTH_GC_STREAM_SKIP_LAST_WINDOWS", "2")))
     except ValueError:
         skip_last_groups = 2
-    scheduler = UnslothStreamActivationScheduler(
-        num_host_windows=max(0, len(layers) - skip_last_groups),
-        num_layer_windows=len(layers),
-    )
     config = getattr(model, "config", None)
     is_vlm = bool(
         getattr(config, "vision_config", None) is not None
@@ -178,33 +269,50 @@ def _install_unsloth_stream_offload_wrapper(model, dtype):
     )
     deepstack_indexes = getattr(getattr(config, "vision_config", None), "deepstack_visual_indexes", None)
     deepstack_count = len(deepstack_indexes or []) if is_vlm else 0
-    scheduler.clone_boundary_layers = set(range(deepstack_count))
-    scheduler.clone_boundary_output = False
-    selected_owner = _find_layers_owner_name(model, layers)
-    selected_owner_lower = selected_owner.lower()
-    selected_visual_stack = any(
-        token in selected_owner_lower
-        for token in ("vision", "visual", "image", "tower")
-    )
-    scheduler.disable_nonreentrant_cpu_offload = False
-    if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
-        print(
-            f"[unsloth_stream] installing layer-level stream wrapper layers={len(layers)} "
-            f"host_windows={max(0, len(layers) - skip_last_groups)} "
-            f"owner={selected_owner or '<unknown>'} "
-            f"vlm={is_vlm} visual_stack={selected_visual_stack} "
-            f"disable_nonreentrant_cpu_offload={scheduler.disable_nonreentrant_cpu_offload} "
-            f"deepstack_count={deepstack_count}",
-            flush=True,
-        )
 
     stream_layers = []
-    for layer_idx, layer in enumerate(layers):
-        layer._unsloth_stream_scheduler = scheduler
-        layer._unsloth_stream_layer_idx = layer_idx
-        stream_layers.append(layer)
+    stream_schedulers = []
+    installed_groups = []
+    for group in groups:
+        layers = group["layers"]
+        scheduler = UnslothStreamActivationScheduler(
+            num_host_windows=max(0, len(layers) - skip_last_groups),
+            num_layer_windows=len(layers),
+        )
+        scheduler.clone_boundary_layers = set(range(deepstack_count)) if group["role"] == "text" else set()
+        scheduler.clone_boundary_output = False
+        scheduler.disable_nonreentrant_cpu_offload = False
+        stream_schedulers.append(scheduler)
+        selected_owner = _find_layers_owner_name(model, layers) or group["name"]
+        installed_groups.append((group, selected_owner, scheduler))
+        for layer_idx, layer in enumerate(layers):
+            layer._unsloth_stream_scheduler = scheduler
+            layer._unsloth_stream_layer_idx = layer_idx
+            stream_layers.append(layer)
 
-    model._unsloth_stream_scheduler = scheduler
+    if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+        total_layers = sum(len(group["layers"]) for group in groups)
+        print(
+            f"[unsloth_stream] installing layer-level stream wrapper groups={len(groups)} "
+            f"total_layers={total_layers} stacks={os.environ.get('UNSLOTH_GC_STREAM_STACKS', 'auto')} "
+            f"vlm={is_vlm} deepstack_count={deepstack_count}",
+            flush=True,
+        )
+        for group, selected_owner, scheduler in installed_groups:
+            print(
+                f"[unsloth_stream] group role={group['role']} layers={len(group['layers'])} "
+                f"host_windows={scheduler.num_host_windows} owner={selected_owner or '<unknown>'} "
+                f"has_checkpoint={group['has_checkpoint']} "
+                f"clone_boundary_layers={len(scheduler.clone_boundary_layers)}",
+                flush=True,
+            )
+
+    model._unsloth_stream_scheduler = stream_schedulers[0]
+    model._unsloth_stream_schedulers = stream_schedulers
+    model._unsloth_stream_groups = [
+        {"role": group["role"], "owner": selected_owner, "layers": len(group["layers"])}
+        for group, selected_owner, _ in installed_groups
+    ]
     model._unsloth_stream_layers = stream_layers
 
 
