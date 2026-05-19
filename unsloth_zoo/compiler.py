@@ -142,6 +142,37 @@ DISABLE_COMPILE_FUNCTIONS = [
 # `from unsloth_zoo.compiler import FORCE_FLOAT32`.
 from .model_lists import FORCE_FLOAT32  # noqa: E402,F401
 
+def comment_out_model_decorators_enabled():
+    return os.environ.get("UNSLOTH_COMPILE_COMMENT_OUT_MODEL_DECORATORS", "0") == "1"
+pass
+
+def model_compile_decorator(fullgraph):
+    decorator = (
+        f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, "
+        "options = torch_compile_options)"
+    )
+    if comment_out_model_decorators_enabled():
+        decorator = "# " + decorator
+    return decorator
+pass
+
+def model_disable_decorator():
+    decorator = "@torch.compiler.disable(recursive = False)"
+    if comment_out_model_decorators_enabled():
+        decorator = "# " + decorator
+    return decorator
+pass
+
+def comment_out_model_torch_decorators(source):
+    if not comment_out_model_decorators_enabled():
+        return source
+    return re.sub(
+        r"(?m)^([ \t]*)@(torch\.compile\([^\n]*\)|torch\.compiler\.disable\(recursive = False\))",
+        r"\1# @\2",
+        source,
+    )
+pass
+
 
 _full_license_header = """
 # Unsloth auto generated code
@@ -214,7 +245,7 @@ from unsloth_zoo.loss_utils import (
 )
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-@torch.compiler.disable(recursive = False)
+{model_disable_decorator()}
 def disable_compile_scaled_dot_product_attention(*args, **kwargs):
     return scaled_dot_product_attention(*args, **kwargs)
 pass
@@ -1382,9 +1413,9 @@ def create_standalone_class(
 
     if disable is not None:
         compile = (
-            f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
+            model_compile_decorator(fullgraph)
             if not disable
-            else "@torch.compiler.disable(recursive = False)"
+            else model_disable_decorator()
         )
     else:
         compile = ""
@@ -4346,11 +4377,11 @@ def unsloth_compile_transformers(
 
             if module in disable_compile_functions:
                 parameters = (
-                    "@torch.compiler.disable(recursive = False)\n"
+                    f"{model_disable_decorator()}\n"
                     + parameters
                 )
             elif not disable:
-                parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+                parameters = f"{model_compile_decorator(UNSLOTH_FULLGRAPH)}\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
 
@@ -4408,13 +4439,16 @@ def unsloth_compile_transformers(
                 if module in disable_compile_functions:
                     source = re.sub(
                         r"@torch.compile\([^\n]*\)\n",
-                        "@torch.compiler.disable(recursive = False)\n",
+                        f"{model_disable_decorator()}\n",
                         source,
                     )
-                    if "@torch.compiler.disable(recursive = False)\n" not in source:
-                        source = "@torch.compiler.disable(recursive = False)\n" + source
+                    if (
+                        "@torch.compiler.disable(recursive = False)\n" not in source
+                        and "# @torch.compiler.disable(recursive = False)\n" not in source
+                    ):
+                        source = f"{model_disable_decorator()}\n" + source
                 elif not disable:
-                    source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                    source = f"{model_compile_decorator(UNSLOTH_FULLGRAPH)}\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
@@ -4456,6 +4490,7 @@ def unsloth_compile_transformers(
     pass
 
     all_code = "\n\n".join(final_all_standalone_classes)
+    all_code = comment_out_model_torch_decorators(all_code)
 
     try:
         combined_module = create_new_function(
