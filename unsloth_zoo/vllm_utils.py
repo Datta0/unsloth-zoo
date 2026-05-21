@@ -1308,6 +1308,20 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         except: return self
     pass
 
+    # Suffix-based shard-dim lookup for TP-aware weight sharing. The HF
+    # parameter that aliases a vLLM TP shard gets tagged with
+    # `_vllm_presharded_dim`; FSDP2's shard-placement fn reads the tag to
+    # avoid re-sharding the already-presharded local storage. Under TP=1
+    # the tag is harmless (FSDP2 only consults it when wrapped on a TP mesh).
+    _VLLM_DIM0_PRESHARDED_SUFFIXES = {"q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"}
+    _VLLM_DIM1_PRESHARDED_SUFFIXES = {"o_proj", "down_proj"}
+    def _tag_vllm_presharded_dim(param, layer_name_for_lookup):
+        suffix = layer_name_for_lookup.rsplit(".", 1)[-1]
+        if suffix in _VLLM_DIM0_PRESHARDED_SUFFIXES:
+            param._vllm_presharded_dim = 0
+        elif suffix in _VLLM_DIM1_PRESHARDED_SUFFIXES:
+            param._vllm_presharded_dim = 1
+
     skipped_layernorms = []
     for kk in range(layer_count):
         for layer_name in layer_names:
@@ -1368,6 +1382,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.weight_scale = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
                     layer.weight.input_scale_ub = kwargs['input_scale_ub']
                     layer.quant_method = "fbgemm_fp8"
+                    _tag_vllm_presharded_dim(layer.weight, layer_name)
                 elif fp8_weight_scale.ndim == 2:
                     # This denotes that the model if FP8 dynamic quantized.
                     # transformers 5.0+ renamed bias -> has_bias and removed device
@@ -1382,6 +1397,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.bias = bias
                     layer.weight_scale_inv = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
                     layer.quant_method = "fp8"
+                    _tag_vllm_presharded_dim(layer.weight, layer_name)
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
                 # Layer is quantized!
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
@@ -1391,6 +1407,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.weight = Params4bit(data = weight, requires_grad = False, **kwargs)
                 layer.weight.quant_state = quant_state
                 layer.bias = bias
+                _tag_vllm_presharded_dim(layer.weight, layer_name)
 
                 # Must override or else Bitsandbytes will error
                 layer.to = partial(_override_to, layer)
@@ -1404,6 +1421,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 # https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170#diff-7d6145ac4ba084231a441c2056c7fca23c3bae33e6542f4f602a6c9d4d2da64dL199-R208
                 layer.weight = torch.nn.Parameter(getattr(weight, 'data', weight), requires_grad = False)
                 layer.bias = bias
+                _tag_vllm_presharded_dim(layer.weight, layer_name)
             else:
                 # LayerNorms (including vision norms)
                 weight_param = torch.nn.Parameter(weight, requires_grad=False)
@@ -1764,6 +1782,7 @@ def load_vllm(
     return_args            : bool = False, # Just return args
     max_num_seqs           : int = 256, # how many seqs to process in parallel. Default vLLM 256
     fp8_mode               : Optional[str] = None,
+    tensor_parallel_size   : int = 1, # vLLM TP degree; >1 requires weight-sharing support
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
@@ -2202,6 +2221,7 @@ def load_vllm(
         load_format            = "bitsandbytes" if use_bitsandbytes else "auto",
         kv_cache_dtype         = "fp8" if float8_kv_cache else "auto",
         dtype                  = dtype,
+        tensor_parallel_size   = tensor_parallel_size,
 
         max_num_batched_tokens = max_num_batched_tokens,
         max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
