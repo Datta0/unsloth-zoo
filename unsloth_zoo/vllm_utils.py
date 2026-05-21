@@ -1315,12 +1315,20 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # the tag is harmless (FSDP2 only consults it when wrapped on a TP mesh).
     _VLLM_DIM0_PRESHARDED_SUFFIXES = {"q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"}
     _VLLM_DIM1_PRESHARDED_SUFFIXES = {"o_proj", "down_proj"}
+    _tag_counter = {"n": 0, "samples": []}
     def _tag_vllm_presharded_dim(param, layer_name_for_lookup):
         suffix = layer_name_for_lookup.rsplit(".", 1)[-1]
         if suffix in _VLLM_DIM0_PRESHARDED_SUFFIXES:
             param._vllm_presharded_dim = 0
         elif suffix in _VLLM_DIM1_PRESHARDED_SUFFIXES:
             param._vllm_presharded_dim = 1
+        else:
+            return
+        _tag_counter["n"] += 1
+        if len(_tag_counter["samples"]) < 3:
+            _tag_counter["samples"].append(
+                (layer_name_for_lookup, suffix, param._vllm_presharded_dim, id(param))
+            )
 
     skipped_layernorms = []
     for kk in range(layer_count):
@@ -1498,6 +1506,10 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
     if len(skipped_layernorms) != 0:
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
+    print(
+        f"[convert_vllm_to_huggingface] _vllm_presharded_dim tagged on "
+        f"{_tag_counter['n']} params; first samples: {_tag_counter['samples']}"
+    )
     return new_model
 pass
 
@@ -2213,6 +2225,25 @@ def load_vllm(
             print(f"Unsloth: FAILED getting compilation_config with error = {str(e)}")
     pass
 
+    # When tensor_parallel_size > 1 and torch.distributed is already up
+    # (typical for torchrun-launched training where vLLM should colocate
+    # with the existing process group rather than spawn its own TP workers),
+    # use vLLM's external_launcher backend: each torchrun rank holds one
+    # vLLM TP shard and they coordinate over the existing nccl group.
+    _has_distributed = False
+    try:
+        import torch.distributed as _dist
+        _has_distributed = _dist.is_available() and _dist.is_initialized()
+    except Exception:
+        _has_distributed = False
+    _distributed_executor_backend = "external_launcher" if (
+        tensor_parallel_size > 1 and _has_distributed
+    ) else None
+    # custom_all_reduce hits a CUDA "invalid argument" error on B200 (SM100)
+    # under external_launcher + TP>1 in vLLM 0.19.x. Force disable when we
+    # know we're in that combination; vLLM falls back to NCCL all-reduce.
+    _disable_custom_all_reduce = (_distributed_executor_backend == "external_launcher")
+
     engine_args = dict(
         model                  = model_name,
         gpu_memory_utilization = actual_gpu_memory_utilization,
@@ -2222,6 +2253,8 @@ def load_vllm(
         kv_cache_dtype         = "fp8" if float8_kv_cache else "auto",
         dtype                  = dtype,
         tensor_parallel_size   = tensor_parallel_size,
+        distributed_executor_backend = _distributed_executor_backend,
+        disable_custom_all_reduce    = _disable_custom_all_reduce,
 
         max_num_batched_tokens = max_num_batched_tokens,
         max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM

@@ -415,7 +415,19 @@ def set_additional_modules(new_model, quant_state_dict, config):
         text_config = getattr(config, "text_config", None)
         if text_config is not None:
             pad_token_id = getattr(text_config, "pad_token_id", None)
-    if pad_token_id is not None: assert pad_token_id < quant_state_dict[embed_tokens_key].shape[0], f"Pad token id {pad_token_id} out of bounds for vocab size {quant_state_dict[embed_tokens_key].shape[0]}"
+    # Under tensor-parallel >1 the vLLM embed_tokens shard has shape
+    # [vocab_local, hidden] where vocab_local is vocab_full // tp_size, so the
+    # full pad_token_id can exceed vocab_local. The caller (text_v2 finalize)
+    # replaces the aliased vocab-shard with a full replicated copy from
+    # safetensors before any forward, so the assert is only meaningful when
+    # the local shape really is the full vocab.
+    if pad_token_id is not None:
+        _full_vocab = getattr(getattr(config, "text_config", config), "vocab_size", None)
+        _shard_vocab = quant_state_dict[embed_tokens_key].shape[0]
+        if _full_vocab is None or _shard_vocab >= _full_vocab:
+            assert pad_token_id < _shard_vocab, (
+                f"Pad token id {pad_token_id} out of bounds for vocab size {_shard_vocab}"
+            )
 
     # language_model.embed_tokens = torch.nn.Embedding.from_pretrained(
     #     quant_state_dict[embed_tokens_key],
