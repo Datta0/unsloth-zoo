@@ -19,6 +19,7 @@ __all__ = [
 ]
 
 import torch
+import torch.distributed as dist
 import inspect
 import os
 import math
@@ -112,6 +113,84 @@ def chunked_hidden_states_selective_log_softmax(
     return all_per_token_logps
 
 RL_REPLACEMENTS["grpo_selective_log_softmax"] = chunked_hidden_states_selective_log_softmax
+
+_GRPO_LM_HEAD_CACHE_ATTR = "_unsloth_grpo_lm_head_projection_cache"
+
+
+def _grpo_model_vocab_size(model, fallback: int) -> int:
+    for candidate in (
+        model,
+        getattr(model, "module", None),
+        getattr(model, "model", None),
+        getattr(model, "base_model", None),
+    ):
+        config = getattr(candidate, "config", None)
+        for cfg in (config, getattr(config, "text_config", None)):
+            vocab_size = getattr(cfg, "vocab_size", None)
+            if vocab_size is not None:
+                try:
+                    return int(vocab_size)
+                except Exception:
+                    pass
+    return int(fallback)
+
+
+def _grpo_materialize_local_tensor(param: torch.Tensor) -> torch.Tensor:
+    if hasattr(param, "to_local"):
+        param = param.to_local()
+    elif hasattr(param, "full_tensor"):
+        param = param.full_tensor()
+    data = param.detach() if hasattr(param, "detach") else param
+    return data.contiguous()
+
+
+def _grpo_all_gather_vocab_shard(model, tensor: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(tensor) or tensor.dim() < 2:
+        return tensor
+    vocab_size = _grpo_model_vocab_size(model, int(tensor.shape[0]))
+    if int(tensor.shape[0]) == vocab_size:
+        return tensor
+    if not (dist.is_available() and dist.is_initialized()):
+        return tensor
+    world_size = dist.get_world_size()
+    if int(tensor.shape[0]) * world_size != vocab_size:
+        return tensor
+    gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, tensor.contiguous())
+    return torch.cat(gathered, dim=0).contiguous()
+
+
+def _resolve_grpo_lm_head_for_projection(trainer) -> torch.Tensor:
+    model = trainer.model
+    lm_head = model.get_output_embeddings().weight
+    if os.environ.get("UNSLOTH_GRPO_DISABLE_LM_HEAD_ALLGATHER", "0") == "1":
+        return lm_head
+
+    cache = getattr(trainer, _GRPO_LM_HEAD_CACHE_ATTR, None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            setattr(trainer, _GRPO_LM_HEAD_CACHE_ATTR, cache)
+        except Exception:
+            pass
+
+    key = (
+        id(lm_head),
+        tuple(getattr(lm_head, "shape", ())),
+        getattr(lm_head, "dtype", None),
+        str(getattr(lm_head, "device", None)),
+        getattr(lm_head, "_version", None),
+        getattr(trainer, "_step", None),
+    )
+    cached = cache.get(key)
+    if torch.is_tensor(cached):
+        return cached
+
+    tensor = _grpo_materialize_local_tensor(lm_head)
+    tensor = _grpo_all_gather_vocab_shard(model, tensor)
+    cache.clear()
+    cache[key] = tensor
+    return tensor
 
 def calculate_pad_tokens_in_prompt(
     input_ids: torch.Tensor,
@@ -771,7 +850,8 @@ def grpo_accumulated_loss(
     pass
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
-    lm_head = trainer.model.get_output_embeddings().weight
+    from unsloth_zoo.rl_replacements import _resolve_grpo_lm_head_for_projection
+    lm_head = _resolve_grpo_lm_head_for_projection(trainer)
     dtype_bytes = 16 if trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
 
     total_rows = input_ids.shape[0]
