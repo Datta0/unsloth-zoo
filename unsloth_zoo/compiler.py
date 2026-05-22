@@ -53,7 +53,12 @@ import regex
 from .peft_utils import get_lora_layer_modules
 from importlib.metadata import version as importlib_version
 import functools
-from .compiler_replacements import compiler_replacements
+from .compiler_replacements import (
+    comment_out_model_torch_decorators,
+    compiler_replacements,
+    model_compile_decorator,
+    model_disable_decorator,
+)
 from . import DEVICE_TYPE
 from .temporary_patches.common import get_torch_compile_options
 from .hf_utils import get_transformers_model_type
@@ -214,7 +219,7 @@ from unsloth_zoo.loss_utils import (
 )
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-@torch.compiler.disable(recursive = False)
+{model_disable_decorator()}
 def disable_compile_scaled_dot_product_attention(*args, **kwargs):
     return scaled_dot_product_attention(*args, **kwargs)
 pass
@@ -1382,9 +1387,9 @@ def create_standalone_class(
 
     if disable is not None:
         compile = (
-            f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
+            model_compile_decorator(fullgraph)
             if not disable
-            else "@torch.compiler.disable(recursive = False)"
+            else model_disable_decorator()
         )
     else:
         compile = ""
@@ -1521,7 +1526,7 @@ pass
 _cross_entropy_code = """
 from torch.nn import CrossEntropyLoss
 
-@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
+{MODEL_COMPILE_DECORATOR}
 def normal_cross_entropy_loss(self, hidden_states, labels):
     logits = self.lm_head(hidden_states)
     logits = logits.float()
@@ -1576,6 +1581,10 @@ def mask_attention_mask_out(labels = None, attention_mask = None):
 pass
 
 """
+_cross_entropy_code = _cross_entropy_code.replace(
+    "{MODEL_COMPILE_DECORATOR}",
+    model_compile_decorator(True),
+)
 
 __DYNAMO__RECOMPILING__ = """
 
@@ -4346,11 +4355,11 @@ def unsloth_compile_transformers(
 
             if module in disable_compile_functions:
                 parameters = (
-                    "@torch.compiler.disable(recursive = False)\n"
+                    f"{model_disable_decorator()}\n"
                     + parameters
                 )
             elif not disable:
-                parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+                parameters = f"{model_compile_decorator(UNSLOTH_FULLGRAPH)}\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
 
@@ -4408,13 +4417,16 @@ def unsloth_compile_transformers(
                 if module in disable_compile_functions:
                     source = re.sub(
                         r"@torch.compile\([^\n]*\)\n",
-                        "@torch.compiler.disable(recursive = False)\n",
+                        f"{model_disable_decorator()}\n",
                         source,
                     )
-                    if "@torch.compiler.disable(recursive = False)\n" not in source:
-                        source = "@torch.compiler.disable(recursive = False)\n" + source
+                    if (
+                        "@torch.compiler.disable(recursive = False)\n" not in source
+                        and "# @torch.compiler.disable(recursive = False)\n" not in source
+                    ):
+                        source = f"{model_disable_decorator()}\n" + source
                 elif not disable:
-                    source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                    source = f"{model_compile_decorator(UNSLOTH_FULLGRAPH)}\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
@@ -4456,6 +4468,7 @@ def unsloth_compile_transformers(
     pass
 
     all_code = "\n\n".join(final_all_standalone_classes)
+    all_code = comment_out_model_torch_decorators(all_code)
 
     try:
         combined_module = create_new_function(
