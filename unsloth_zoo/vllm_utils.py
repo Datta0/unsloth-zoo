@@ -1538,6 +1538,7 @@ def approximate_vllm_memory_usage(
     account_for_gradients = True,
     parallel_sequences = 64,
     cuda_graph_overhead = True,
+    tensor_parallel_size = 1,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
@@ -1607,9 +1608,22 @@ def approximate_vllm_memory_usage(
     bytes_for_model = \
         total_quantizable_elements / factor + total_float16_elements + lora_elements
 
+    # Under TP=N, each rank holds 1/N of the model weights. The free_memory here
+    # is the per-rank budget (gpu_memory_utilization * single-GPU free), so we
+    # must scale bytes_for_model down to per-rank too. Without this scaling,
+    # 32B+ models under TP report negative memory_left_for_kv_cache, which
+    # caps max_num_batched_tokens at 0 and pins max_seq_length at 256.
+    if tensor_parallel_size and tensor_parallel_size > 1:
+        bytes_for_model = bytes_for_model / float(tensor_parallel_size)
+
     # KV cache size (float16 is 2 bytes. float8 is 1.25 bytes)
     float_bytes = 1.25 if float8_kv_cache else 2
     kv_elements = (kv_size * 2 * n_layers) * float_bytes
+    # vLLM also shards KV cache along TP — each rank holds 1/N of KV. Keep the
+    # per-token KV size in per-rank terms so max_num_batched_tokens reflects
+    # what fits on this rank.
+    if tensor_parallel_size and tensor_parallel_size > 1:
+        kv_elements = kv_elements / float(tensor_parallel_size)
     memory_left_for_kv_cache = free_memory - bytes_for_model
 
     # Account for CUDA graph capture overhead.
@@ -1918,6 +1932,7 @@ def load_vllm(
         max_loras = max_loras,
         float8_kv_cache = float8_kv_cache,
         account_for_gradients = training,
+        tensor_parallel_size = tensor_parallel_size,
     )
 
     # Pre-flight warning: if KV cache headroom is very low with standby mode,
@@ -2294,6 +2309,15 @@ def load_vllm(
         # To reduce memory usage, we limit the number of images/videos per prompt
         # TODO: Make it configurable by user
         engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
+        # vLLM v1 runs a multimodal profile-forward during init that allocates
+        # large transient activation memory (10-30 GiB on 32B+ models). For
+        # weight-sharing training we don't need that profile because the
+        # vLLM KV cache budget is intentionally tight. Skip it when
+        # UNSLOTH_VLM_SKIP_MM_PROFILING=1 (the env var the FSDP2 VL driver
+        # already sets at module-import time).
+        _skip_mm = os.environ.get("UNSLOTH_VLM_SKIP_MM_PROFILING", "0").lower() in {"1", "true", "yes", "on"}
+        if _skip_mm:
+            engine_args["skip_mm_profiling"] = True
 
     # [[CRITICAL for RL on policy]]
     # Check for Cascade Attention which fails on A100 / L40 for vLLM < 0.11.0 versions
