@@ -946,10 +946,21 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         proj = getattr(proj, "base_layer", proj)
         qweight = proj.weight
 
-        # Determine slicing offsets
+        # Determine slicing offsets. vLLM exposes the full (un-sharded)
+        # `output_sizes` on a MergedColumnParallelLinear even when TP>1, but
+        # `qweight` is the local TP shard. Scale the per-projection sizes
+        # proportionally so the slices match the local tensor's first dim.
+        # Under TP=1 this is identity. Under TP>1 a [4096, 1024, 1024] split
+        # of a [3072, hidden] local shard becomes [2048, 512, 512].
         output_sizes = getattr(proj, "output_sizes", None)
         if output_sizes is not None:
-            dim_offsets = np.cumsum([0] + output_sizes)
+            total_full = sum(output_sizes)
+            actual_dim0 = qweight.shape[0]
+            if total_full != actual_dim0 and total_full > 0:
+                output_sizes = [
+                    int(size * actual_dim0 / total_full) for size in output_sizes
+                ]
+            dim_offsets = np.cumsum([0] + list(output_sizes))
         else:
             dim_offsets = [0, qweight.shape[0]]
 
