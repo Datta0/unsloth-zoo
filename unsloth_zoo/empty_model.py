@@ -400,8 +400,19 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
 
 @torch.inference_mode
 def set_additional_modules(new_model, quant_state_dict, config):
+    # Three known HF layouts:
+    # (a) Top-level language_model attribute (old VL HF, vLLM-side mirror): new_model.language_model
+    # (b) Nested under model (newer transformers VL like Qwen2.5-VL / Qwen3-VL):
+    #     new_model.model.language_model
+    # (c) Plain text causal LM: new_model.model
+    # We must match the prefix to whatever _get_vllm_state_dict emitted, which
+    # uses "model.language_model" for VL (vision_text_model_prefix in vllm_utils
+    # _get_vllm_state_dict at L1077-1086) and "model" otherwise.
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
+        language_model_prefix = "model.language_model"
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model"):
+        language_model = new_model.model.language_model
         language_model_prefix = "model.language_model"
     else:
         language_model_prefix = "model"
