@@ -23,12 +23,19 @@ from transformers import Trainer
 from transformers.trainer_utils import seed_worker as trainer_utils_seed_worker
 from tqdm import tqdm as ProgressBar
 import time
-from typing import Any, Optional, List, Dict, Tuple
+from typing import Any, Optional, List
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
+    patch_unsloth_smart_gradient_checkpointing,
+    _bind_gradient_checkpointing_func,
+    _set_unsloth_checkpoint_state,
+    unsloth_checkpoint,
+    resolve_gc_offload_backend,
+    _install_unsloth_stream_offload_wrapper,
+    _remove_unsloth_stream_offload_wrapper,
 )
 import os
 import re
@@ -200,18 +207,32 @@ def prepare_model_for_training(
     if use_gradient_checkpointing != "unsloth":
         unpatch_unsloth_gradient_checkpointing()
         unpatch_unsloth_smart_gradient_checkpointing()
+
+    def _enable_gc(_module):
+        if not hasattr(_module, "gradient_checkpointing_enable"):
+            return
+        try:
+            _module.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": use_reentrant},
+            )
+            return
+        except TypeError:
+            # Older HF signatures might not accept kwargs; fall back.
+            pass
+        _module.gradient_checkpointing_enable()
+
     m = model
     while hasattr(m, "model"):
         if use_gradient_checkpointing == "unsloth":
             m._offloaded_gradient_checkpointing = True
         if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-            m.gradient_checkpointing_enable()
+            _enable_gc(m)
         m = m.model
     pass
     if use_gradient_checkpointing == "unsloth":
         m._offloaded_gradient_checkpointing = True
     if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-        m.gradient_checkpointing_enable()
+        _enable_gc(m)
 
     # Also set HF version manually to stop failures
     if hasattr(model, "_set_gradient_checkpointing"):
@@ -223,8 +244,68 @@ def prepare_model_for_training(
                 if hasattr(module, "gradient_checkpointing"):
                     module.gradient_checkpointing = False
 
-    # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
-    if use_reentrant:
+    # HF caches checkpoint callables on modules; rebind to the active one so
+    # mode switches and monkey patches apply consistently. Only the "unsloth"
+    # path rewires the module-level `_gradient_checkpointing_func`; when
+    # `use_gradient_checkpointing == True` the caller has asked for vanilla
+    # PyTorch checkpointing via HF's `gradient_checkpointing_enable` above, so
+    # leave the per-module function alone and strip any prior unsloth offload
+    # wrapper / attribute so benchmarks isolate the native path.
+    if use_gradient_checkpointing == "unsloth":
+        # Activate the smart-checkpoint dispatcher so HF Trainer's cached
+        # checkpoint partials route through the selected Unsloth checkpoint path.
+        # Historically only `FastLanguageModel.from_pretrained` activated this;
+        # direct `prepare_model_for_training` consumers otherwise kept stale
+        # vanilla checkpoint functions.
+        context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+        effective_reentrant = getattr(model, "_unsloth_use_reentrant", None)
+        if type(effective_reentrant) is not bool:
+            effective_reentrant = bool(use_reentrant)
+        offload_backend = getattr(model, "_unsloth_gc_offload_backend", None)
+        if offload_backend is None and not effective_reentrant:
+            offload_backend = os.environ.get("UNSLOTH_GC_OFFLOAD_BACKEND", "unsloth_stream")
+        offload_backend = resolve_gc_offload_backend(offload_backend)
+        effective_reentrant, offload_backend = _set_unsloth_checkpoint_state(
+            model, effective_reentrant, offload_backend,
+        )
+        try:
+            patch_unsloth_smart_gradient_checkpointing(
+                dtype=dtype,
+                use_reentrant=effective_reentrant,
+                offload_backend=offload_backend,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Unsloth: failed to install smart gradient checkpointing."
+            ) from exc
+
+        _bind_gradient_checkpointing_func(
+            model, unsloth_checkpoint, effective_reentrant, context_fn, offload_backend,
+        )
+
+        if offload_backend == "unsloth_stream":
+            _install_unsloth_stream_offload_wrapper(model, dtype)
+        else:
+            _remove_unsloth_stream_offload_wrapper(model)
+    else:
+        _remove_unsloth_stream_offload_wrapper(model)
+        if use_gradient_checkpointing is True and hasattr(model, "_unsloth_gc_offload_backend"):
+            # Native path: drop the unsloth offload attribute so downstream
+            # fallbacks (e.g. env-var lookup in `_unsloth_checkpoint_nonreentrant`)
+            # don't accidentally apply an
+            # unsloth offload backend to a user requesting vanilla GC.
+            try:
+                delattr(model, "_unsloth_gc_offload_backend")
+            except Exception:
+                model._unsloth_gc_offload_backend = None
+
+    # Non-reentrant torch.utils.checkpoint.checkpoint needs the saved-tensor
+    # graph to anchor on a tensor with requires_grad=True to trigger its
+    # recompute path. With LoRA (frozen base weights) the embedding output has
+    # requires_grad=False, so without this call the checkpoint hooks don't
+    # activate and activations stay resident (silently disabling GC). This was
+    # only called for reentrant previously, matching historical assumptions.
+    if use_gradient_checkpointing in (True, "unsloth"):
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         else:
@@ -444,6 +525,7 @@ def unsloth_train(trainer):
     if leftover_samples == 0: leftover_ga = ga
 
     logging_steps = training_args.logging_steps
+
     # Go through each epoch
     start_time = time.time()
     with ProgressBar(total = max_steps, dynamic_ncols = True) as progress_bar:
