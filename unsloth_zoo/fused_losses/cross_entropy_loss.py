@@ -136,15 +136,30 @@ def compute_fused_ce_loss(
 pass
 
 
+# torch.func.grad_and_value materializes ~3 transient copies of each chunk's
+# logits (forward value + grad wrt hidden_states + grad wrt lm_head weight).
+# The old auto budget (50% of *free* VRAM) let a single chunk's logits reach
+# tens of GB on large vocab * long sequence (e.g. 19.9 GB at bsz4*seq8192*
+# vocab151936), which grad_and_value then tripled to ~60 GB and blew up the
+# step (esp. under torch.compile, where the chunker collapsed to n_chunks=1).
+# Cap the per-chunk logit budget so the tripled transient stays bounded.
+_FUSED_CE_GRAD_COPIES = 3.0
+_FUSED_CE_MAX_TRANSIENT_GB = float(os.environ.get("UNSLOTH_CE_LOSS_MAX_TRANSIENT_GB", "3.0"))
+
 @functools.cache
 def _get_chunk_multiplier(vocab_size, target_gb = None):
-    """ Gets chunk size that fits the target max memory usage (1GB) """
+    """ Gets chunk size that fits the target max memory usage """
     if target_gb is None:
         # Find current VRAM left in the GPU, and use 50% or less of it
         free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu" else torch.cuda.mem_get_info(0)
         free_gb = free / 1024 / 1024 / 1024
         free_gb = free_gb * 0.5
-        target_gb = free_gb
+        # Bound the per-chunk logit budget so grad_and_value's ~3x transient
+        # copies cannot balloon (see note above). target_gb is the budget for
+        # ONE chunk's logit tensor; dividing the transient cap by the copy
+        # factor keeps the peak (chunk_logits * copies) <= the cap.
+        budget_gb = min(free_gb, _FUSED_CE_MAX_TRANSIENT_GB)
+        target_gb = budget_gb / _FUSED_CE_GRAD_COPIES
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
@@ -558,8 +573,13 @@ def unsloth_fused_ce_loss(
     # Get mixed precision scaling if seen
     scaling = scaler.get_scale() if scaler is not None else scaling
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
-    if TARGET_GB: target_gb = float(TARGET_GB)
-    elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
+    # Read overrides at call time (not import time) so callers that set these
+    # after import (e.g. the FSDP2 trainer enabling chunking when compile is on)
+    # still take effect.
+    _target_gb_env = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", TARGET_GB)
+    _n_chunks_env = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", N_CHUNKS)
+    if _target_gb_env: target_gb = float(_target_gb_env)
+    elif _n_chunks_env: kwargs["n_chunks"] = max(int(_n_chunks_env), 1)
 
     # Move hidden_states to lm_head's device if they differ (e.g. multi-GPU
     # device_map="balanced"). torch.func.grad_and_value wraps inputs and fails
