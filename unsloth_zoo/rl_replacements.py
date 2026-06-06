@@ -25,10 +25,25 @@ import os
 import math
 import logging
 import numpy as np
+from contextlib import contextmanager
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
+
+
+@contextmanager
+def _temporary_unsloth_return_hidden_states():
+    old_value = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES")
+    os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop("UNSLOTH_RETURN_HIDDEN_STATES", None)
+        else:
+            os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = old_value
+
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
 @torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
@@ -878,7 +893,6 @@ def grpo_accumulated_loss(
         trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
         if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = None
     pass
-    os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
     from unsloth_zoo.rl_replacements import _resolve_grpo_lm_head_for_projection
     lm_head = _resolve_grpo_lm_head_for_projection(trainer)
@@ -1160,17 +1174,18 @@ def grpo_accumulated_loss(
         )
 
 
-    for (
-        input_ids_chunk,
-        attention_mask_chunk,
-        pixel_values_chunk,
-        image_grid_thw_chunk,
-        pixel_attention_mask_chunk,
-        image_sizes_chunk,
-        token_type_ids_chunk,
-        mm_token_type_ids_chunk,
-        completion_ids
-    ) in zipped_inputs:
+    with _temporary_unsloth_return_hidden_states():
+        for (
+            input_ids_chunk,
+            attention_mask_chunk,
+            pixel_values_chunk,
+            image_grid_thw_chunk,
+            pixel_attention_mask_chunk,
+            image_sizes_chunk,
+            token_type_ids_chunk,
+            mm_token_type_ids_chunk,
+            completion_ids
+        ) in zipped_inputs:
             _extra_vision_kwargs = {}
             if token_type_ids_chunk is not None:
                 _extra_vision_kwargs["token_type_ids"] = token_type_ids_chunk
@@ -1227,9 +1242,6 @@ def grpo_accumulated_loss(
             1,
             kwargs
         )
-
-    # Must force not returning hidden states but logits otherwise gibberish
-    os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, completion_mask
     # Old non efficient code path
